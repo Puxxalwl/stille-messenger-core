@@ -11,6 +11,7 @@ const session_mod = stille_messenger.core.session;
 const obfuscate = stille_messenger.net.obfuscate;
 const tcp = stille_messenger.net.tcp;
 const relay = stille_messenger.net.relay;
+const sysfd = stille_messenger.net.sysfd;
 
 // -------------------------------------------------------------- pipe pair
 const io_g = struct {
@@ -773,9 +774,11 @@ test "relay: присутствие — переподключение без и
     hb.pings.deinit(alloc);
 
     // релей: остановить — shutdown на слушающем сокете будит заблоки-
-    // рованный accept (close fd его НЕ будит), флаг завершит цикл
+    // рованный accept (close fd его НЕ будит), флаг завершит цикл.
+    // Только sysfd: сырые linux-вызовы на darwin = SIGSYS (неверный
+    // номер syscall), тест обязан быть переносимым.
     relay_stop.store(true, .seq_cst);
-    _ = std.os.linux.shutdown(listener.fd, std.os.linux.SHUT.RDWR);
+    sysfd.shutdownReadWrite(listener.fd);
     th.join();
     listener.deinit();
 }
