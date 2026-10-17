@@ -11,7 +11,6 @@ const session_mod = stille_messenger.core.session;
 const obfuscate = stille_messenger.net.obfuscate;
 const tcp = stille_messenger.net.tcp;
 const relay = stille_messenger.net.relay;
-const sysfd = stille_messenger.net.sysfd;
 
 // -------------------------------------------------------------- pipe pair
 const io_g = struct {
@@ -773,13 +772,16 @@ test "relay: присутствие — переподключение без и
     ha.pings.deinit(alloc);
     hb.pings.deinit(alloc);
 
-    // релей: остановить — shutdown на слушающем сокете будит заблоки-
-    // рованный accept (close fd его НЕ будит), флаг завершит цикл.
-    // Только sysfd: сырые linux-вызовы на darwin = SIGSYS (неверный
-    // номер syscall), тест обязан быть переносимым.
+    // релей: остановить — флаг + служебный коннект. Переносимо для любой
+    // ОС: реальный коннект будит блокированный accept (shutdown слушаю-
+    // щего сокета будит accept только на linux; на darwin он возвращает
+    // ENOTCONN, и поток релея висел бы в accept навсегда). serve проверяет
+    // флаг после accept и выходит, wake-коннект закрывается на месте.
     relay_stop.store(true, .seq_cst);
-    sysfd.shutdownReadWrite(listener.fd);
+    const wake = tcp.dial(alloc, relay_addr) catch return error.NoWake;
     th.join();
+    wake.deinit();
+    alloc.destroy(wake);
     listener.deinit();
 }
 

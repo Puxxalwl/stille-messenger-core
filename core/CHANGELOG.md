@@ -70,7 +70,10 @@
   darwin неприменимы). Переведены tcp, relay, socks5, api_server (UDS),
   discover (UDP multicast), main; расхождения констант (TCP keepalive,
   IP_ADD_MEMBERSHIP) заданы явно per-OS. Сборка, тесты и exe зелёные
-  под aarch64-macos; CI (macos-14) снова зелёный. Оговорка: аудио-
+  под aarch64-macos; CI (macos-14) снова зелёный. Остановка релея с
+  stop-флагом: флаг проверяется и после принятого коннекта — переносимая
+  схема «флаг + служебный коннект» (shutdown слушающего сокета будит
+  accept только на linux, на darwin он висит бы вечно). Оговорка: аудио-
   устройство звонка (fifo через mknodat/openat) пока Linux-only,
   перенос на sysfd — отдельное изменение.
 

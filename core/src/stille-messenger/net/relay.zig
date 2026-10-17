@@ -148,6 +148,17 @@ pub fn serve(alloc: std.mem.Allocator, listener: *tcp.Listener, stop: ?*std.atom
             }
             continue;
         };
+        // Стоп проверяется и после принятого коннекта: shutdown слушающего
+        // сокета будит блокированный accept только на linux (на darwin/BSD
+        // он возвращает ENOTCONN и accept висит дальше), поэтому переноси-
+        // мая остановка — флаг плюс служебный коннект, будящий accept.
+        if (stop) |st| {
+            if (st.load(.seq_cst)) {
+                sysfd.close(tc.fd);
+                alloc.destroy(tc);
+                break;
+            }
+        }
         // tc-структура не нужна потоку (он работает с fd): копия в аргументах
         const th = std.Thread.spawn(.{}, relayConn, .{ alloc, &map, &spin, tc.fd }) catch {
             sysfd.close(tc.fd);
