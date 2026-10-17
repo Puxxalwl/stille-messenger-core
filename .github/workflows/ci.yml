@@ -31,11 +31,11 @@ jobs:
           tar xJf zig.tar.xz
           echo "$PWD/zig-${{ matrix.target }}-0.17.0" >> $GITHUB_PATH
       - name: Test
-        working-directory: zig
+        working-directory: core
         run: zig build test --summary all
       - name: Build (ReleaseFast)
-        working-directory: zig
+        working-directory: core
         run: zig build -Doptimize=ReleaseFast -Dcpu=baseline -Dtarget=${{ matrix.zig_target }}
       - name: Smoke test
-        working-directory: zig
-        run: ./zig-out/bin/shopot-zig 2>&1 | head -1
+        working-directory: core
+        run: ./zig-out/bin/stille-messenger 2>&1 | head -1

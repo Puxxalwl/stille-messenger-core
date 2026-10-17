@@ -1,4 +1,4 @@
-# Contributing to shopot-core
+# Contributing to stille-messenger-core
 
 **English** | [Русский](docs/ru/CONTRIBUTING.md)
 
@@ -28,8 +28,8 @@ adapted to a Zig project on GitHub. Read this before opening a PR.
 ## 2. Development setup
 
 ```bash
-git clone https://github.com/Puxxalwl/shopot-core.git
-cd shopot-core
+git clone https://github.com/Puxxalwl/stille-messenger-core.git
+cd stille-messenger-core
 make test                 # zig build test --summary all
 make                      # zig build -Doptimize=ReleaseFast
 ```
@@ -38,19 +38,19 @@ Toolchain: [Zig 0.17.0](https://ziglang.org/download/) — the only
 requirement. CI runs the same `zig build test` plus release builds on every
 `zig-v*` tag.
 
-Coding rules for the `zig/` tree (allocator discipline, error sets, module
-boundaries): [zig/AGENTS.md](zig/AGENTS.md). It binds contributors and
+Coding rules for the `core/` tree (allocator discipline, error sets, module
+boundaries): [core/AGENTS.md](core/AGENTS.md). It binds contributors and
 agents equally.
 
 ## 3. Source layout and ownership
 
 | Subsystem | Files |
 |---|---|
-| build/integration | `build.zig`, `src/shopot.zig`, `src/shopot/core/*`, `src/shopot/app/*`, `docs/*`, `CHANGELOG.md` |
-| crypto | `src/shopot/crypto/*.zig` |
-| proto | `src/shopot/proto/*.zig` |
-| net | `src/shopot/net/*.zig` |
-| store | `src/shopot/store/*.zig` |
+| build/integration | `build.zig`, `src/stille-messenger.zig`, `src/stille-messenger/core/*`, `src/stille-messenger/app/*`, `docs/*`, `CHANGELOG.md` |
+| crypto | `src/stille-messenger/crypto/*.zig` |
+| proto | `src/stille-messenger/proto/*.zig` |
+| net | `src/stille-messenger/net/*.zig` |
+| store | `src/stille-messenger/store/*.zig` |
 
 A change touches the files of its subsystem; other subsystems are read-only
 for the author of the change (integration is done by the maintainer of the
@@ -77,7 +77,7 @@ Same rules as the kernel, adapted:
 - **State how you tested it** (unit tests added, integration scenario, E2E
   run). "It works on my machine" is not a test statement.
 - **Crypto/protocol changes** additionally require: an update to
-  `zig/docs/PROTOCOL.md`, a CHANGELOG.md entry, and the rationale in the
+  `core/docs/PROTOCOL.md`, a CHANGELOG.md entry, and the rationale in the
   commit body.
 - Never mix whitespace/formatting churn with functional changes; put
   `zig fmt`-only cleanups in their own commit (or, better, avoid them).

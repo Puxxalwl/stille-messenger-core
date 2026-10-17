@@ -1,10 +1,18 @@
-# shopot
+# stille-messenger
+
+<p align="center">
+  <img src="docs/assets/stille_logo.png" alt="stille-messenger logo" width="280">
+</p>
+
+> **Legacy compatibility:** the data directory `~/.shopot`, invitation prefixes,
+> discovery marker and cryptographic domain strings retain their original values.
+> Existing identities, encrypted history and protocol formats are unchanged.
 
 **English** | [Русский](docs/ru/README.md)
 
 Serverless P2P messenger core: **zero servers of our own**, message history
 lives on the two devices only. Implementation: pure Zig, std-only — no
-packages, no OS dependencies. Source: [`zig/`](zig/).
+packages, no OS dependencies. Source: [`core/`](core/).
 
 The C++ version (v0.2.4, FTXUI/MQTT/WebRTC) is removed from master; the
 archive lives under the tag `cpp-archive`.
@@ -25,24 +33,24 @@ archive lives under the tag `cpp-archive`.
 Requires [Zig 0.17.0](https://ziglang.org/download/) only.
 
 ```bash
-make            # = cd zig && zig build -Doptimize=ReleaseFast
-make test       # = cd zig && zig build test --summary all
+make            # = cd core && zig build -Doptimize=ReleaseFast
+make test       # = cd core && zig build test --summary all
 ```
 
-Binary: `zig/zig-out/bin/shopot-zig`. Release builds for
+Binary: `core/zig-out/bin/stille-messenger`. Release builds for
 x86_64-linux-musl and aarch64-macos are attached to every `zig-v*` tag.
 
 ## Running
 
 ```bash
-shopot-zig init          # identity: ~/.shopot/zig-seed (0600)
-shopot-zig serve         # daemon: core + UDS API (~/.shopot/api.sock)
+stille-messenger init          # identity: ~/.shopot/zig-seed (0600)
+stille-messenger serve         # daemon: core + UDS API (~/.shopot/api.sock)
 ```
 
 There is no CLI/TUI: the only client interface is the GUI, which talks to
 the core over UDS using the binary framed protocol (typed responses,
 machine error codes, events). Specification for client authors:
-[`zig/docs/CORE-API.md`](zig/docs/CORE-API.md) (API 2.0.0).
+[`core/docs/CORE-API.md`](core/docs/CORE-API.md) (API 2.0.0).
 
 Adding a friend is one action: `CREATE_INVITE` produces a one-way code
 (`shopot://i/...`); the holder performs a single `ACCEPT_INVITE`. The
@@ -53,7 +61,7 @@ discovery, autodial, offline outbox, delivery ACKs).
 
 ```bash
 # on any server (VPS):
-./shopot relay 0.0.0.0:9000
+./stille-messenger relay 0.0.0.0:9000
 
 # on your side:
 > invite bob relay vps.example.com:9000
@@ -71,17 +79,17 @@ discovery, autodial, offline outbox, delivery ACKs).
   transport
 - Storage: append-only AEAD log, not a single plaintext byte
 
-Details: [`zig/docs/PROTOCOL.md`](zig/docs/PROTOCOL.md),
+Details: [`core/docs/PROTOCOL.md`](core/docs/PROTOCOL.md),
 [SECURITY.md](SECURITY.md).
 
 ## Documentation
 
 | Document | Content |
 |---|---|
-| [`zig/docs/CORE-API.md`](zig/docs/CORE-API.md) / [ru](zig/docs/ru/CORE-API.md) | binary UDS interface for GUI clients (API 2.0.0) |
-| [`zig/docs/PROTOCOL.md`](zig/docs/PROTOCOL.md) / [ru](zig/docs/ru/PROTOCOL.md) | byte-level wire protocol v4 |
-| [`zig/docs/ARCHITECTURE.md`](zig/docs/ARCHITECTURE.md) / [ru](zig/docs/ru/ARCHITECTURE.md) | layers, data flow, threading |
-| [`zig/docs/ROADMAP.md`](zig/docs/ROADMAP.md) / [ru](zig/docs/ru/ROADMAP.md) | technical plan and anti-plan |
+| [`core/docs/CORE-API.md`](core/docs/CORE-API.md) / [ru](core/docs/ru/CORE-API.md) | binary UDS interface for GUI clients (API 2.0.0) |
+| [`core/docs/PROTOCOL.md`](core/docs/PROTOCOL.md) / [ru](core/docs/ru/PROTOCOL.md) | byte-level wire protocol v4 |
+| [`core/docs/ARCHITECTURE.md`](core/docs/ARCHITECTURE.md) / [ru](core/docs/ru/ARCHITECTURE.md) | layers, data flow, threading |
+| [`core/docs/ROADMAP.md`](core/docs/ROADMAP.md) / [ru](core/docs/ru/ROADMAP.md) | technical plan and anti-plan |
 | [SECURITY.md](SECURITY.md) / [ru](docs/ru/SECURITY.md) | threat model, reporting, crypto inventory |
 | [CONTRIBUTING.md](CONTRIBUTING.md) / [ru](docs/ru/CONTRIBUTING.md) | contribution rules (kernel-style) |
 | [docs/DOCSTYLE.md](docs/DOCSTYLE.md) / [ru](docs/ru/DOCSTYLE.md) | binding rules for writing documentation |
@@ -89,7 +97,7 @@ Details: [`zig/docs/PROTOCOL.md`](zig/docs/PROTOCOL.md),
 ## Official client
 
 - Second project developer: [EryyynIT](https://github.com/EryyynIT)
-- Official shopot client: [shopot](https://github.com/EryyynIT/shopot)
+- Official stille-messenger client: [stille-messenger](https://github.com/EryyynIT/stille-messenger)
 
 ## License
 

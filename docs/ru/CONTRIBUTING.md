@@ -1,4 +1,4 @@
-# Контрибуция в shopot-core
+# Контрибуция в stille-messenger-core
 
 [English](../../CONTRIBUTING.md) | **Русский**
 
@@ -28,8 +28,8 @@
 ## 2. Окружение разработки
 
 ```bash
-git clone https://github.com/Puxxalwl/shopot-core.git
-cd shopot-core
+git clone https://github.com/Puxxalwl/stille-messenger-core.git
+cd stille-messenger-core
 make test                 # zig build test --summary all
 make                      # zig build -Doptimize=ReleaseFast
 ```
@@ -38,19 +38,19 @@ make                      # zig build -Doptimize=ReleaseFast
 требование. CI гоняет тот же `zig build test` плюс релизные сборки на
 каждом теге `zig-v*`.
 
-Правила кода в дереве `zig/` (дисциплина аллокаторов, error-сеты, границы
-модулей): [zig/AGENTS.md](../../zig/AGENTS.md). Они одинаково обязательны для
+Правила кода в дереве `core/` (дисциплина аллокаторов, error-сеты, границы
+модулей): [core/AGENTS.md](../../core/AGENTS.md). Они одинаково обязательны для
 контрибьюторов и агентов.
 
 ## 3. Раскладка исходников и владение
 
 | Подсистема | Файлы |
 |---|---|
-| build/интеграция | `build.zig`, `src/shopot.zig`, `src/shopot/core/*`, `src/shopot/app/*`, `docs/*`, `CHANGELOG.md` |
-| crypto | `src/shopot/crypto/*.zig` |
-| proto | `src/shopot/proto/*.zig` |
-| net | `src/shopot/net/*.zig` |
-| store | `src/shopot/store/*.zig` |
+| build/интеграция | `build.zig`, `src/stille-messenger.zig`, `src/stille-messenger/core/*`, `src/stille-messenger/app/*`, `docs/*`, `CHANGELOG.md` |
+| crypto | `src/stille-messenger/crypto/*.zig` |
+| proto | `src/stille-messenger/proto/*.zig` |
+| net | `src/stille-messenger/net/*.zig` |
+| store | `src/stille-messenger/store/*.zig` |
 
 Изменение трогает файлы своей подсистемы; чужие подсистемы для автора
 изменения только для чтения (интеграцию делает мейнтейнер root-скоупа).
@@ -77,7 +77,7 @@ make                      # zig build -Doptimize=ReleaseFast
 - **Напишите, как тестировали** (добавленные юнит-тесты, интеграционный
   сценарий, E2E-прогон). «У меня работает» — не отчёт о тестировании.
 - **Изменения крипты/протокола** дополнительно требуют: обновление
-  `zig/docs/PROTOCOL.md`, запись в CHANGELOG.md и обоснование в теле
+  `core/docs/PROTOCOL.md`, запись в CHANGELOG.md и обоснование в теле
   коммита.
 - Не смешивайте форматирование/переносы с функциональными изменениями;
   чистки `zig fmt` — отдельным коммитом (или, лучше, без них).

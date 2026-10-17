@@ -4,10 +4,10 @@
 
 ## Scope
 
-shopot-core protects message content, files, and local history against
+stille-messenger-core protects message content, files, and local history against
 everyone except the two endpoints. The exact boundary of what is and is not
 covered: the threat model in
-[zig/docs/PROTOCOL.md](zig/docs/PROTOCOL.md#18-what-an-observer-can-learn).
+[core/docs/PROTOCOL.md](core/docs/PROTOCOL.md#18-what-an-observer-can-learn).
 
 ## Reporting a vulnerability
 

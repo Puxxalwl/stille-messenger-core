@@ -29,19 +29,21 @@ jobs:
           tar xJf zig.tar.xz
           echo "$PWD/zig-${{ matrix.target }}-0.17.0" >> $GITHUB_PATH
       - name: Test
-        working-directory: zig
+        working-directory: core
         run: zig build test
       - name: Build
-        working-directory: zig
+        working-directory: core
         run: zig build -Doptimize=ReleaseFast -Dcpu=baseline -Dtarget=${{ matrix.zig_target }}
       - name: Package
-        working-directory: zig
+        working-directory: core
         shell: bash
         run: |
-          NAME="shopot-zig-${{ matrix.target }}"
+          NAME="stille-messenger-${{ matrix.target }}"
           mkdir -p "dist/$NAME"
-          cp zig-out/bin/shopot-zig "dist/$NAME/"
-          cp ../README.md "dist/$NAME/" 2>/dev/null || true
+          cp zig-out/bin/stille-messenger "dist/$NAME/"
+          cp ../README.md "dist/$NAME/"
+          mkdir -p "dist/$NAME/docs/assets"
+          cp ../docs/assets/stille_logo.png "dist/$NAME/docs/assets/"
           tar czf "../$NAME.tar.gz" -C dist "$NAME"
       - name: Release
         uses: softprops/action-gh-release@v2

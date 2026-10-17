@@ -2,7 +2,7 @@
 
 **English** | [Русский](ru/DOCSTYLE.md)
 
-Binding rules for writing and changing documentation in shopot-core.
+Binding rules for writing and changing documentation in stille-messenger-core.
 Modeled on how Discord, Telegram, X, WhatsApp document developer contracts
 and how the kernel treats documentation as part of the patch. Breaking
 these rules is review-blocking, same as code style.
@@ -11,9 +11,9 @@ these rules is review-blocking, same as code style.
 
 - **English is the normative version** and lives at the canonical location:
   `README.md`, `CONTRIBUTING.md`, `SECURITY.md` at the root;
-  `zig/docs/X.md` for specifications.
+  `core/docs/X.md` for specifications.
 - **Russian mirrors live in `ru/` directories**: `docs/ru/README.md`,
-  `docs/ru/CONTRIBUTING.md`, `zig/docs/ru/X.md` — same filename as the
+  `docs/ru/CONTRIBUTING.md`, `core/docs/ru/X.md` — same filename as the
   English original, no `.ru` suffix (the directory carries the language).
 - Every doc starts with a language switcher line linking its mirror; both
   directions must work.

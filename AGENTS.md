@@ -1,7 +1,7 @@
-# AGENTS.md — shopot-core
+# AGENTS.md — stille-messenger-core
 
 This file is the repository-wide operating contract for human contributors,
-AI agents, reviewers, and maintainers. It is intentionally strict: shopot-core
+AI agents, reviewers, and maintainers. It is intentionally strict: stille-messenger-core
 is security-sensitive networking software, not a general-purpose application.
 
 If a rule in this file conflicts with a more specific `AGENTS.md` located in a
@@ -20,7 +20,7 @@ not be merged.
    A relay is self-hosted user software and must remain optional.
 2. **Minimal dependencies.** The supported implementation is pure Zig and
    std-only. Do not add OS packages or runtime dependencies. A Zig package is
-   allowed only when it is hash-pinned, justified in `zig/CHANGELOG.md`, and
+   allowed only when it is hash-pinned, justified in `core/CHANGELOG.md`, and
    approved by a maintainer before implementation.
 3. **No plaintext at rest.** User messages, files, call material, identity
    secrets, and history must never be written to disk in plaintext. Persistent
@@ -49,8 +49,8 @@ not be merged.
 
 ## 2. Scope and source of truth
 
-- Work from the repository root unless a command explicitly requires `zig/`.
-- The active implementation is under `zig/`; the removed C++ implementation is
+- Work from the repository root unless a command explicitly requires `core/`.
+- The active implementation is under `core/`; the removed C++ implementation is
   historical and must not be revived or modified on the default branch.
 - Source code is authoritative for behavior. Protocol and API documentation
   must describe the source, not an aspirational design.
@@ -81,8 +81,8 @@ make
 Equivalent direct commands are:
 
 ```sh
-cd zig && zig build test --summary all
-cd zig && zig build -Doptimize=ReleaseFast
+cd core && zig build test --summary all
+cd core && zig build -Doptimize=ReleaseFast
 ```
 
 If a command fails because the environment cannot write a Zig cache, use a
@@ -91,16 +91,16 @@ an incomplete validation run as a successful test.
 
 ## 4. Repository ownership and change boundaries
 
-The `zig/AGENTS.md` file contains the detailed subsystem ownership map. The
+The `core/AGENTS.md` file contains the detailed subsystem ownership map. The
 current ownership boundaries are:
 
 | Area | Primary files |
 |---|---|
-| Build and integration | `zig/build.zig`, `zig/src/shopot.zig`, `zig/src/shopot/core/*`, `zig/src/shopot/app/*`, `zig/docs/*`, `zig/CHANGELOG.md` |
-| Cryptography | `zig/src/shopot/crypto/*.zig` |
-| Protocol | `zig/src/shopot/proto/*.zig` |
-| Networking | `zig/src/shopot/net/*.zig` |
-| Storage | `zig/src/shopot/store/*.zig` |
+| Build and integration | `core/build.zig`, `core/src/stille-messenger.zig`, `core/src/stille-messenger/core/*`, `core/src/stille-messenger/app/*`, `core/docs/*`, `core/CHANGELOG.md` |
+| Cryptography | `core/src/stille-messenger/crypto/*.zig` |
+| Protocol | `core/src/stille-messenger/proto/*.zig` |
+| Networking | `core/src/stille-messenger/net/*.zig` |
+| Storage | `core/src/stille-messenger/store/*.zig` |
 
 Rules:
 
@@ -157,7 +157,7 @@ Rules:
 ## 6. Cryptography and security
 
 The threat model and cryptographic inventory are defined in
-[`SECURITY.md`](SECURITY.md) and `zig/docs/PROTOCOL.md`. A security-sensitive
+[`SECURITY.md`](SECURITY.md) and `core/docs/PROTOCOL.md`. A security-sensitive
 change must be reviewed against both.
 
 Mandatory rules:
@@ -194,7 +194,7 @@ Before changing a protocol or persistent record:
 3. Decide explicitly whether a version byte, feature bit, or migration is
    required.
 4. Add rejection tests for malformed and oversized inputs.
-5. Update English and Russian documentation plus `zig/CHANGELOG.md` in the
+5. Update English and Russian documentation plus `core/CHANGELOG.md` in the
    same change when both language mirrors exist.
 6. Test communication between the changed and unchanged behavior where
    possible.
@@ -258,7 +258,7 @@ make
 - Tests must not depend on the public internet, wall-clock timing, random
   external services, or a developer's home directory.
 - Use deterministic fixtures and injected clocks/randomness where practical.
-- Integration tests belong in `zig/tests/` and must cover cross-module behavior.
+- Integration tests belong in `core/tests/` and must cover cross-module behavior.
 - Security and protocol tests must include tampering and downgrade/compatibility
   cases where relevant.
 - If a test cannot run in the current environment, state exactly why and what
@@ -280,12 +280,12 @@ unrelated formatting, missing docs, and ownership violations.
 Documentation is part of the implementation contract.
 
 - Update `README.md` for user-visible capabilities or setup changes.
-- Update `zig/docs/PROTOCOL.md` for wire-level behavior.
-- Update `zig/docs/CORE-API.md` for client API behavior.
-- Update `zig/docs/ARCHITECTURE.md` when data flow, ownership, or threading
+- Update `core/docs/PROTOCOL.md` for wire-level behavior.
+- Update `core/docs/CORE-API.md` for client API behavior.
+- Update `core/docs/ARCHITECTURE.md` when data flow, ownership, or threading
   changes.
-- Update `zig/docs/ROADMAP.md` only for deliberate planning changes.
-- Update `zig/CHANGELOG.md` for user-visible behavior, API, protocol, security,
+- Update `core/docs/ROADMAP.md` only for deliberate planning changes.
+- Update `core/CHANGELOG.md` for user-visible behavior, API, protocol, security,
   limit, or compatibility changes.
 - Keep English canonical and update the Russian mirror in the same commit when
   the repository has one.

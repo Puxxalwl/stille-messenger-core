@@ -1,10 +1,18 @@
-# shopot
+# stille-messenger
+
+<p align="center">
+  <img src="../assets/stille_logo.png" alt="Логотип stille-messenger" width="280">
+</p>
+
+> **Legacy-совместимость:** каталог данных `~/.shopot`, префиксы приглашений,
+> маркер обнаружения и криптографические домены сохраняют прежние значения.
+> Существующие личности, зашифрованная история и форматы протокола не изменены.
 
 [English](../../README.md) | **Русский**
 
 Ядро серверлесс P2P-мессенджера: **ноль своих серверов**, история сообщений
 живёт только на двух устройствах. Реализация — чистый Zig, std-only: без
-пакетов и зависимостей от ОС. Исходники: [`zig/`](../../zig/).
+пакетов и зависимостей от ОС. Исходники: [`core/`](../../core/).
 
 C++-версия (v0.2.4, FTXUI/MQTT/WebRTC) удалена из master; архив — тег
 `cpp-archive`.
@@ -25,24 +33,24 @@ C++-версия (v0.2.4, FTXUI/MQTT/WebRTC) удалена из master; арх�
 Нужен только [Zig 0.17.0](https://ziglang.org/download/).
 
 ```bash
-make            # = cd zig && zig build -Doptimize=ReleaseFast
-make test       # = cd zig && zig build test --summary all
+make            # = cd core && zig build -Doptimize=ReleaseFast
+make test       # = cd core && zig build test --summary all
 ```
 
-Бинарник: `zig/zig-out/bin/shopot-zig`. Релизные сборки под
+Бинарник: `core/zig-out/bin/stille-messenger`. Релизные сборки под
 x86_64-linux-musl и aarch64-macos прикрепляются к каждому тегу `zig-v*`.
 
 ## Запуск
 
 ```bash
-shopot-zig init          # личность: ~/.shopot/zig-seed (0600)
-shopot-zig serve         # демон: ядро + UDS-апи (~/.shopot/api.sock)
+stille-messenger init          # личность: ~/.shopot/zig-seed (0600)
+stille-messenger serve         # демон: ядро + UDS-апи (~/.shopot/api.sock)
 ```
 
 Интерфейса командной строки нет: единственный клиент — GUI, подключающийся
 к ядру по UDS бинарным кадровым протоколом (типизированные ответы, машинные
 коды ошибок, события). Спецификация для авторов клиента:
-[`zig/docs/ru/CORE-API.md`](../../zig/docs/ru/CORE-API.md) (API 2.0.0).
+[`core/docs/ru/CORE-API.md`](../../core/docs/ru/CORE-API.md) (API 2.0.0).
 
 Добавление друга — одно действие: `CREATE_INVITE` выдаёт односторонний код
 (`shopot://i/...`), держатель делает единственный `ACCEPT_INVITE`. Контакт,
@@ -53,7 +61,7 @@ shopot-zig serve         # демон: ядро + UDS-апи (~/.shopot/api.sock
 
 ```bash
 # на любом сервере (VPS):
-./shopot relay 0.0.0.0:9000
+./stille-messenger relay 0.0.0.0:9000
 
 # у себя:
 > invite bob relay vps.example.com:9000
@@ -71,25 +79,25 @@ shopot-zig serve         # демон: ядро + UDS-апи (~/.shopot/api.sock
   транспорт
 - Хранилище: append-only AEAD-лог, ни одного байта открытого текста
 
-Детали: [`zig/docs/ru/PROTOCOL.md`](../../zig/docs/ru/PROTOCOL.md),
+Детали: [`core/docs/ru/PROTOCOL.md`](../../core/docs/ru/PROTOCOL.md),
 [SECURITY.md](SECURITY.md).
 
 ## Документация
 
 | Документ | Содержание |
 |---|---|
-| [`zig/docs/ru/CORE-API.md`](../../zig/docs/ru/CORE-API.md) / [en](../../zig/docs/CORE-API.md) | бинарный UDS-интерфейс для GUI-клиентов (API 2.0.0) |
-| [`zig/docs/ru/PROTOCOL.md`](../../zig/docs/ru/PROTOCOL.md) / [en](../../zig/docs/PROTOCOL.md) | байтовая спецификация провода v4 |
-| [`zig/docs/ru/ARCHITECTURE.md`](../../zig/docs/ru/ARCHITECTURE.md) / [en](../../zig/docs/ARCHITECTURE.md) | слои, потоки данных, трединг |
-| [`zig/docs/ru/ROADMAP.md`](../../zig/docs/ru/ROADMAP.md) / [en](../../zig/docs/ROADMAP.md) | технический план и анти-план |
+| [`core/docs/ru/CORE-API.md`](../../core/docs/ru/CORE-API.md) / [en](../../core/docs/CORE-API.md) | бинарный UDS-интерфейс для GUI-клиентов (API 2.0.0) |
+| [`core/docs/ru/PROTOCOL.md`](../../core/docs/ru/PROTOCOL.md) / [en](../../core/docs/PROTOCOL.md) | байтовая спецификация провода v4 |
+| [`core/docs/ru/ARCHITECTURE.md`](../../core/docs/ru/ARCHITECTURE.md) / [en](../../core/docs/ARCHITECTURE.md) | слои, потоки данных, трединг |
+| [`core/docs/ru/ROADMAP.md`](../../core/docs/ru/ROADMAP.md) / [en](../../core/docs/ROADMAP.md) | технический план и анти-план |
 | [SECURITY.md](SECURITY.md) / [en](../../SECURITY.md) | модель угроз, репортинг, инвентаризация крипты |
 | [CONTRIBUTING.md](CONTRIBUTING.md) / [en](../../CONTRIBUTING.md) | правила контрибуции (kernel-style) |
 | [DOCSTYLE.md](DOCSTYLE.md) / [en](../../docs/DOCSTYLE.md) | обязательные правила написания доков |
 
 ## Официальный клиент
 
-- Второй разработчик проекта shopot: [EryyynIT](https://github.com/EryyynIT)
-- Официальный клиент shopot: [shopot](https://github.com/EryyynIT/shopot)
+- Второй разработчик проекта stille-messenger: [EryyynIT](https://github.com/EryyynIT)
+- Официальный клиент stille-messenger: [stille-messenger](https://github.com/EryyynIT/stille-messenger)
 
 ## Лицензия
 
