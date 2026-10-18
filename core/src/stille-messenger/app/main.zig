@@ -2209,7 +2209,7 @@ fn handleDeviceAnnounce(app: *App, ip: [4]u8, port: u16) void {
             if (app.eng.sessions.contains(@intCast(i + 1))) return; // уже жива
             c.setAddr(ip_str, port);
             dial_cid = @intCast(i + 1);
-            return;
+            break;
         }
     }
     if (dial_cid < 0) return;
