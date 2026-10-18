@@ -473,7 +473,9 @@ is capped at 16 MiB total (`TOO_BIG`); `READ_DB` limit 0 → 50, ≤ 200.
 A *device link* is a contact whose bundle equals your own: two installs
 that share the same identity seed (e.g. a phone and a laptop), paired with
 a regular invite code (`ACCEPT_INVITE` — exactly one link per bundle:
-`TOO_BIG` for a second). With `device_sync` on, the core replicates
+`TOO_BIG` for a second). On the invite holder, LAN discovery of the same
+bundle updates the stored route and continues into the authenticated dial path;
+the holder role initiates while the inviter's waiter role accepts. With `device_sync` on, the core replicates
 records (messages, reactions, acks, contacts, blocks, files, config, and
 client-DB records up to the sync record size) to the linked device over
 the session, in bounded queues with retry semantics like the outbox;

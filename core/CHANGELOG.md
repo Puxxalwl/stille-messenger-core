@@ -1,5 +1,10 @@
 # Changelog — stille-messenger
 
+## [Unreleased / неизданное] — исправление LAN-подключения device-link
+
+- Fixed `handleDeviceAnnounce`: selecting a known device-link contact no longer returns from the function while still in the selection block. The holder now proceeds to the existing single-flight authenticated dial path; waiter/blocked/deleted/already-online and `device_sync` guards remain unchanged. No wire or storage format change.
+- Исправлен `handleDeviceAnnounce`: поиск существующего контакта device-link больше не завершает функцию преждевременно. Держатель кода продолжает через существующий single-flight путь аутентифицированного подключения; проверки роли, блокировки, удаления, живой сессии и `device_sync` сохранены. Форматы протокола и хранилища не менялись.
+
 ## [Unreleased / неизданное] — API 2.7.0: single-key friend requests
 
 - One invite code is now the complete friend request: its holder accepts once;
