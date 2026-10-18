@@ -14,7 +14,7 @@ The Russian mirror of this document is
 
 ## 1. Connection basics (MUST for all clients)
 
-- Connect to the core over the Unix domain socket `$HOME/.shopot/api.sock`
+- Connect to the core over the Unix domain socket `$HOME/.stille-messenger/api.sock`
   (0700, same user). No TCP, no HTTP.
 - Wire protocol is **binary, little-endian, fixed-width** (no JSON, no
   varint). Every frame is a 16-byte header + payload:
@@ -60,8 +60,8 @@ A fresh device is in exactly one of these states:
 1. **Existing local profile** — `GET_IDENTITY` returns OK. Show chats.
 2. **New account** — user wants a brand-new identity:
    the client MUST create the profile via the core CLI:
-   `stille-messenger init` (writes `~/.shopot/zig-seed`, 0600), then start
-   `stille-messenger serve`. A daemon already running in recovery mode
+   `stille-messenger-core init` (writes `~/.stille-messenger/zig-seed`, 0600), then start
+   `stille-messenger-core serve`. A daemon already running in recovery mode
    cannot be provisioned by `init`; restart it after `init`.
 3. **Account recovery** — user restores an existing identity from the
    recovery backup. This is the flow in §4.
@@ -149,7 +149,7 @@ see the same identity (same bundle) and keep writing to the same chats.
 
 ### 4.4 Restore on a fresh device
 
-1. Start the core: `stille-messenger serve`. With no seed file the daemon
+1. Start the core: `stille-messenger-core serve`. With no seed file the daemon
    starts in **recovery mode** (ephemeral identity, no network threads).
    `GET_IDENTITY` returns `NOT_INITIALIZED` — that is the onboarding
    signal.
@@ -168,7 +168,7 @@ see the same identity (same bundle) and keep writing to the same chats.
      blind retries in UX (the failure is deterministic, not flaky).
    - `ALREADY_PROVISIONED` (20): a profile already exists on this device.
      Do not silently overwrite; offer an explicit destructive reset
-     (delete `~/.shopot` and restart the daemon) with a confirmation
+     (delete `~/.stille-messenger` and restart the daemon) with a confirmation
      step.
    - Empty blob payload → `BAD_ARGS`; treat as a client bug, never send
      it.
@@ -189,7 +189,7 @@ see the same identity (same bundle) and keep writing to the same chats.
 - **Never log** the unlock secret, PRF outputs, recovery code bytes, or
   blob contents. Treat the blob as opaque bytes: never parse, inspect,
   or render it.
-- **Never display or export** `~/.shopot/zig-seed` (the raw identity
+- **Never display or export** `~/.stille-messenger/zig-seed` (the raw identity
   seed). The seed is the whole identity; the backup path exists exactly
   so the seed never has to be moved by hand.
 - Wipe unlock-secret buffers after use (zero-fill; in JS drop all
@@ -200,7 +200,7 @@ see the same identity (same bundle) and keep writing to the same chats.
 - Transports other than the core's own (UDS for the core, OAuth for the
   user's cloud) MUST NOT be introduced by the client for identity
   material.
-- On logout/"wipe device": delete local `~/.shopot` (with confirmation);
+- On logout/"wipe device": delete local `~/.stille-messenger` (with confirmation);
   the cloud blob stays — that is the recovery path, and deleting it is a
   separate, explicit user action.
 

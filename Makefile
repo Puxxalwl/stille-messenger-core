@@ -10,7 +10,7 @@ test:
 	cd core && $(ZIG) build test --summary all
 
 run: build
-	cd core && ./zig-out/bin/stille-messenger chat
+	cd core && ./zig-out/bin/stille-messenger-core chat
 
 clean:
 	rm -rf core/zig-out core/.zig-cache

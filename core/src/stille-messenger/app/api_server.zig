@@ -1,6 +1,6 @@
 //! UDS-сервер бинарного API — единственный интерфейс ядра stille-messenger для GUI.
 //!
-//! Сокет $HOME/.shopot/api.sock (0700). Протокол — бинарные кадры (api.zig,
+//! Сокет $HOME/.stille-messenger/api.sock (0700). Протокол — бинарные кадры (api.zig,
 //! полная спецификация — docs/CORE-API.md): запрос клиента → ровно один
 //! ответ ядра с корреляцией по request_id; события ядра рассылаются всем
 //! подключённым клиентам. Строк на проводе нет.
@@ -239,7 +239,7 @@ fn udsAcceptLoop(srv: *Server, lfd: posix.socket_t) void {
     }
 }
 
-/// Поднять API-сервер: UDS-сокет $HOME/.shopot/api.sock.
+/// Поднять API-сервер: UDS-сокет $HOME/.stille-messenger/api.sock.
 /// Вызывается один раз при старте serve (до старта потоков фронт-енда).
 pub fn start(app: *main.App, home: []const u8) void {
     if (home.len == 0) return;
@@ -248,7 +248,7 @@ pub fn start(app: *main.App, home: []const u8) void {
     app.cli = srv;
 
     var pb: [128]u8 = undefined;
-    const sock_path = std.fmt.bufPrint(&pb, "{s}/.shopot/api.sock", .{home}) catch return;
+    const sock_path = std.fmt.bufPrint(&pb, "{s}/{s}/api.sock", .{ home, main.data_dir_name }) catch return;
     std.Io.Dir.deleteFileAbsolute(app.io, sock_path) catch {};
     const ufd = sysfd.socketUnix() catch {
         std.debug.print("api: uds-сокет не создан\n", .{});

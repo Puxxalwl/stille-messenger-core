@@ -3,9 +3,10 @@
 //! v1 (совместимость): shopot1.<base64url(bundle|имя)>[@host:port] —
 //! имя зашито в код, но подключение требует взаимного add.
 //!
-//! v2 (односторонний): shopot://i/<base64url(bundle|secret16|имя)>[@host:port]
+//! v2 (односторонний): stille://i/<base64url(bundle|secret16|имя)>[@host:port]
 //! Держатель кода redeem-ит его ОДНИМ add: контакт поднимается, легитимность
 //! сессии доказывается JOIN-конвертом (HMAC по secret). Секрет одноразовый.
+//! Старые коды shopot://i/ принимаются как legacy.
 const std = @import("std");
 
 pub const Error = error{
@@ -18,7 +19,9 @@ pub const max_name = 32;
 /// Длина одноразового секрета приглашения (v2).
 pub const secret_len = 16;
 /// Префикс v2-кода (URL-схема — кликабелен в мессенджерах/браузерах).
-pub const v2_prefix = "shopot://i/";
+pub const v2_prefix = "stille://i/";
+/// Префикс v2-кодов старого неймспейса: принимаем, но больше не генерим.
+pub const legacy_v2_prefix = "shopot://i/";
 
 /// Разобранный инвайт. host_len == 0 — адрес не указан (найдём через LAN).
 pub const Invite = struct {
@@ -118,12 +121,16 @@ pub fn encode2(buf: []u8, bundle: [64]u8, secret: [secret_len]u8, name: []const 
     return buf[0..n];
 }
 
-/// Разбирает код v1 (shopot1. или голый b64) или v2 (shopot://i/).
+/// Разбирает код v1 (shopot1. или голый b64) или v2 (stille://i/,
+/// legacy shopot://i/).
 pub fn decode(code: []const u8) Error!Invite {
     var s = code;
     var inv = Invite{};
     if (std.mem.startsWith(u8, s, v2_prefix)) {
         s = s[v2_prefix.len..];
+        inv.v2 = true;
+    } else if (std.mem.startsWith(u8, s, legacy_v2_prefix)) {
+        s = s[legacy_v2_prefix.len..];
         inv.v2 = true;
     } else if (std.mem.startsWith(u8, s, "shopot1.")) {
         s = s["shopot1.".len..];
@@ -197,6 +204,24 @@ test "invite: v2 roundtrip с секретом, именем и адресом" 
     try testing.expect(inv2.addr() == null);
 }
 
+test "invite: legacy shopot://i/ декодируется как v2" {
+    const testing = std.testing;
+    var bundle: [64]u8 = undefined;
+    for (&bundle, 0..) |*b, i| b.* = @truncate(i * 5);
+    var secret: [secret_len]u8 = undefined;
+    for (&secret, 0..) |*b, i| b.* = @truncate(i * 3);
+    var buf: [256]u8 = undefined;
+    const code = try encode2(&buf, bundle, secret, "mom", null);
+    try testing.expect(std.mem.startsWith(u8, code, v2_prefix));
+    var legacy_buf: [256]u8 = undefined;
+    const legacy = try std.fmt.bufPrint(&legacy_buf, "{s}{s}", .{ legacy_v2_prefix, code[v2_prefix.len..] });
+    const inv = try decode(legacy);
+    try testing.expect(inv.v2);
+    try testing.expectEqualSlices(u8, &bundle, &inv.bundle);
+    try testing.expectEqualSlices(u8, &secret, &inv.secret);
+    try testing.expectEqualStrings("mom", inv.name());
+}
+
 test "invite: v1 код после добавления v2 всё ещё читается" {
     const testing = std.testing;
     var bundle: [64]u8 = undefined;
@@ -231,12 +256,14 @@ test "invite: roundtrip с адресом и без" {
 // Гибридное одностороннее приглашение (0.3.0 / API 2.7.0): прямой LAN
 // endpoint + fallback-релей в ОДНОМ коде. Тело — строго типизированные
 // little-endian поля, base64url без паддинга, внешний @-хвост ЗАПРЕЩЁН
-// (адреса живут в теле). Префикс shopot://i3/ отдельный от v2: старое ядро
+// (адреса живут в теле). Префикс stille://i3/ отдельный от v2: старое ядро
 // отвергает код без скрытого downgrade, держатель различает версии до dial.
 // Секрет — тот же одноразовый secret16, что в v2; JOIN-конверт не меняется.
 
 /// Префикс v3-кода (гибрид direct+relay).
-pub const v3_prefix = "shopot://i3/";
+pub const v3_prefix = "stille://i3/";
+/// Префикс v3-кодов старого неймспейса: принимаем, но больше не генерим.
+pub const legacy_v3_prefix = "shopot://i3/";
 /// Максимум общей длины v3-кода в байтах (QR/передача).
 pub const v3_max_code = 512;
 /// Максимум строки адреса "host:port" в теле.
@@ -341,12 +368,19 @@ pub fn encode3(buf: []u8, bundle: [64]u8, secret: [secret_len]u8, name: []const 
     return buf[0 .. v3_prefix.len + enc_len];
 }
 
-/// Разбирает v3-код (shopot://i3/...): строгая валидация всех полей.
-/// Лишние биты flags, хвостовые байты тела, внешний '@' — отказ.
+/// Разбирает v3-код (stille://i3/..., legacy shopot://i3/...): строгая
+/// валидация всех полей. Лишние биты flags, хвостовые байты тела,
+/// внешний '@' — отказ.
 pub fn decode3(code: []const u8) Error!InviteV3 {
     if (code.len > v3_max_code) return Error.BadCode;
-    if (!std.mem.startsWith(u8, code, v3_prefix)) return Error.BadCode;
-    const s = code[v3_prefix.len..];
+    var s = code;
+    if (std.mem.startsWith(u8, s, v3_prefix)) {
+        s = s[v3_prefix.len..];
+    } else if (std.mem.startsWith(u8, s, legacy_v3_prefix)) {
+        s = s[legacy_v3_prefix.len..];
+    } else {
+        return Error.BadCode;
+    }
     // v3: адреса только в теле; '@' вне base64url-алфавита — чужой хвост
     if (std.mem.indexOfScalar(u8, s, '@') != null) return Error.BadCode;
     const dec = std.base64.url_safe_no_pad.Decoder;
@@ -413,6 +447,20 @@ test "invite: v3 roundtrip с обоими endpoint'ами" {
     var ab: [96]u8 = undefined;
     try testing.expectEqualStrings("192.168.100.100:7777", inv.direct.addr(&ab).?);
     try testing.expectEqualStrings("relay.example.com:9000", inv.relay.addr(&ab).?);
+}
+
+test "invite: legacy shopot://i3/ декодируется как v3" {
+    const testing = std.testing;
+    const bundle: [64]u8 = @splat(5);
+    var buf: [v3_max_code]u8 = undefined;
+    const code = try encode3(&buf, bundle, @splat(1), "a", "10.0.0.5:7777", null);
+    try testing.expect(std.mem.startsWith(u8, code, v3_prefix));
+    var legacy_buf: [v3_max_code]u8 = undefined;
+    const legacy = try std.fmt.bufPrint(&legacy_buf, "{s}{s}", .{ legacy_v3_prefix, code[v3_prefix.len..] });
+    const inv = try decode3(legacy);
+    try testing.expect(inv.has_direct and !inv.has_relay);
+    try testing.expectEqualStrings("a", inv.name());
+    try testing.expectEqualStrings("10.0.0.5", inv.direct.host());
 }
 
 test "invite: v3 только direct / только relay" {

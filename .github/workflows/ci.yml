@@ -38,4 +38,4 @@ jobs:
         run: zig build -Doptimize=ReleaseFast -Dcpu=baseline -Dtarget=${{ matrix.zig_target }}
       - name: Smoke test
         working-directory: core
-        run: ./zig-out/bin/stille-messenger 2>&1 | head -1
+        run: ./zig-out/bin/stille-messenger-core 2>&1 | head -1

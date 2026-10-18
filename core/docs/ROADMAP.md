@@ -6,7 +6,7 @@ Russian version: [ru/ROADMAP.md](ru/ROADMAP.md).
 
 ## P0 — ✅ DONE
 
-- ~~Relay~~: `stille-messenger relay` + `invite <name> relay <addr>` — HMAC
+- ~~Relay~~: `stille-messenger-core relay` + `invite <name> relay <addr>` — HMAC
   marker-pairing (invite secret), byte split, A-side self-reconnect
   (e2e: E2E-RELAY-PASS).
 - ~~Fake-TLS~~: wire disguised as TLS 1.3.

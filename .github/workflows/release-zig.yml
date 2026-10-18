@@ -38,9 +38,9 @@ jobs:
         working-directory: core
         shell: bash
         run: |
-          NAME="stille-messenger-${{ matrix.target }}"
+          NAME="stille-messenger-core-${{ matrix.target }}"
           mkdir -p "dist/$NAME"
-          cp zig-out/bin/stille-messenger "dist/$NAME/"
+          cp zig-out/bin/stille-messenger-core "dist/$NAME/"
           cp ../README.md "dist/$NAME/"
           mkdir -p "dist/$NAME/docs/assets"
           cp ../docs/assets/stille_logo.png "dist/$NAME/docs/assets/"
