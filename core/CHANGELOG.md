@@ -1,5 +1,26 @@
 # Changelog — stille-messenger
 
+## [Unreleased / неизданное] — API 2.7.0: single-key friend requests
+
+- One invite code is now the complete friend request: its holder accepts once;
+  the inviter automatically adds that peer only after validating the signed,
+  HMAC-authenticated JOIN. No second key or manual confirmation is required.
+  Added observable invite/connection status and bounded asynchronous connect
+  scheduling. v1 invite codes and peer protocol v5 remain compatible; storage
+  format is unchanged.
+- Hardened invitation processing: constant-time HMAC comparison, one-time
+  secret clearing, bounded pending JOIN sessions, and secret cleanup from
+  JOIN retry state.
+- Заявка в друзья теперь целиком состоит из одного инвайт-кода: получатель
+  принимает его один раз, приглашающий автоматически добавляет пира только
+  после проверки подписанного JOIN с HMAC. Второй ключ и ручное подтверждение
+  не нужны. Добавлены наблюдаемое состояние инвайта/подключения и ограниченная
+  асинхронная очередь соединений. Коды v1 и peer-протокол v5 совместимы,
+  формат хранилища не меняется.
+- Усилена обработка инвайтов: HMAC сравнивается за постоянное время, одноразовые
+  секреты стираются после погашения, число pending JOIN ограничено, секрет
+  очищается из состояния повторной отправки JOIN.
+
 ## [Unreleased / неизданное] — API 2.6.0: восстановление доступа
 
 - Added account recovery: `CREATE_RECOVERY_BACKUP` (41) seals the identity

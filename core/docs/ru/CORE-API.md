@@ -9,11 +9,14 @@
 — только типизированные байтовые кадры и машинные коды (методы, статусы,
 события).
 
-- Версия API: **2.6.0** (возвращается `GET_VERSION`, semver).
+- Версия API: **2.7.0** (возвращается `GET_VERSION`, semver).
+  2.7.0 добавляет заявки в друзья по одному ключу, наблюдаемое состояние
+  подключения, снимки/дельты контактов, поиск endpoint'ов, гибридные инвайты
+  и постраничную историю (§4.2, §4.11), без миграции протокола пиров/хранилища.
   2.6.0 добавляет восстановление доступа (§4.10: `CREATE_RECOVERY_BACKUP`/
   `RESTORE_RECOVERY_BACKUP`, статусы `BAD_RECOVERY`/`NOT_INITIALIZED`/
-  `ALREADY_PROVISIONED`) и непровижненный режим serve, без миграции
-  протокола пиров/хранилища. История: 2.5.0 — `GET_MY_AVATAR` (§4.4);
+  `ALREADY_PROVISIONED`) и непровижненный режим serve. История: 2.5.0 —
+  `GET_MY_AVATAR` (§4.4);
   2.0.0 — хвост entities в payload'ах сообщений (§4.3); 2.1.0 —
   `SEARCH_MESSAGE`/`GLOBAL_SEARCH_MESSAGE` (§4.3); 2.2.0 — закрепления и
   удаление чатов, закрепление сообщений, пересылка визитки (§4.8),
@@ -127,7 +130,7 @@
 ### 4.2 Контакты
 
 #### `CREATE_INVITE` (4)
-Payload: `[flags u8 (бит0 = relay)][name str16 ≤ 32][addr str16]`.
+Создаёт заявку в друзья с одним ключом. Payload: `[flags u8 (бит0 = relay)][name str16 ≤ 32][addr str16]`.
 - Пустое name → `stille-messenger`. `addr` — `host:port` (опционально: иначе держатель
   найдёт приглашающего по LAN-анонсу). `relay=1` требует `addr`;
   подключение пойдёт через релей — пир не видит ваш IP.
@@ -141,13 +144,55 @@ Payload: `[flags u8 (бит0 = relay)][name str16 ≤ 32][addr str16]`.
 
 #### `ACCEPT_INVITE` (5)
 Payload: `[code str16][my_name str16]`. **Единственное** действие держателя
-кода.
+кода и единственное подтверждение заявки, необходимое от пользователя.
 - `my_name` (≤ 32, пустой → `друг`) — увидит приглашающий.
 - Код с адресом — подключение немедленное; без — ядро ждёт LAN-анонс
   приглашающего / автодозванивается.
 - Статус подключения — по событиям `PRESENCE` (установка асинхронна).
+  Для v2/v3-инвайта без адреса `GET_CONTACT_STATE` сначала возвращает
+  `pending`, пока не найден маршрут через LAN; v1 остаётся в пути совместимости.
 
 Ответ: `[cid u32]`. Ошибки: `BAD_INVITE_CODE`, `BAD_ARGS`.
+
+#### Расширенные инвайты и наблюдение контактов (API 2.7.0)
+
+`CREATE_INVITE_EX` (49): `[mode u8][name str16][direct str16][relay str16]` →
+`[code str16][invite_id 16]`. Режимы: 0 discovery, 1 direct, 2 relay-only,
+3 direct-then-relay (отдельный версионированный гибридный код
+`shopot://i3/`). Адреса — `host:port`; direct запрещён при включённой Tor-маскировке.
+`invite_id` случайный и не секретный, по нему нельзя восстановить ключ инвайта.
+
+`GET_INVITE_STATE` (50): `[invite_id 16]` →
+`[state u8][accepted_cid u32][expires_at_ms i64]`. Состояния: 0 active,
+1 joining, 2 consumed, 3 expired (резерв), 4 failed. `joining` — валидный JOIN
+получен, выполняется bind; `consumed` фиксируется после bind. Дополнительного
+подтверждения пользователя эти статусы не требуют.
+
+`ACCEPT_INVITE_EX` (44) принимает тот же payload, что `ACCEPT_INVITE`, и
+возвращает `[cid u32][disposition u8][state u8][attempt u32]`. disposition:
+0 accepted, 1 already pending, 2 already connected. Dial ставится асинхронно;
+ответ не означает криптографическое доверие до JOIN.
+
+`GET_CONTACT_STATE` (43): `[cid u32]` →
+`[state u8][attempt u32][last_error u16][next_retry_ms u32]`. `ConnState`:
+0 pending, 1 discovering, 2 dialing, 3 handshaking, 4 joining, 5 online,
+6 offline, 7 failed. `ConnErr` 0–9: none, discovery disabled, transport
+unavailable, transport timeout, auth failed, join timeout, capacity exhausted,
+relay unreachable, Tor unavailable, canceled. Детали ошибки аутентификации
+не раскрываются.
+
+`SUBSCRIBE_CONTACT_UPDATES` (45) с пустым payload возвращает
+`[epoch 16][revision u64]` и включает события 15–17 на этом API-соединении.
+`GET_BOOTSTRAP` (46) возвращает `[version 3×u16][epoch 16][revision u64]
+[count u32] × {contact_view}`. `GET_CONTACTS_DELTA` (47) принимает
+`[epoch 16][from_revision u64]` и отдаёт изменения с ревизиями либо
+`RESYNC_REQUIRED`, если эпоха/окно устарели. `GET_REACHABLE_ENDPOINTS` (48)
+с пустым payload возвращает `[count u8] × [address str16]` — локальные IPv4
+кандидаты `host:port`, но не гарантию доступности. `GET_HISTORY_PAGE` (51)
+принимает `[cid u32][has_cursor u8][before_ts u64][before_msg_id 16][limit u16]`
+и возвращает `[has_more u8][next_ts u64][next_msg_id 16][count u32] × запись`;
+limit 0 → 30, максимум 200. `next_*` указывает на старейшую запись страницы
+и обнуляется, если страница пуста.
 
 #### `LIST_CONTACTS` (6)
 Payload: ∅. Ответ:
@@ -494,6 +539,11 @@ tag-пространством, которым владеет клиент. За
 | `REPLY_RECEIVED` | 13 | `[cid u32][msg_id 16][reply_to 16][ts_ms u64][name str16][body str16][хвост entities]` |
 | `CONFIG_CHANGED` | 14 | blob конфигурации (§4.9: `[ver u8][flags u32][server_addr str16][tor_addr str16]`) |
 
+События наблюдения за подключениями доступны после `SUBSCRIBE_CONTACT_UPDATES`:
+`CONTACT_STATE_CHANGED` сообщает состояние транспорта, а `CONTACT_UPSERTED`/
+`CONTACTS_CHANGED` — ревизии снимка. Они не заменяют аутентифицированный JOIN
+или `CONTACT_JOINED`.
+
 - `MESSAGE_RECEIVED.ts_ms` = локальное время приёма, совпадает с ts в
   GET_HISTORY. msg_id — то, на что адресуются реакции.
 - `PRESENCE`: рендерите статус только по этому событию — не опрашивать.
@@ -583,11 +633,11 @@ LIST_CONTACTS                     — полный снапшот контакт
 
 ### Добавление друга (один Wi-Fi)
 ```
-A: CREATE_INVITE{name:"мама"}             → code
-   (переслать код любым мессенджером)
+A: CREATE_INVITE{name:"мама"}             → один ключ-заявка
+   (переслать ключ любым мессенджером)
 B: ACCEPT_INVITE{code, my_name:"мама"}    → cid
    далее: сессия поднимается сама, PRESENCE online, текст ходит
-A: слушает CONTACT_JOINED
+A: получает CONTACT_JOINED; второй ключ и ручное подтверждение не нужны
 ```
 
 ### Дальние (за NAT, адрес известен)

@@ -226,3 +226,282 @@ test "invite: roundtrip с адресом и без" {
     try testing.expectEqualStrings("eryn", inv2.name());
     try testing.expect(inv2.addr() == null);
 }
+
+// ---------------------------------------------------------------- v3 (i3)
+// Гибридное одностороннее приглашение (0.3.0 / API 2.7.0): прямой LAN
+// endpoint + fallback-релей в ОДНОМ коде. Тело — строго типизированные
+// little-endian поля, base64url без паддинга, внешний @-хвост ЗАПРЕЩЁН
+// (адреса живут в теле). Префикс shopot://i3/ отдельный от v2: старое ядро
+// отвергает код без скрытого downgrade, держатель различает версии до dial.
+// Секрет — тот же одноразовый secret16, что в v2; JOIN-конверт не меняется.
+
+/// Префикс v3-кода (гибрид direct+relay).
+pub const v3_prefix = "shopot://i3/";
+/// Максимум общей длины v3-кода в байтах (QR/передача).
+pub const v3_max_code = 512;
+/// Максимум строки адреса "host:port" в теле.
+pub const v3_addr_max = 70;
+
+/// Endpoint "host:port": host — IPv4-литерал или имя (без ':'), порт 1..65535.
+pub const Endpoint = struct {
+    host_buf: [64]u8 = @splat(0),
+    host_len: u8 = 0,
+    port: u16 = 0,
+
+    pub fn host(self: *const Endpoint) []const u8 {
+        return self.host_buf[0..self.host_len];
+    }
+    /// "host:port" в буфер; null — endpoint не задан (host_len == 0).
+    pub fn addr(self: *const Endpoint, buf: []u8) ?[]const u8 {
+        if (self.host_len == 0 or self.port == 0) return null;
+        return std.fmt.bufPrint(buf, "{s}:{d}", .{ self.host(), self.port }) catch null;
+    }
+};
+
+/// Разобранное v3-приглашение: bundle, одноразовый секрет, имя и до двух
+/// endpoint'ов (direct — пробуется первым, relay — fallback).
+pub const InviteV3 = struct {
+    bundle: [64]u8 = @splat(0),
+    secret: [secret_len]u8 = @splat(0),
+    name_buf: [max_name]u8 = @splat(0),
+    name_len: u8 = 0,
+    direct: Endpoint = .{},
+    has_direct: bool = false,
+    relay: Endpoint = .{},
+    has_relay: bool = false,
+
+    pub fn name(self: *const InviteV3) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+};
+
+/// Тело v3 до base64 (все целые little-endian):
+/// [ver u8 = 3][flags u8][bundle 64][secret 16][name_len u16][name]
+/// [direct_len u16][direct][relay_len u16][relay].
+/// flags: bit0 = есть direct, bit1 = есть relay; прочие биты запрещены.
+const v3_body_fixed = 1 + 1 + 64 + secret_len + 2 + 2 + 2;
+const v3_body_max = v3_body_fixed + max_name + 2 * v3_addr_max;
+
+/// Строгий разбор "host:port" (host 1..64 без ':', порт 1..65535).
+fn parseEndpoint(s: []const u8) Error!Endpoint {
+    if (s.len == 0 or s.len > v3_addr_max) return Error.BadAddr;
+    const colon = std.mem.lastIndexOfScalar(u8, s, ':') orelse return Error.BadAddr;
+    const host = s[0..colon];
+    if (host.len == 0 or host.len > 64) return Error.BadAddr;
+    if (std.mem.indexOfScalar(u8, host, ':') != null) return Error.BadAddr;
+    const port = std.fmt.parseInt(u16, s[colon + 1 ..], 10) catch return Error.BadAddr;
+    if (port == 0) return Error.BadAddr;
+    var ep = Endpoint{};
+    @memcpy(ep.host_buf[0..host.len], host);
+    ep.host_len = @intCast(host.len);
+    ep.port = port;
+    return ep;
+}
+
+/// Кодирует v3 (гибрид): direct/relay — null или пустой срез = отсутствует;
+/// хотя бы один endpoint обязателен. Возвращает срез буфера.
+pub fn encode3(buf: []u8, bundle: [64]u8, secret: [secret_len]u8, name: []const u8, direct: ?[]const u8, relay: ?[]const u8) Error![]const u8 {
+    if (name.len == 0 or name.len > max_name) return Error.BadName;
+    const d: ?[]const u8 = if (direct) |a| (if (a.len > 0) a else null) else null;
+    const r: ?[]const u8 = if (relay) |a| (if (a.len > 0) a else null) else null;
+    if (d == null and r == null) return Error.BadCode;
+    if (d) |a| _ = try parseEndpoint(a);
+    if (r) |a| _ = try parseEndpoint(a);
+    var raw: [v3_body_max]u8 = undefined;
+    raw[0] = 3;
+    raw[1] = @as(u8, if (d != null) 1 else 0) | @as(u8, if (r != null) 2 else 0);
+    var n: usize = 2;
+    @memcpy(raw[n .. n + 64], &bundle);
+    n += 64;
+    @memcpy(raw[n .. n + secret_len], &secret);
+    n += secret_len;
+    std.mem.writeInt(u16, raw[n .. n + 2][0..2], @intCast(name.len), .little);
+    n += 2;
+    @memcpy(raw[n .. n + name.len], name);
+    n += name.len;
+    const dlen: u16 = if (d) |a| @intCast(a.len) else 0;
+    std.mem.writeInt(u16, raw[n .. n + 2][0..2], dlen, .little);
+    n += 2;
+    if (d) |a| {
+        @memcpy(raw[n .. n + a.len], a);
+        n += a.len;
+    }
+    const rlen: u16 = if (r) |a| @intCast(a.len) else 0;
+    std.mem.writeInt(u16, raw[n .. n + 2][0..2], rlen, .little);
+    n += 2;
+    if (r) |a| {
+        @memcpy(raw[n .. n + a.len], a);
+        n += a.len;
+    }
+    const enc_len = std.base64.url_safe_no_pad.Encoder.calcSize(n);
+    if (v3_prefix.len + enc_len > v3_max_code) return Error.BadCode;
+    if (buf.len < v3_prefix.len + enc_len) return Error.BadCode;
+    @memcpy(buf[0..v3_prefix.len], v3_prefix);
+    _ = std.base64.url_safe_no_pad.Encoder.encode(buf[v3_prefix.len .. v3_prefix.len + enc_len], raw[0..n]);
+    return buf[0 .. v3_prefix.len + enc_len];
+}
+
+/// Разбирает v3-код (shopot://i3/...): строгая валидация всех полей.
+/// Лишние биты flags, хвостовые байты тела, внешний '@' — отказ.
+pub fn decode3(code: []const u8) Error!InviteV3 {
+    if (code.len > v3_max_code) return Error.BadCode;
+    if (!std.mem.startsWith(u8, code, v3_prefix)) return Error.BadCode;
+    const s = code[v3_prefix.len..];
+    // v3: адреса только в теле; '@' вне base64url-алфавита — чужой хвост
+    if (std.mem.indexOfScalar(u8, s, '@') != null) return Error.BadCode;
+    const dec = std.base64.url_safe_no_pad.Decoder;
+    const n = dec.calcSizeForSlice(s) catch return Error.BadCode;
+    if (n < v3_body_fixed + 1) return Error.BadCode;
+    if (n > v3_body_max) return Error.BadCode;
+    var raw: [v3_body_max]u8 = undefined;
+    dec.decode(raw[0..n], s) catch return Error.BadCode;
+    if (raw[0] != 3) return Error.BadCode;
+    const flags = raw[1];
+    if (flags & ~@as(u8, 3) != 0) return Error.BadCode;
+    const has_direct = flags & 1 != 0;
+    const has_relay = flags & 2 != 0;
+    var inv = InviteV3{};
+    inv.bundle = raw[2 .. 2 + 64].*;
+    @memcpy(inv.secret[0..secret_len], raw[66 .. 66 + secret_len]);
+    var pos: usize = 66 + secret_len;
+    const name_len = std.mem.readInt(u16, raw[pos .. pos + 2][0..2], .little);
+    pos += 2;
+    if (name_len == 0 or name_len > max_name) return Error.BadName;
+    if (pos + name_len > n) return Error.BadCode;
+    inv.name_len = @intCast(name_len);
+    @memcpy(inv.name_buf[0..name_len], raw[pos .. pos + name_len]);
+    pos += name_len;
+    const dlen = std.mem.readInt(u16, raw[pos .. pos + 2][0..2], .little);
+    pos += 2;
+    if (has_direct != (dlen > 0)) return Error.BadCode;
+    if (pos + dlen > n) return Error.BadCode;
+    if (dlen > 0) {
+        inv.direct = try parseEndpoint(raw[pos .. pos + dlen]);
+        inv.has_direct = true;
+    }
+    pos += dlen;
+    const rlen = std.mem.readInt(u16, raw[pos .. pos + 2][0..2], .little);
+    pos += 2;
+    if (has_relay != (rlen > 0)) return Error.BadCode;
+    if (pos + rlen != n) return Error.BadCode;
+    if (rlen > 0) {
+        inv.relay = try parseEndpoint(raw[pos .. pos + rlen]);
+        inv.has_relay = true;
+    }
+    if (!inv.has_direct and !inv.has_relay) return Error.BadCode;
+    return inv;
+}
+
+test "invite: v3 roundtrip с обоими endpoint'ами" {
+    const testing = std.testing;
+    var bundle: [64]u8 = undefined;
+    for (&bundle, 0..) |*b, i| b.* = @truncate(i * 13);
+    const secret: [secret_len]u8 = @splat(0xCD);
+    var buf: [v3_max_code]u8 = undefined;
+    const code = try encode3(&buf, bundle, secret, "mom", "192.168.100.100:7777", "relay.example.com:9000");
+    try testing.expect(code.len <= v3_max_code);
+    try testing.expect(std.mem.startsWith(u8, code, v3_prefix));
+    const inv = try decode3(code);
+    try testing.expectEqualSlices(u8, &bundle, &inv.bundle);
+    try testing.expectEqualSlices(u8, &secret, &inv.secret);
+    try testing.expectEqualStrings("mom", inv.name());
+    try testing.expect(inv.has_direct and inv.has_relay);
+    try testing.expectEqualStrings("192.168.100.100", inv.direct.host());
+    try testing.expectEqual(@as(u16, 7777), inv.direct.port);
+    try testing.expectEqualStrings("relay.example.com", inv.relay.host());
+    try testing.expectEqual(@as(u16, 9000), inv.relay.port);
+    var ab: [96]u8 = undefined;
+    try testing.expectEqualStrings("192.168.100.100:7777", inv.direct.addr(&ab).?);
+    try testing.expectEqualStrings("relay.example.com:9000", inv.relay.addr(&ab).?);
+}
+
+test "invite: v3 только direct / только relay" {
+    const testing = std.testing;
+    const bundle: [64]u8 = @splat(5);
+    var buf: [v3_max_code]u8 = undefined;
+    const c1 = try encode3(&buf, bundle, @splat(1), "a", "10.0.0.5:7777", null);
+    const inv1 = try decode3(c1);
+    try testing.expect(inv1.has_direct and !inv1.has_relay);
+    // пустая строка = отсутствует
+    const c2 = try encode3(&buf, bundle, @splat(1), "a", "", "r.host:9000");
+    const inv2 = try decode3(c2);
+    try testing.expect(!inv2.has_direct and inv2.has_relay);
+}
+
+test "invite: v3 отказы — валидация полей" {
+    const testing = std.testing;
+    const bundle: [64]u8 = @splat(9);
+    var buf: [v3_max_code]u8 = undefined;
+    // без endpoint'ов
+    try testing.expectError(Error.BadCode, encode3(&buf, bundle, @splat(1), "a", null, null));
+    // невалидные адреса
+    try testing.expectError(Error.BadAddr, encode3(&buf, bundle, @splat(1), "a", "nohost:0", null));
+    try testing.expectError(Error.BadAddr, encode3(&buf, bundle, @splat(1), "a", "host:65536", null));
+    try testing.expectError(Error.BadAddr, encode3(&buf, bundle, @splat(1), "a", ":7777", null));
+    try testing.expectError(Error.BadAddr, encode3(&buf, bundle, @splat(1), "a", "host", null));
+    // имя вне диапазона
+    var long_name: [max_name + 1]u8 = @splat('x');
+    _ = &long_name;
+    try testing.expectError(Error.BadName, encode3(&buf, bundle, @splat(1), &long_name, "h:1", null));
+    // буфер мал
+    var small: [8]u8 = undefined;
+    try testing.expectError(Error.BadCode, encode3(&small, bundle, @splat(1), "a", "h:1", null));
+}
+
+test "invite: v3 отказы — структура тела" {
+    const testing = std.testing;
+    const bundle: [64]u8 = @splat(9);
+    var buf: [v3_max_code]u8 = undefined;
+    const code = try encode3(&buf, bundle, @splat(1), "mom", "10.0.0.5:7777", "r.host:9000");
+    // '@'-хвост запрещён
+    var tailed: [v3_max_code]u8 = undefined;
+    @memcpy(tailed[0..code.len], code);
+    tailed[code.len] = '@';
+    try testing.expectError(Error.BadCode, decode3(tailed[0 .. code.len + 1]));
+    // чужой префикс / пустой код
+    try testing.expectError(Error.BadCode, decode3("shopot://i/abc"));
+    try testing.expectError(Error.BadCode, decode3("shopot1.abc"));
+    try testing.expectError(Error.BadCode, decode3(""));
+    // тело с испорченным ver/флагами/хвостом: пересобираем base64 руками
+    const s = code[v3_prefix.len..];
+    const dec = std.base64.url_safe_no_pad.Decoder;
+    const n = dec.calcSizeForSlice(s) catch unreachable;
+    var raw: [v3_body_max]u8 = undefined;
+    dec.decode(raw[0..n], s) catch unreachable;
+    const tryBad = struct {
+        fn go(bad: []const u8, len: usize) Error!void {
+            var b64: [420]u8 = undefined;
+            const el = std.base64.url_safe_no_pad.Encoder.calcSize(len);
+            _ = std.base64.url_safe_no_pad.Encoder.encode(b64[0..el], bad[0..len]);
+            var full: [512]u8 = undefined;
+            @memcpy(full[0..v3_prefix.len], v3_prefix);
+            @memcpy(full[v3_prefix.len .. v3_prefix.len + el], b64[0..el]);
+            _ = try decode3(full[0 .. v3_prefix.len + el]);
+        }
+    }.go;
+    var bad: [v3_body_max]u8 = undefined;
+    // ver != 3
+    @memcpy(bad[0..n], raw[0..n]);
+    bad[0] = 2;
+    try testing.expectError(Error.BadCode, tryBad(&bad, n));
+    // лишний бит flags
+    @memcpy(bad[0..n], raw[0..n]);
+    bad[1] |= 4;
+    try testing.expectError(Error.BadCode, tryBad(&bad, n));
+    // бит флага без адреса (снимаем bit0, длина direct осталась)
+    @memcpy(bad[0..n], raw[0..n]);
+    bad[1] &= ~@as(u8, 1);
+    try testing.expectError(Error.BadCode, tryBad(&bad, n));
+    // хвостовой байт тела (лишняя длина relay_len)
+    @memcpy(bad[0..n], raw[0..n]);
+    bad[n] = 0;
+    try testing.expectError(Error.BadCode, tryBad(&bad, n + 1));
+}
+
+test "invite: v2 decode отвергает v3-код" {
+    const testing = std.testing;
+    const bundle: [64]u8 = @splat(3);
+    var buf: [v3_max_code]u8 = undefined;
+    const code = try encode3(&buf, bundle, @splat(1), "mom", "10.0.0.5:7777", null);
+    try testing.expectError(Error.BadCode, decode(code));
+}

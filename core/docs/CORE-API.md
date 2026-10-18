@@ -9,11 +9,14 @@ renders. The protocol is **binary**: no strings-as-protocol, no JSON, no
 human-readable text on the wire — only typed byte frames and machine-readable
 codes (methods, statuses, events).
 
-- API version: **2.6.0** (returned by `GET_VERSION`, semver).
+- API version: **2.7.0** (returned by `GET_VERSION`, semver).
+  2.7.0 adds one-key friend-request invites, observable connection state,
+  contact snapshots/deltas, endpoint discovery, hybrid invite codes and
+  paged history (§4.2, §4.11), without peer wire or storage migration.
   2.6.0 adds account recovery (§4.10: `CREATE_RECOVERY_BACKUP`/
   `RESTORE_RECOVERY_BACKUP`, statuses `BAD_RECOVERY`/`NOT_INITIALIZED`/
-  `ALREADY_PROVISIONED`) and the unprovisioned serve mode, without peer
-  wire or storage migration. History: 2.5.0 — `GET_MY_AVATAR` (§4.4);
+  `ALREADY_PROVISIONED`) and the unprovisioned serve mode. History: 2.5.0 —
+  `GET_MY_AVATAR` (§4.4);
   2.0.0 — formatting-entities tail in message payloads (§4.3); 2.1.0 —
   `SEARCH_MESSAGE`/`GLOBAL_SEARCH_MESSAGE` (§4.3); 2.2.0 — chat pinning/
   deletion, message pinning, contact-card sharing (§4.8), the
@@ -128,7 +131,7 @@ A major bump means this document's contract changed (see CHANGELOG).
 ### 4.2 Contacts
 
 #### `CREATE_INVITE` (4)
-Payload: `[flags u8 (bit0 = relay)][name str16 ≤ 32][addr str16]`.
+Creates a one-key friend request. Payload: `[flags u8 (bit0 = relay)][name str16 ≤ 32][addr str16]`.
 - Empty name → `stille-messenger`. `addr` is `host:port` (optional: otherwise the holder
   discovers the inviter via the LAN announcement). `relay=1` requires `addr`;
   the connection goes through a relay — the peer never sees your IP.
@@ -142,13 +145,57 @@ Errors: `TOO_MANY_INVITES`, `BAD_ARGS`.
 
 #### `ACCEPT_INVITE` (5)
 Payload: `[code str16][my_name str16]`. The **only** action of the code
-holder.
+holder and the only user-side confirmation required for a friend request.
 - `my_name` (≤ 32, empty → `друг`) is what the inviter will see.
 - A code with an address connects immediately; without one, the core waits
   for the inviter's LAN announcement / autodials.
 - Connection status arrives via `PRESENCE` events (establishment is async).
+  With a v2/v3 invite and no embedded route, `GET_CONTACT_STATE` starts at
+  `pending` until the inviter's LAN discovery route is found; v1 routes
+  remain on the legacy manual-add compatibility path.
 
 Response: `[cid u32]`. Errors: `BAD_INVITE_CODE`, `BAD_ARGS`.
+
+#### Extended invite and contact observation (API 2.7.0)
+
+`CREATE_INVITE_EX` (49) takes `[mode u8][name str16][direct str16][relay str16]`
+and responds `[code str16][invite_id 16]`. Modes: `0` discovery, `1` direct,
+`2` relay-only, `3` direct-then-relay (versioned `shopot://i3/` hybrid code).
+Addresses are `host:port`; direct modes are rejected while Tor IP masking is
+enabled. `invite_id` is random and non-secret; it cannot recover the invite key.
+
+`GET_INVITE_STATE` (50) takes `[invite_id 16]` and returns
+`[state u8][accepted_cid u32][expires_at_ms i64]`. States: 0 active, 1 joining,
+2 consumed, 3 expired (reserved), 4 failed. `joining` means a valid JOIN was
+received and bind is in progress; `consumed` is recorded after bind. Neither
+state is a request for another user confirmation.
+
+`ACCEPT_INVITE_EX` (44) has the same request payload as `ACCEPT_INVITE` and
+responds `[cid u32][disposition u8][state u8][attempt u32]`. Dispositions:
+0 accepted, 1 already pending, 2 already connected. It schedules dialing and
+returns immediately; it does not claim cryptographic trust before JOIN.
+
+`GET_CONTACT_STATE` (43) takes `[cid u32]` and returns
+`[state u8][attempt u32][last_error u16][next_retry_ms u32]`. `ConnState`:
+0 pending, 1 discovering, 2 dialing, 3 handshaking, 4 joining, 5 online,
+6 offline, 7 failed. `ConnErr` values 0–9 are none, discovery disabled,
+transport unavailable, transport timeout, auth failed, join timeout, capacity
+exhausted, relay unreachable, Tor unavailable, canceled. Auth failure details
+are intentionally not exposed.
+
+`SUBSCRIBE_CONTACT_UPDATES` (45) takes an empty payload, returns
+`[epoch 16][revision u64]`, and enables events 15–17 on that API connection.
+`GET_BOOTSTRAP` (46) returns `[version 3×u16][epoch 16][revision u64]
+[count u32] × {contact_view}`. `GET_CONTACTS_DELTA` (47) takes
+`[epoch 16][from_revision u64]`; it returns revisioned contact changes or
+`RESYNC_REQUIRED` when the epoch/window is stale. `GET_REACHABLE_ENDPOINTS` (48)
+takes an empty payload and returns `[count u8] × [address str16]` local IPv4
+`host:port` candidates (not a reachability guarantee). `GET_HISTORY_PAGE` (51)
+takes `[cid u32][has_cursor u8][before_ts u64][before_msg_id 16][limit u16]`
+and returns `[has_more u8][next_ts u64][next_msg_id 16][count u32] × history
+entry`, newest to oldest. The next cursor is exclusive; limit 0 defaults to 30,
+maximum 200. `next_*` identifies the oldest entry in the returned page and is
+zeroed when there is no page.
 
 #### `LIST_CONTACTS` (6)
 Payload: ∅. Response:
@@ -500,6 +547,11 @@ Broadcast to all connected clients, in any order, `request_id = 0`.
 | `REPLY_RECEIVED` | 13 | `[cid u32][msg_id 16][reply_to 16][ts_ms u64][name str16][body str16][entity tail]` |
 | `CONFIG_CHANGED` | 14 | config blob (§4.9: `[ver u8][flags u32][server_addr str16][tor_addr str16]`) |
 
+The connection-observation events are opt-in: call `SUBSCRIBE_CONTACT_UPDATES`
+before expecting events 15–17. `CONTACT_STATE_CHANGED` is a transport/UI
+state notification; `CONTACT_UPSERTED`/`CONTACTS_CHANGED` carry revisioned
+snapshot changes. They do not replace authenticated JOIN or `CONTACT_JOINED`.
+
 - `MESSAGE_RECEIVED.ts_ms` = local receive time, consistent with GET_HISTORY
   timestamps. The `msg_id` is what reactions address.
 - `PRESENCE`: render the online status from this event only — do not poll.
@@ -591,11 +643,11 @@ fail naturally (`NO_CONTACT`/`NO_SESSION`).
 
 ### Adding a friend (same Wi-Fi)
 ```
-A: CREATE_INVITE{name:"mom"}             → code
-   (relay the code through any messenger)
+A: CREATE_INVITE{name:"mom"}             → one friend-request key
+   (relay the key through any messenger)
 B: ACCEPT_INVITE{code, my_name:"mom"}    → cid
    then: the session comes up by itself, PRESENCE online, text flows
-A: listens for CONTACT_JOINED
+A: receives CONTACT_JOINED; no second key or manual confirmation is needed
 ```
 
 ### Remote (behind NAT, address known)

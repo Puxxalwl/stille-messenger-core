@@ -37,7 +37,14 @@ pub const header_len = 16;
 /// 2.6.0: восстановление доступа без истории — CREATE_RECOVERY_BACKUP (41),
 /// RESTORE_RECOVERY_BACKUP (42) и статусы BAD_RECOVERY/NOT_INITIALIZED/
 /// ALREADY_PROVISIONED; serve без сида поднимается в режиме восстановления.
-pub const api_version = [3]u16{ 2, 6, 0 };
+/// 2.7.0 (релиз 0.3.0): наблюдаемое подключение и быстрые снимки —
+/// GET_CONTACT_STATE (43), ACCEPT_INVITE_EX (44), SUBSCRIBE_CONTACT_UPDATES
+/// (45), GET_BOOTSTRAP (46), GET_CONTACTS_DELTA (47), GET_REACHABLE_ENDPOINTS
+/// (48), CREATE_INVITE_EX (49), GET_INVITE_STATE (50), GET_HISTORY_PAGE (51),
+/// события CONTACT_STATE_CHANGED (15), CONTACTS_CHANGED (16),
+/// CONTACT_UPSERTED (17) и статус RESYNC_REQUIRED (21). Все добавления
+/// аддитивны: старые методы/события/форматы не менялись.
+pub const api_version = [3]u16{ 2, 7, 0 };
 
 /// Тип кадра.
 pub const Kind = enum(u8) {
@@ -157,6 +164,55 @@ pub const Method = enum(u16) {
     /// чужой секрет — BAD_RECOVERY. После успеха профиль провижен, сеть
     /// поднимается сама.
     RESTORE_RECOVERY_BACKUP = 42,
+    /// Состояние подключения контакта: [cid u32] →
+    /// [state u8][attempt u32][last_error u16][next_retry_ms u32].
+    /// Snapshot-метод; события без опроса — SUBSCRIBE_CONTACT_UPDATES +
+    /// CONTACT_STATE_CHANGED.
+    GET_CONTACT_STATE = 43,
+    /// Погасить инвайт-код (расширенный): payload как у ACCEPT_INVITE
+    /// ([code str16][my_name str16]) →
+    /// [cid u32][disposition u8][state u8][attempt u32].
+    /// disposition: 0 accepted, 1 already_pending, 2 already_connected.
+    /// Подключение НЕ блокирует ответ: dial уходит в планировщик.
+    ACCEPT_INVITE_EX = 44,
+    /// Подписаться на новые события контактов (CONTACT_STATE_CHANGED,
+    /// CONTACTS_CHANGED, CONTACT_UPSERTED): ∅ → [epoch 16][revision u64].
+    /// События до подписки не доставляются; подписка per-соединение.
+    SUBSCRIBE_CONTACT_UPDATES = 45,
+    /// Единый снимок для старта GUI: ∅ →
+    /// [ver 3×u16][epoch 16][revision u64][count u32] × {contact_view}.
+    /// contact_view: [cid u32][flags u8 bit0 online bit1 blocked
+    /// bit2 pending][last_seen_ms i64][name str16][avatar_id 16]
+    /// [state u8][attempt u32][last_error u16][next_retry_ms u32].
+    GET_BOOTSTRAP = 46,
+    /// Инкрементальная выгрузка изменений: [epoch 16][from_revision u64] →
+    /// [epoch 16][to_revision u64][count u32] × {[revision u64][kind u8
+    /// (0 upsert, 1 removed)][cid u32] + contact_view (только upsert)}.
+    /// Чужая эпоха или ревизия выпала из кольца — RESYNC_REQUIRED;
+    /// будущая ревизия — BAD_ARGS.
+    GET_CONTACTS_DELTA = 47,
+    /// Прямые LAN-адреса для QR: ∅ → [count u8] × [address str16]
+    /// ("ip:port"). Пусто при выключенном листенере или use_tor_mask.
+    GET_REACHABLE_ENDPOINTS = 48,
+    /// Создать инвайт-код (расширенный): [mode u8][name str16 ≤ 32]
+    /// [direct str16][relay str16] → [code str16][invite_id 16].
+    /// mode: 0 discovery (адреса пусты, v2-код), 1 direct, 2 relay_only,
+    /// 3 direct_then_relay (гибрид v3-код shopot://i3/). invite_id —
+    /// случайный НЕсекретный идентификатор для GET_INVITE_STATE.
+    CREATE_INVITE_EX = 49,
+    /// Состояние приглашения: [invite_id 16] →
+    /// [state u8][accepted_cid u32][expires_at_ms i64 (0 = бессрочно)].
+    /// state: 0 active, 1 joining, 2 consumed, 3 expired, 4 failed.
+    /// joining означает, что валидный JOIN принят и идёт bind; consumed —
+    /// bind завершён. CONTACT_JOINED выдаётся только после bind.
+    GET_INVITE_STATE = 50,
+    /// Страница истории (cursor-based): [cid u32][has_cursor u8]
+    /// [before_ts u64][before_msg_id 16][limit u16 (0 → 30, ≤ 200)] →
+    /// [has_more u8][next_ts u64][next_msg_id 16][count u32] × {запись
+    /// GET_HISTORY}. has_cursor=0 — последние сообщения; курсор
+    /// эксклюзивный, записи старые → новые, next_* = самое старое выданное
+    /// (нули = конец истории).
+    GET_HISTORY_PAGE = 51,
 };
 
 /// Коды статуса ответа (u16 на проводе, имена SCREAMING_SNAKE — контракт;
@@ -207,6 +263,10 @@ pub const Status = enum(u16) {
     /// Профиль уже существует: RESTORE_RECOVERY_BACKUP требует пустой
     /// профиль (перезапись живого — отдельная явная операция сброса).
     ALREADY_PROVISIONED = 20,
+    /// Delta-выгрузка невозможна: чужая эпоха демона или запрошенная
+    /// ревизия выпала из кольца изменений. Клиент обязан сделать полный
+    /// GET_BOOTSTRAP.
+    RESYNC_REQUIRED = 21,
     /// Внутренняя ошибка ядра.
     INTERNAL = 255,
 };
@@ -247,6 +307,110 @@ pub const Event = enum(u16) {
     /// другого устройства через device_sync): payload — новый blob
     /// [ver u8][flags u32][server_addr str16][tor_addr str16].
     CONFIG_CHANGED = 14,
+    /// Стадия подключения контакта изменилась (только подписанным):
+    /// [epoch 16][revision u64][cid u32][state u8][attempt u32]
+    /// [last_error u16][next_retry_ms u32] — поля как GET_CONTACT_STATE.
+    /// revision здесь — общая ревизия представления контактов.
+    CONTACT_STATE_CHANGED = 15,
+    /// Представление контактов изменилось (только подписанным):
+    /// [epoch 16][revision u64]. Полный вид — CONTACT_UPSERTED или
+    /// GET_CONTACTS_DELTA/GET_BOOTSTRAP.
+    CONTACTS_CHANGED = 16,
+    /// Полный контакт-view (только подписанным): [epoch 16][revision u64]
+    /// [cid u32] + contact_view (поля как GET_BOOTSTRAP). Заменяет собой
+    /// «дёрнуть LIST_CONTACTS» после CONTACT_JOINED/CONTACT_PROFILE.
+    CONTACT_UPSERTED = 17,
+};
+
+/// Стадия установки соединения с контактом (u8 на проводе).
+pub const ConnState = enum(u8) {
+    /// Принят, ожидает первой попытки (контакт без адреса — ждёт LAN).
+    pending = 0,
+    /// Ждём анонса пира в LAN (мультикаст) — адреса нет.
+    discovering = 1,
+    /// TCP/relay dial идёт (блокирующая фаза транспорта).
+    dialing = 2,
+    /// Транспорт поднят, идёт рукопожатие (X25519+ML-KEM).
+    handshaking = 3,
+    /// JOIN отправлен, ждём PROFILE-эхо пира (подтверждение добавления).
+    joining = 4,
+    /// Сессия жива и аутентифицирована.
+    online = 5,
+    /// Живой сессии нет; автодозвон/пир поднимет её.
+    offline = 6,
+    /// Последняя попытка провалилась; см. last_error и next_retry_ms.
+    failed = 7,
+};
+
+/// Код последней ошибки подключения (u16 на проводе; не строки — контракт).
+pub const ConnErr = enum(u16) {
+    none = 0,
+    /// LAN-discovery выключен конфигурацией (lan_discovery = 0).
+    discovery_disabled = 1,
+    /// Транспорт недоступен (нет маршрута/интерфейса, dial отказал).
+    transport_unavailable = 2,
+    /// Транспорт не ответил за отведённое окно (таймаут dial/handshake).
+    transport_timeout = 3,
+    /// Аутентификация не прошла (рукопожатие/JOIN отвергнут). Детали не
+    /// раскрываются намеренно (без oracle).
+    auth_failed = 4,
+    /// PROFILE-эхо после JOIN не пришло за окно наблюдения.
+    join_timeout = 5,
+    /// Планировщик подключений переполнен (очередь/активные слоты).
+    capacity_exhausted = 6,
+    /// Relay-маршрут недоступен (dial к релею отказал).
+    relay_unreachable = 7,
+    /// Tor SOCKS5-прокси недоступен (use_tor_mask включён).
+    tor_unavailable = 8,
+    /// Попытка отменена (блокировка/удаление чата/выключение).
+    canceled = 9,
+};
+
+/// Расширенный ответ ACCEPT_INVITE_EX (u8 на проводе): информирует о
+/// постановке работы, НЕ о доверии — контакт подтверждается только
+/// аутентифицированным JOIN (см. PROTOCOL.md §6).
+pub const AcceptDisposition = enum(u8) {
+    /// Код погашен, контакт создан/найден, работа подключению поставлена.
+    accepted = 0,
+    /// Контакт уже есть и подключение уже в очереди/в полёте.
+    already_pending = 1,
+    /// С контактом уже живая сессия — новая работа не ставилась.
+    already_connected = 2,
+};
+
+/// Режим CREATE_INVITE_EX (u8 на проводе).
+pub const InviteExMode = enum(u8) {
+    /// Адресов нет: v2-код без адреса, держатель ждёт LAN-анонс.
+    discovery = 0,
+    /// Прямой адрес: v2-код с @direct.
+    direct = 1,
+    /// Relay-адрес: v2-код с @r/relay (IP скрыт).
+    relay_only = 2,
+    /// Гибрид: v3-код shopot://i3/ (direct, затем relay-fallback).
+    direct_then_relay = 3,
+};
+
+/// Состояние приглашения для GET_INVITE_STATE (u8 на проводе).
+pub const InviteState = enum(u8) {
+    /// Секрет жив, ждёт держателя кода.
+    active = 0,
+    /// Валидный JOIN получен, бинд идёт (короткое окно).
+    joining = 1,
+    /// Секрет погашен, контакт добавлен.
+    consumed = 2,
+    /// TTL кончился (в текущей модели не используется — коды живут до
+    /// рестарта демона; значение зарезервировано).
+    expired = 3,
+    /// JOIN дошёл, но бинд/добавление провалились.
+    failed = 4,
+};
+
+/// Тип изменения в GET_CONTACTS_DELTA (u8 на проводе).
+pub const DeltaChange = enum(u8) {
+    /// Запись/обновление контакта: за заголовком следует contact_view.
+    upsert = 0,
+    /// Чат удалён (tombstone): contact_view нет.
+    removed = 1,
 };
 
 /// Состояние звонка для события CALL_STATE.
@@ -482,6 +646,32 @@ test "method ids стабильны (контракт провода)" {
     try std.testing.expectEqual(@as(u16, 12), @backingInt(Event.CONTACT_CARD));
     // событие CONFIG_CHANGED — 2.4.0
     try std.testing.expectEqual(@as(u16, 14), @backingInt(Event.CONFIG_CHANGED));
+    // наблюдаемое подключение и снимки — 2.7.0 (релиз 0.3.0)
+    try std.testing.expectEqual(@as(u16, 43), @backingInt(Method.GET_CONTACT_STATE));
+    try std.testing.expectEqual(@as(u16, 44), @backingInt(Method.ACCEPT_INVITE_EX));
+    try std.testing.expectEqual(@as(u16, 45), @backingInt(Method.SUBSCRIBE_CONTACT_UPDATES));
+    try std.testing.expectEqual(@as(u16, 46), @backingInt(Method.GET_BOOTSTRAP));
+    try std.testing.expectEqual(@as(u16, 47), @backingInt(Method.GET_CONTACTS_DELTA));
+    try std.testing.expectEqual(@as(u16, 48), @backingInt(Method.GET_REACHABLE_ENDPOINTS));
+    try std.testing.expectEqual(@as(u16, 49), @backingInt(Method.CREATE_INVITE_EX));
+    try std.testing.expectEqual(@as(u16, 50), @backingInt(Method.GET_INVITE_STATE));
+    try std.testing.expectEqual(@as(u16, 51), @backingInt(Method.GET_HISTORY_PAGE));
+    try std.testing.expectEqual(@as(u16, 15), @backingInt(Event.CONTACT_STATE_CHANGED));
+    try std.testing.expectEqual(@as(u16, 16), @backingInt(Event.CONTACTS_CHANGED));
+    try std.testing.expectEqual(@as(u16, 17), @backingInt(Event.CONTACT_UPSERTED));
+    try std.testing.expectEqual(@as(u16, 21), @backingInt(Status.RESYNC_REQUIRED));
+    // значения стадий подключения — контракт u8
+    try std.testing.expectEqual(@as(u8, 0), @backingInt(ConnState.pending));
+    try std.testing.expectEqual(@as(u8, 7), @backingInt(ConnState.failed));
+    try std.testing.expectEqual(@as(u16, 0), @backingInt(ConnErr.none));
+    try std.testing.expectEqual(@as(u16, 9), @backingInt(ConnErr.canceled));
+    try std.testing.expectEqual(@as(u8, 0), @backingInt(AcceptDisposition.accepted));
+    try std.testing.expectEqual(@as(u8, 2), @backingInt(AcceptDisposition.already_connected));
+    try std.testing.expectEqual(@as(u8, 3), @backingInt(InviteExMode.direct_then_relay));
+    try std.testing.expectEqual(@as(u8, 4), @backingInt(InviteState.failed));
+    try std.testing.expectEqual(@as(u8, 1), @backingInt(DeltaChange.removed));
+    try std.testing.expectEqual(@as(u16, 2), api_version[0]);
+    try std.testing.expectEqual(@as(u16, 7), api_version[1]);
 }
 
 test "reader/writer round-trip" {

@@ -88,6 +88,12 @@ persist* (app, under app.mu)
 - Server-mode presence threads (one per contact when `server_mode` is on)
   re-read the configuration each iteration; turning the mode off stops
   them at the next cycle without teardown signalling.
+- Invite connection scheduling is bounded and asynchronous: `connq_mu` is a
+  leaf lock held only while queue metadata is changed, with at most 64 queued
+  jobs and 4 active dial workers. One in-flight job is allowed per contact.
+  Direct-to-relay fallback is permitted only during transport dial, never
+  after handshake or JOIN authentication begins. Unknown incoming invite
+  sessions are capped at 16 and have a 3-second pending-JOIN deadline.
 
 ## 5. Error and memory model
 

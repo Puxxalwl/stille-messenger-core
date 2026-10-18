@@ -45,6 +45,12 @@ pub const Conn = struct {
     /// Payload текущего запроса (аллоцирован по длине заголовка).
     payload: ?[]u8 = null,
     payload_have: usize = 0,
+    /// Подписка на новые события контактов (SUBSCRIBE_CONTACT_UPDATES,
+    /// 2.7.0): CONTACT_STATE_CHANGED/CONTACTS_CHANGED/CONTACT_UPSERTED
+    /// доставляются ТОЛЬКО подписанным соединениям — старые клиенты их
+    /// не получают вовсе (обратная совместимость без клиентской фильтрации).
+    /// Читается/ставится под app.mu (как список conns).
+    subscribed: bool = false,
 
     /// Записать кадр целиком (заголовок + payload) под wmu.
     fn sendFrame(self: *Conn, hdr: api.Header, payload: []const u8) void {
@@ -114,6 +120,16 @@ pub const Server = struct {
 pub fn fanoutEventLocked(app: *main.App, ev: api.Event, payload: []const u8) void {
     const srv = app.cli orelse return;
     for (srv.conns.items) |c| c.sendEvent(ev, payload);
+}
+
+/// Разослать событие ТОЛЬКО подписанным (SUBSCRIBE_CONTACT_UPDATES)
+/// клиентам (ВЫЗЫВАТЬ ПОД app.mu). Новые события контактов 2.7.0 не
+/// доставляются старым клиентам — их провод расширяется без их ведома.
+pub fn fanoutSubEventLocked(app: *main.App, ev: api.Event, payload: []const u8) void {
+    const srv = app.cli orelse return;
+    for (srv.conns.items) |c| {
+        if (c.subscribed) c.sendEvent(ev, payload);
+    }
 }
 
 /// Обработка одного собранного кадра-запроса. false — закрыть соединение.

@@ -192,7 +192,12 @@ The engine sends TEXT only through `sendSealedText`; on reconnect the outbox
 is flushed in batches: `[len][sealed] || [len][sealed] …` in one `writeAll`,
 which the obfuscation layer packs into a single padded frame (coalescing).
 
-## 6. Invitations (v2, one-way, JOIN)
+## 6. Invitations (v2, one-key friend request, JOIN)
+
+The invite is the request itself: the inviter creates and shares one code; the
+recipient accepts it once. The inviter does not enter a second code or perform
+a separate confirmation. The recipient's authenticated `JOIN` proves possession
+of the one-time invite secret and automatically adds the recipient as a contact.
 
 Invitation code (created by the inviter, handed over out of band):
 
@@ -203,6 +208,8 @@ shopot://i/<base64url(bundle[64] || secret[16] || name_len u8 || name ≤32)>
 ```
 
 - The 16-byte `secret` is one-time, held in the inviter's memory only.
+  Invite state is bounded to four live registrations; unknown pending JOIN
+  sessions are capped at 16 per daemon and expire after 3 seconds.
 - The code holder performs exactly **one** action (accept) and is always the
   connection initiator: it dials the embedded address, or captures the
   inviter's LAN announcement.

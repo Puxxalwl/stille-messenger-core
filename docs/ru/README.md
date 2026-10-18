@@ -35,6 +35,13 @@ C++-версия (v0.2.4, FTXUI/MQTT/WebRTC) удалена из master; арх�
 в шифрованном логе; незашифрованный дисковый кэш клиенту не нужен.
 Подробности — в [спецификации API](../../core/docs/ru/CORE-API.md#44-свой-профиль).
 
+Добавление друга — заявка с одним ключом: `CREATE_INVITE` создаёт один код
+`shopot://i/...`, держатель выполняет ровно один `ACCEPT_INVITE`. Приглашающему
+не нужен второй ключ или ручное подтверждение: ядро проверяет подписанный JOIN
+с HMAC и автоматически добавляет пира. API 2.7.0 также показывает состояния
+инвайта и асинхронного подключения; для гибридной маршрутизации доступен
+v3-код `shopot://i3/...` (сначала direct, затем relay).
+
 Потерянное устройство не теряет аккаунт: `stille-messenger serve` без файла
 сида стартует непровижненным и ждёт
 [`RESTORE_RECOVERY_BACKUP`](../../core/docs/ru/CORE-API.md#410-восстановление-доступа-начиная-с-api-260)
@@ -67,12 +74,8 @@ stille-messenger serve         # демон: ядро + UDS-апи (~/.shopot/ap
 Интерфейса командной строки нет: единственный клиент — GUI, подключающийся
 к ядру по UDS бинарным кадровым протоколом (типизированные ответы, машинные
 коды ошибок, события). Спецификация для авторов клиента:
-[`core/docs/ru/CORE-API.md`](../../core/docs/ru/CORE-API.md) (API 2.6.0).
+[`core/docs/ru/CORE-API.md`](../../core/docs/ru/CORE-API.md) (API 2.7.0).
 
-Добавление друга — одно действие: `CREATE_INVITE` выдаёт односторонний код
-(`shopot://i/...`), держатель делает единственный `ACCEPT_INVITE`. Контакт,
-сессия и доставка поднимаются ядром сами (LAN-поиск, автодозвон,
-офлайн-outbox, подтверждения доставки ACK).
 
 ## Релей (скрытие IP)
 
@@ -103,7 +106,7 @@ stille-messenger serve         # демон: ядро + UDS-апи (~/.shopot/ap
 
 | Документ | Содержание |
 |---|---|
-| [`core/docs/ru/CORE-API.md`](../../core/docs/ru/CORE-API.md) / [en](../../core/docs/CORE-API.md) | бинарный UDS-интерфейс для GUI-клиентов (API 2.6.0) |
+| [`core/docs/ru/CORE-API.md`](../../core/docs/ru/CORE-API.md) / [en](../../core/docs/CORE-API.md) | бинарный UDS-интерфейс для GUI-клиентов (API 2.7.0) |
 | [`docs/ru/CLIENT_RULES.md`](CLIENT_RULES.md) / [en](../../CLIENT_RULES.md) | обязательный контракт GUI-клиентов: бутстрап, события, UX восстановления |
 | [`core/docs/ru/PROTOCOL.md`](../../core/docs/ru/PROTOCOL.md) / [en](../../core/docs/PROTOCOL.md) | байтовая спецификация провода v4 |
 | [`core/docs/ru/ARCHITECTURE.md`](../../core/docs/ru/ARCHITECTURE.md) / [en](../../core/docs/ARCHITECTURE.md) | слои, потоки данных, трединг |

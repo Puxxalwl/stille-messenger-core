@@ -2,6 +2,7 @@
 //! Интерфейс для клиентов — UDS-апи (cli_server.zig, см. docs/CORE-API.md).
 //! Контакты, история и блокировки — в шифрованном логе (~/.shopot/zig-log).
 const std = @import("std");
+const builtin = @import("builtin");
 const stille_messenger = @import("stille-messenger");
 
 const identity = stille_messenger.crypto.identity;
@@ -14,6 +15,7 @@ const tcp = stille_messenger.net.tcp;
 const store_mod = stille_messenger.store.log;
 const interfaces = stille_messenger.core.interfaces;
 const invite_mod = @import("invite.zig");
+const endpoints_mod = @import("endpoints.zig");
 const discover_mod = @import("discover.zig");
 const audio_mod = @import("audio.zig");
 const adpcm_mod = @import("adpcm.zig");
@@ -26,6 +28,7 @@ const config_mod = stille_messenger.app.config;
 const sync_mod = stille_messenger.app.sync;
 const socks5 = stille_messenger.net.socks5;
 const sysfd = stille_messenger.net.sysfd;
+const posix = std.posix;
 
 const usage =
     \\stille-messenger — ядро шифрованного мессенджера (std-only Zig).
@@ -43,6 +46,8 @@ pub const app_home_max = 512;
 // (root main.zig) собирает тесты только явно процитированных файлов
 test {
     _ = @import("recovery.zig");
+    _ = @import("invite.zig");
+    _ = @import("endpoints.zig");
 }
 
 /// $HOME копия App.home_buf.
@@ -172,6 +177,8 @@ pub const App = struct {
     // ---- Односторонние инвайты (v2) ----
     /// Выданные приглашения: секрет ждёт предъявителя JOIN-конвертом.
     invites: [4]InviteReg = @splat(.{}),
+    /// Число pending-сессий, ожидающих JOIN; ограничивает неизвестные входы.
+    pending_sessions: u32 = 0,
     /// JOIN-данные по cid: отправить первым конвертом после рукопожатия.
     join_map: std.AutoHashMapUnmanaged(i64, JoinInfo) = .empty,
     /// Кэш аватаров: avatar_id -> байты (из лога kind AVATAR).
@@ -222,6 +229,36 @@ pub const App = struct {
     /// server-присутствие) — поток с dial'ами переживёт приложение из
     /// tmp-каталога. Продуктовый код флаг не устанавливает.
     no_network: bool = false,
+
+    // ---- наблюдаемое подключение и снимки (2.7.0 / релиз 0.3.0) ----
+    /// Очередь работ подключения и слоты активных попыток: connq_mu.
+    connq_mu: std.Io.Mutex = .init,
+    conn_work: std.ArrayListUnmanaged(ConnWork) = .empty,
+    /// cid -> «в очереди или в полёте» (single-flight на контакт).
+    conn_inflight: std.AutoHashMapUnmanaged(i64, void) = .empty,
+    conn_active: u32 = 0,
+    /// Состояния подключения (app.mu): GET_CONTACT_STATE/события.
+    conn_st: std.AutoHashMapUnmanaged(i64, ConnEntry) = .empty,
+    /// Ждём PROFILE-эхо после JOIN: cid -> монотонный дедлайн, нс (app.mu).
+    conn_await: std.AutoHashMapUnmanaged(i64, i128) = .empty,
+    /// Эпоха представления контактов: случайные НЕсекретные 16 байт,
+    /// меняется на рестарте демона (клиент обязан resync).
+    contacts_epoch: [16]u8 = @splat(0),
+    /// Монотонная ревизия представления контактов (app.mu): растёт на
+    /// каждом изменении contact_view (контакт/presence/state/avatar).
+    contacts_rev: u64 = 0,
+    /// Кольцо изменений для delta-выгрузки (app.mu): окно последних
+    /// contact_ring_cap записей; пропавшая ревизия — RESYNC_REQUIRED.
+    contacts_ring: [contact_ring_cap]ContactChange = @splat(.{}),
+    contacts_ring_len: usize = 0,
+    contacts_ring_pos: usize = 0,
+    /// Завершённые приглашения (диагностика GET_INVITE_STATE, app.mu).
+    invite_done: [invite_done_cap]InviteDone = @splat(.{}),
+    invite_done_pos: usize = 0,
+    invite_done_len: usize = 0,
+    /// Слушатель автолистенера поднят (startNetworking): без него
+    /// GET_REACHABLE_ENDPOINTS честно возвращает пустой список.
+    listening: bool = false,
 
     /// Профиль провижен: сид на диске, личность своя, лог открыт.
     /// false — режим восстановления (serve без сида): эфемерная личность,
@@ -279,6 +316,15 @@ pub const App = struct {
         syncFlushLocked(self, cid);
         // PROFILE-эхо: имя + avatar_id пир-у при каждом установлении
         self.eng.sendProfile(cid) catch {};
+        // наблюдаемое состояние (2.7.0): сессия аутентифицирована; ждём
+        // PROFILE-эхо после JOIN — JOINING (пир ещё не подтвердил добавление),
+        // иначе ONLINE
+        if (self.conn_await.contains(cid)) {
+            connSetLocked(self, cid, .joining, .none, null);
+        } else {
+            connSetLocked(self, cid, .online, .none, null);
+        }
+        bumpContactLocked(self, cid);
     }
 
     fn events(self: *App) engine_mod.Events {
@@ -451,6 +497,402 @@ fn evConfigChanged(app: *App) void {
     var buf: [config_mod.blob_max]u8 = undefined;
     const blob = app.cfg.encode(&buf) catch return;
     api_srv.fanoutEventLocked(app, .CONFIG_CHANGED, blob);
+}
+
+// ----------------------------- наблюдаемое подключение (2.7.0 / 0.3.0)
+
+/// CONTACT_STATE_CHANGED (только подписанным): [epoch 16][revision u64]
+/// [cid u32][state u8][attempt u32][last_error u16][next_retry_ms u32].
+/// ВЫЗЫВАТЬ ПОД app.mu.
+fn evContactStateChangedLocked(app: *App, cid: i64) void {
+    var w = api.Writer.init(app.alloc);
+    defer w.deinit();
+    w.putBytes(&app.contacts_epoch) catch return;
+    w.putU64(app.contacts_rev) catch return;
+    w.putU32(@intCast(cid)) catch return;
+    const e = app.conn_st.get(cid) orelse ConnEntry{};
+    w.putU8(e.state) catch return;
+    w.putU32(e.attempt) catch return;
+    w.putU16(e.last_error) catch return;
+    w.putU32(retryRemainingMs(e.next_retry_at, app.nowMs())) catch return;
+    api_srv.fanoutSubEventLocked(app, .CONTACT_STATE_CHANGED, w.items());
+}
+
+/// CONTACT_UPSERTED (только подписанным): [epoch 16][revision u64]
+/// [cid u32] + contact_view. ВЫЗЫВАТЬ ПОД app.mu.
+fn evContactUpsertedLocked(app: *App, cid: i64) void {
+    var w = api.Writer.init(app.alloc);
+    defer w.deinit();
+    w.putBytes(&app.contacts_epoch) catch return;
+    w.putU64(app.contacts_rev) catch return;
+    w.putU32(@intCast(cid)) catch return;
+    putContactViewLocked(app, &w, cid) catch return;
+    api_srv.fanoutSubEventLocked(app, .CONTACT_UPSERTED, w.items());
+}
+
+/// CONTACTS_CHANGED (только подписанным): [epoch 16][revision u64] —
+/// «представление изменилось, вытяни delta» (removal и объёмные случаи).
+/// ВЫЗЫВАТЬ ПОД app.mu.
+fn evContactsChangedLocked(app: *App) void {
+    var w = api.Writer.init(app.alloc);
+    defer w.deinit();
+    w.putBytes(&app.contacts_epoch) catch return;
+    w.putU64(app.contacts_rev) catch return;
+    api_srv.fanoutSubEventLocked(app, .CONTACTS_CHANGED, w.items());
+}
+
+/// Контакт ещё НЕ подтверждён пиром: JOIN не отправлен или PROFILE-эхо
+/// после JOIN не получено. Имя такого контакта — локальная подсказка из
+/// кода, НЕ аутентифицированный профиль. ВЫЗЫВАТЬ ПОД app.mu.
+fn contactPendingLocked(app: *App, cid: i64) bool {
+    return app.join_map.contains(cid) or app.conn_await.contains(cid);
+}
+
+/// Верхняя граница сериализованного contact_view (бюджет кадра:
+/// 4+1+8+2+32+16+1+4+2+4 = 74 байта + str16-заголовок учтён).
+const contact_view_size: usize = 4 + 1 + 8 + 2 + invite_mod.max_name + 16 + 1 + 4 + 2 + 4;
+
+/// Эффективное состояние подключения контакта (view-семантика): запись
+/// есть — её значение; нет — по факту сессии (online/offline).
+/// ВЫЗЫВАТЬ ПОД app.mu.
+fn connStateOfLocked(app: *App, cid: i64) api.ConnState {
+    if (app.conn_st.get(cid)) |e| return @fromBackingInt(@intCast(e.state));
+    const idx = app.eng.findIndex(cid) orelse return .offline;
+    return if (app.eng.contacts.items[idx].online) .online else .offline;
+}
+
+/// Записать contact_view в сборщик ответа: [cid u32][flags u8 bit0 online
+/// bit1 blocked bit2 pending][last_seen_ms i64][name str16][avatar_id 16]
+/// [state u8][attempt u32][last_error u16][next_retry_ms u32].
+/// ВЫЗЫВАТЬ ПОД app.mu.
+fn putContactViewLocked(app: *App, w: *api.Writer, cid: i64) !void {
+    const idx = app.eng.findIndex(cid) orelse return error.NoContact;
+    const c = &app.eng.contacts.items[idx];
+    var flags: u8 = 0;
+    if (c.online) flags |= 1;
+    if (c.blocked) flags |= 2;
+    if (contactPendingLocked(app, cid)) flags |= 4;
+    const seen: i64 = app.eng.lastSeen(cid) orelse 0;
+    const e = app.conn_st.get(cid) orelse ConnEntry{};
+    const state: api.ConnState = connStateOfLocked(app, cid);
+    try w.putU32(@intCast(cid));
+    try w.putU8(flags);
+    try w.putI64(seen);
+    try w.putStr16(c.getName());
+    try w.putBytes(&c.avatar_id);
+    try w.putU8(@backingInt(state));
+    try w.putU32(e.attempt);
+    try w.putU16(e.last_error);
+    try w.putU32(retryRemainingMs(e.next_retry_at, app.nowMs()));
+}
+
+/// Добавить запись в кольцо изменений (app.mu): новая ревизия.
+fn ringAppendLocked(app: *App, kind: api.DeltaChange, cid: i64) void {
+    app.contacts_rev += 1;
+    const slot = &app.contacts_ring[app.contacts_ring_pos];
+    slot.* = .{ .rev = app.contacts_rev, .kind = @backingInt(kind), .cid = @intCast(cid) };
+    app.contacts_ring_pos = (app.contacts_ring_pos + 1) % contact_ring_cap;
+    if (app.contacts_ring_len < contact_ring_cap) app.contacts_ring_len += 1;
+}
+
+/// Представление контакта изменилось (профиль/presence/avatar/блокировка):
+/// ревизия + кольцо + CONTACT_UPSERTED подписанным. ВЫЗЫВАТЬ ПОД app.mu.
+fn bumpContactLocked(app: *App, cid: i64) void {
+    ringAppendLocked(app, .upsert, cid);
+    evContactUpsertedLocked(app, cid);
+}
+
+/// Чат удалён: ревизия + кольцо (removed) + CONTACTS_CHANGED. ВЫЗЫВАТЬ
+/// ПОД app.mu.
+fn bumpRemovedLocked(app: *App, cid: i64) void {
+    ringAppendLocked(app, .removed, cid);
+    evContactsChangedLocked(app);
+}
+
+/// Смена полей СОСТОЯНИЯ подключения: ревизия + кольцо (view включает
+/// state) + CONTACT_STATE_CHANGED подписанным. gen — поколение попытки
+/// работника (null — системные переходы: bind/close/profile). Переход
+/// опоздавшего поколения молча игнорируется. ВЫЗЫВАТЬ ПОД app.mu.
+fn connSetLocked(app: *App, cid: i64, state: api.ConnState, err: api.ConnErr, gen: ?u32) void {
+    const gop = app.conn_st.getOrPut(app.alloc, cid) catch return;
+    if (!gop.found_existing) gop.value_ptr.* = .{};
+    if (gen) |g| {
+        if (gop.found_existing and g != gop.value_ptr.gen) return;
+        if (!gop.found_existing and g != 1) return;
+    }
+    const e = gop.value_ptr;
+    if (e.state == @backingInt(state) and e.last_error == @backingInt(err)) return;
+    e.state = @backingInt(state);
+    e.last_error = @backingInt(err);
+    if (e.next_retry_at != 0 and state != .failed) e.next_retry_at = 0;
+    ringAppendLocked(app, .upsert, cid);
+    evContactStateChangedLocked(app, cid);
+}
+
+/// Начало новой попытки подключения (dial): attempt += 1, gen += 1,
+/// состояние dialing. Возвращает поколение для меток работника.
+/// ВЫЗЫВАТЬ ПОД app.mu.
+fn connBeginAttemptLocked(app: *App, cid: i64) u32 {
+    const gop = app.conn_st.getOrPut(app.alloc, cid) catch return 0;
+    gop.value_ptr.attempt += 1;
+    gop.value_ptr.gen += 1;
+    gop.value_ptr.state = @backingInt(api.ConnState.dialing);
+    gop.value_ptr.last_error = @backingInt(api.ConnErr.none);
+    gop.value_ptr.next_retry_at = 0;
+    ringAppendLocked(app, .upsert, cid);
+    evContactStateChangedLocked(app, cid);
+    return gop.value_ptr.gen;
+}
+
+/// Контакт уходит в DISCOVERING (ждёт LAN-анонс пира; адреса нет).
+/// ВЫЗЫВАТЬ ПОД app.mu.
+fn connDiscoveringLocked(app: *App, cid: i64) void {
+    connSetLocked(app, cid, .discovering, .none, null);
+}
+
+/// Осталось мс до повтора (насыщение до u32; 0 — повтора нет).
+/// next_retry_at — абсолютные wall-мс (0 = не назначен).
+fn retryRemainingMs(next_retry_at: i64, now: i64) u32 {
+    if (next_retry_at <= 0 or next_retry_at <= now) return 0;
+    const d: u64 = @intCast(next_retry_at - now);
+    if (d > std.math.maxInt(u32)) return std.math.maxInt(u32);
+    return @intCast(d);
+}
+
+/// Классификация ошибки установления соединения → ConnErr. Детали
+/// отказа аутентификации НЕ раскрываются (без oracle-поведения).
+fn connErrOf(e: anyerror) api.ConnErr {
+    return switch (e) {
+        error.Timeout => .transport_timeout,
+        error.Network, error.BadAddress, error.Closed => .transport_unavailable,
+        error.NoRelay => .relay_unreachable,
+        error.NoTor => .tor_unavailable,
+        error.OutOfMemory => .capacity_exhausted,
+        else => .auth_failed,
+    };
+}
+
+/// Ошибка ФАЗЫ dial (транспорт ещё не поднимался): гибрид-инвайт имеет
+/// право упасть на relay-fallback. Отказ ПОСЛЕ dial (рукопожатие/JOIN) —
+/// аутентификационный контекст, fallback запрещён.
+fn isDialPhaseError(e: anyerror) bool {
+    return switch (e) {
+        error.Network, error.BadAddress, error.Timeout, error.NoRelay, error.NoTor, error.OutOfMemory => true,
+        else => false,
+    };
+}
+
+// ---------------------------------------------------- планировщик (connq)
+// Инвариант порядка локов: connq_mu — листовой (НИКОГДА не берётся поверх
+// app.mu из своих функций); app.mu → connq_mu вкладывать МОЖНО. Так
+// enqueue решает «в полёте?» атомарно с решением по контакту.
+
+/// Занят ли cid работой подключения (в очереди или в полёте).
+fn connInflight(app: *App, cid: i64) bool {
+    app.connq_mu.lockUncancelable(app.io);
+    defer app.connq_mu.unlock(app.io);
+    return app.conn_inflight.contains(cid);
+}
+
+/// Занять single-flight слот на контакт напрямую (autodial/linker/CONNECT,
+/// работа БЕЗ очереди): занят — error.Busy (не дублируем dial).
+fn connFlightBegin(app: *App, cid: i64) error{Busy}!void {
+    app.connq_mu.lockUncancelable(app.io);
+    defer app.connq_mu.unlock(app.io);
+    if (app.conn_inflight.contains(cid)) return error.Busy;
+    app.conn_inflight.put(app.alloc, cid, {}) catch return error.Busy;
+}
+
+/// Освободить прямой слот + прокачать очередь (мог освободиться активный).
+fn connFlightEnd(app: *App, cid: i64) void {
+    app.connq_mu.lockUncancelable(app.io);
+    defer app.connq_mu.unlock(app.io);
+    _ = app.conn_inflight.remove(cid);
+    connPumpLocked(app);
+}
+
+/// Поставить работу подключения в очередь. error.Busy — уже в полёте или
+/// очередь переполнена (cap conn_queue_cap: конечный бюджет, без unbounded).
+fn connEnqueue(app: *App, work: ConnWork) error{Busy}!void {
+    app.connq_mu.lockUncancelable(app.io);
+    defer app.connq_mu.unlock(app.io);
+    if (app.conn_inflight.contains(work.cid)) return error.Busy;
+    if (app.conn_work.items.len >= conn_queue_cap) return error.Busy;
+    app.conn_work.append(app.alloc, work) catch return error.Busy;
+    app.conn_inflight.put(app.alloc, work.cid, {}) catch {
+        _ = app.conn_work.pop();
+        return error.Busy;
+    };
+    connPumpLocked(app);
+}
+
+/// Спавн работников на очередь, пока есть слоты (conn_active_cap).
+/// ВЫЗЫВАТЬ ПОД connq_mu. Сетевого I/O здесь нет — только spawn.
+fn connPumpLocked(app: *App) void {
+    while (app.conn_active < conn_active_cap and app.conn_work.items.len > 0) {
+        const work = app.conn_work.orderedRemove(0);
+        app.conn_active += 1;
+        const th = std.Thread.spawn(.{}, connWorker, .{ app, work }) catch {
+            app.conn_active -= 1;
+            // вернуть в голову; OOM на вставке — работа теряется (слот
+            // и inflight сняты ниже), состояние остаётся по факту
+            app.conn_work.insert(app.alloc, 0, work) catch {
+                _ = app.conn_inflight.remove(work.cid);
+            };
+            break;
+        };
+        th.detach();
+    }
+}
+
+/// Работник одной попытки подключения: dial → рукопожатие → JOIN — вся
+/// сеть БЕЗ app.mu (спин-лок сетевой I/O держать нельзя). Финальный
+/// провал — FAILED с классификацией; секрет релея затирается.
+fn connWorker(app: *App, work: ConnWork) void {
+    var w = work;
+    defer {
+        if (w.relay_secret) |*s| std.crypto.secureZero(u8, s);
+        app.connq_mu.lockUncancelable(app.io);
+        app.conn_active -= 1;
+        _ = app.conn_inflight.remove(w.cid);
+        connPumpLocked(app);
+        app.connq_mu.unlock(app.io);
+    }
+    // стадия dialing + поколение; отмена (удалён/заблокирован) — выход
+    var gen: u32 = 0;
+    {
+        app.lock();
+        defer app.unlock();
+        const idx = app.eng.findIndex(w.cid) orelse return;
+        const c = &app.eng.contacts.items[idx];
+        if (c.deleted) {
+            connSetLocked(app, w.cid, .failed, .canceled, null);
+            return;
+        }
+        if (c.blocked) {
+            connSetLocked(app, w.cid, .failed, .canceled, null);
+            return;
+        }
+        gen = connBeginAttemptLocked(app, w.cid);
+    }
+    var err: ?anyerror = null;
+    if (w.hybrid and w.relay_secret != null) {
+        // гибрид (i3): прямой адрес с таймаутом dial; отказ ТРАНСПОРТА
+        // фазы dial — relay-fallback. Отказ после dial — без fallback.
+        establishToRelay(app, w.addr(), .{ .cid = w.cid, .gen = gen, .dial_timeout_ms = direct_dial_timeout_ms }) catch |e| {
+            if (isDialPhaseError(e)) {
+                // fallback: marker-спаривание в релее (блокируется до пира)
+                establishToRelay(app, w.relayAddr(), .{ .cid = w.cid, .gen = gen, .relay_secret = w.relay_secret }) catch |e2| {
+                    err = e2;
+                };
+            } else {
+                err = e;
+            }
+        };
+    } else {
+        establishToRelay(app, w.addr(), .{ .cid = w.cid, .gen = gen, .relay_secret = w.relay_secret }) catch |e| {
+            err = e;
+        };
+    }
+    // relay-маршрут: держать присутствие marker-ом (реконнекты без кода)
+    if (w.relay_secret != null and !app.no_network) {
+        app.lock();
+        defer app.unlock();
+        if (app.eng.findIndex(w.cid)) |idx| {
+            if (!app.eng.contacts.items[idx].deleted and !app.eng.contacts.items[idx].blocked) {
+                startRelayPresenceLocked(app, w.cid, w.relayAddr());
+            }
+        }
+    }
+    if (err) |e| {
+        app.lock();
+        defer app.unlock();
+        connSetLocked(app, w.cid, .failed, connErrOf(e), gen);
+    }
+}
+
+// --------------------------------------------- dial с дедлайном (неблокирующий)
+// Linux — прямые syscall-ы std.os.linux (паттерн sysfd.zig), Darwin —
+// libc-extern. После успеха fd возвращается в блокирующий режим: дальше
+// сессия работает как после tcp.dial.
+
+/// fcntl-константы (linux и darwin совпадают): F_GETFL=3, F_SETFL=4.
+const fcntl_getfl: i32 = 3;
+const fcntl_setfl: i32 = 4;
+/// O_NONBLOCK: Linux 0o4000, Darwin 0x4.
+const o_nonblock: usize = if (builtin.os.tag == .linux) 0o4000 else 0x4;
+
+const dial_cabi = struct {
+    extern "c" fn fcntl(fd: c_int, cmd: c_int, arg: c_int) c_int;
+    extern "c" fn connect(fd: c_int, addr: *const posix.sockaddr, addrlen: posix.socklen_t) c_int;
+    extern "c" fn getsockopt(fd: c_int, level: c_int, optname: c_int, optval: [*]u8, optlen: *posix.socklen_t) c_int;
+};
+
+/// Переключить неблокирующий режим fd. Ошибка — error.Network.
+fn setNonblock(fd: posix.socket_t, on: bool) error{Network}!void {
+    if (builtin.os.tag == .linux) {
+        const fl = std.os.linux.fcntl(fd, fcntl_getfl, 0);
+        if (std.os.linux.errno(fl) != .SUCCESS) return error.Network;
+        const cur: usize = @intCast(fl);
+        const want: usize = if (on) cur | o_nonblock else cur & ~o_nonblock;
+        const rc = std.os.linux.fcntl(fd, fcntl_setfl, want);
+        if (std.os.linux.errno(rc) != .SUCCESS) return error.Network;
+        return;
+    }
+    const cur = dial_cabi.fcntl(@intCast(fd), fcntl_getfl, 0);
+    if (cur < 0) return error.Network;
+    const want: c_int = if (on) cur | @as(c_int, @intCast(o_nonblock)) else cur & ~@as(c_int, @intCast(o_nonblock));
+    if (dial_cabi.fcntl(@intCast(fd), fcntl_setfl, want) < 0) return error.Network;
+}
+
+/// Прямой TCP dial с дедлайном (мс): connect в неблокирующем режиме +
+/// poll. Таймаут — error.Timeout; отказ транспорта — error.Network;
+/// некорректный адрес — error.BadAddress (классифицируется вызывающим).
+/// Возвращает TcpConn с блокирующим fd (аллокатор приложения).
+fn dialDeadline(app: *App, addr: []const u8, timeout_ms: u32) error{ Network, Timeout, BadAddress, OutOfMemory }!*tcp.TcpConn {
+    const colon = std.mem.lastIndexOfScalar(u8, addr, ':') orelse return error.BadAddress;
+    const host = addr[0..colon];
+    const port = std.fmt.parseInt(u16, addr[colon + 1 ..], 10) catch return error.BadAddress;
+    const ip4 = std.Io.net.Ip4Address.parse(host, port) catch return error.BadAddress;
+    const sa = sysfd.sockaddrIn(ip4.bytes, port);
+    const fd = sysfd.socketTcp() catch return error.Network;
+    var failed = false;
+    errdefer if (!failed) sysfd.close(fd);
+    setNonblock(fd, true) catch {
+        failed = true;
+        return error.Network;
+    };
+    // connect: EINPROGRESS — норма для неблокирующего сокета
+    if (builtin.os.tag == .linux) {
+        const rc = std.os.linux.connect(fd, @ptrCast(&sa), @sizeOf(sysfd.SockaddrIn));
+        const e = std.os.linux.errno(rc);
+        if (e != .SUCCESS and e != .INPROGRESS) return error.Network;
+    } else {
+        const rc = dial_cabi.connect(@intCast(fd), @ptrCast(&sa), @sizeOf(sysfd.SockaddrIn));
+        if (rc < 0 and posix.errno(rc) != .INPROGRESS) return error.Network;
+    }
+    var pfd = [1]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT | posix.POLL.ERR | posix.POLL.HUP, .revents = 0 }};
+    const n = posix.poll(&pfd, @intCast(timeout_ms)) catch return error.Network;
+    if (n == 0) return error.Timeout;
+    // итог connect: SO_ERROR (0 = успех)
+    var so_err: i32 = 0;
+    var so_len: posix.socklen_t = @sizeOf(i32);
+    if (builtin.os.tag == .linux) {
+        const rc = std.os.linux.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, @ptrCast(&so_err), &so_len);
+        if (std.os.linux.errno(rc) != .SUCCESS) return error.Network;
+    } else {
+        if (dial_cabi.getsockopt(@intCast(fd), posix.SOL.SOCKET, posix.SO.ERROR, @ptrCast(&so_err), &so_len) < 0) return error.Network;
+    }
+    if (so_err != 0) return error.Network;
+    // назад в блокирующий режим — сессия читает как из tcp.dial
+    setNonblock(fd, false) catch return error.Network;
+    sysfd.setSocketBuffers(fd);
+    sysfd.setQuickAck(fd);
+    sysfd.setNoDelay(fd);
+    const tc = app.alloc.create(tcp.TcpConn) catch return error.OutOfMemory;
+    tc.* = .{ .fd = fd };
+    sysfd.setKeepalive(fd);
+    return tc;
 }
 
 // ------------------------------------------- синхронизация устройств (2.4.0)
@@ -707,6 +1149,113 @@ const InviteReg = struct {
     /// Relay-адрес (если relay-инвайт): после JOIN — присутствие.
     relay_buf: [relay_addr_max]u8 = @splat(0),
     relay_len: u8 = 0,
+    /// НЕсекретный случайный идентификатор приглашения (GET_INVITE_STATE,
+    /// 2.7.0): по нему GUI опрашивает состояние; секрет по нему не
+    /// восстанавливается и не логируется.
+    invite_id: [16]u8 = @splat(0),
+    /// JOIN в полёте (state JOINING до бинда): живое приглашение.
+    joining: bool = false,
+};
+
+/// Запись в кольцо завершённых приглашений (GET_INVITE_STATE).
+/// ВЫЗЫВАТЬ ПОД app.mu.
+fn inviteDonePutLocked(app: *App, invite_id: [16]u8, state: api.InviteState, accepted_cid: u32) void {
+    app.invite_done[app.invite_done_pos] = .{
+        .invite_id = invite_id,
+        .state = @backingInt(state),
+        .accepted_cid = accepted_cid,
+    };
+    app.invite_done_pos = (app.invite_done_pos + 1) % invite_done_cap;
+    if (app.invite_done_len < invite_done_cap) app.invite_done_len += 1;
+    // приглашение больше не «в полёте»: used/joining расформированы
+    for (&app.invites) |*reg| {
+        if (reg.joining and std.mem.eql(u8, &reg.invite_id, &invite_id)) {
+            reg.joining = false;
+            std.crypto.secureZero(u8, &reg.secret);
+        }
+    }
+}
+
+/// Завершённое приглашение (кольцо диагностики invite_done): consumed
+/// или failed. Секрет не хранится — только идентификатор и результат.
+const InviteDone = struct {
+    invite_id: [16]u8 = @splat(0),
+    /// api.InviteState (backing u8): consumed/failed.
+    state: u8 = 0,
+    /// cid добавленного контакта (0 при failed).
+    accepted_cid: u32 = 0,
+};
+
+/// Капа завершённых приглашений для GET_INVITE_STATE: дальше — NOT_FOUND
+/// (клиент обязан сам держать последний ответ, кольцо — только диагностика).
+const invite_done_cap: usize = 64;
+
+// ------------------------------------------------ подключение: планировщик
+// Единая очередь подключений (2.7.0): ACCEPT_INVITE/ACCEPT_INVITE_EX/CONNECT
+// больше не блокируют ответ на dial. Очередь и счётчик слотов — под
+// connq_mu (НЕ под app.mu: сетевой I/O под спин-локом запрещён), состояния
+// и метрики — под app.mu (там же fanout событий).
+
+/// Капа очереди ожидающих подключений: больше — BUSY без побочных эффектов.
+const conn_queue_cap: usize = 64;
+/// Капа одновременных активных попыток подключения.
+const conn_active_cap: u32 = 4;
+/// Капа одновременно ожидающих неизвестных JOIN-сессий.
+const pending_session_cap: u32 = 16;
+/// Таймаут dial прямого адреса в гибрид-приглашении (i3), мс.
+const direct_dial_timeout_ms: u32 = 3000;
+/// Окно ожидания PROFILE-эха после JOIN (подтверждение добавления), мс.
+const join_echo_timeout_ms: u64 = 5000;
+/// Кольцо изменений представления контактов (GET_CONTACTS_DELTA).
+const contact_ring_cap: usize = 4096;
+/// Максимум контактов GET_BOOTSTRAP (как LIST_CONTACTS): больше — TOO_BIG.
+const bootstrap_max_contacts: usize = 10000;
+
+/// Одна работа подключения: адрес + признак релея + секрет marker-спаривания.
+/// Секрет копия join_map — затирается secureZero по завершении работы.
+const ConnWork = struct {
+    cid: i64,
+    addr_buf: [72]u8 = @splat(0),
+    addr_len: u8 = 0,
+    /// secret релей-приглашения (marker-спаривание; null — прямой dial).
+    relay_secret: ?[16]u8 = null,
+    /// Гибрид (i3): addr — ПРЯМОЙ адрес с таймаутом dial, relay_addr —
+    /// fallback-релей (dial по relay_secret).
+    hybrid: bool = false,
+    relay_addr_buf: [72]u8 = @splat(0),
+    relay_addr_len: u8 = 0,
+
+    fn addr(self: *const ConnWork) []const u8 {
+        return self.addr_buf[0..self.addr_len];
+    }
+    fn relayAddr(self: *const ConnWork) []const u8 {
+        return self.relay_addr_buf[0..self.relay_addr_len];
+    }
+};
+
+/// Состояние подключения контакта (app.mu): ответ GET_CONTACT_STATE и
+/// источник события CONTACT_STATE_CHANGED.
+const ConnEntry = struct {
+    /// api.ConnState (backing u8).
+    state: u8 = 0,
+    /// Номер текущей/последней попытки (0 = попыток не было).
+    attempt: u32 = 0,
+    /// api.ConnErr (backing u16): код последней неудачи.
+    last_error: u16 = 0,
+    /// Абсолютные wall-мс следующего автодозвона (0 = повтор не назначен;
+    /// в ответ/event отдаётся остаток до момента — насыщение до u32).
+    next_retry_at: i64 = 0,
+    /// Поколение попытки: инкремент на старте каждой; переходы от
+    /// опоздавших callbacks с чужим поколением игнорируются.
+    gen: u32 = 0,
+};
+
+/// Запись кольца изменений контактов (app.mu): revision 0 — пустой слот.
+const ContactChange = struct {
+    rev: u64 = 0,
+    /// api.DeltaChange (backing u8).
+    kind: u8 = 0,
+    cid: u32 = 0,
 };
 
 /// JOIN-данные, которые отправим после установления сессии.
@@ -729,6 +1278,8 @@ pub const SessCtx = struct {
     /// Сессия контекста: pending-join (cid == -1) — до промоушена,
     /// привязанная — выставляется в bindSessionLocked.
     s: ?*session_mod.Session = null,
+    /// Учитывается в App.pending_sessions до успешного JOIN или закрытия.
+    pending_counted: bool = false,
 };
 
 fn envIn(ctx: *anyopaque, env: envelope.Envelope) void {
@@ -776,6 +1327,9 @@ fn handleJoinEnvelope(sc: *SessCtx, env: envelope.Envelope) void {
     };
     var failed = false;
     var cid: i64 = 0;
+    var bind_failed = false;
+    // invite_id для кольца диагностики (погашенного приглашения)
+    var invite_done_id: [16]u8 = @splat(0);
     // relay-адрес приглашения: после JOIN — присутствие контакта
     var relay_addr_buf: [relay_addr_max]u8 = @splat(0);
     var relay_addr_len: usize = 0;
@@ -789,7 +1343,7 @@ fn handleJoinEnvelope(sc: *SessCtx, env: envelope.Envelope) void {
             if (reg.used) continue;
             var mac: [32]u8 = undefined;
             std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, &transcript, &reg.secret);
-            if (std.mem.eql(u8, &mac, &j.hmac)) {
+            if (std.crypto.timing_safe.eql([32]u8, mac, j.hmac)) {
                 matched = i;
                 break;
             }
@@ -797,9 +1351,17 @@ fn handleJoinEnvelope(sc: *SessCtx, env: envelope.Envelope) void {
         if (matched == null) {
             failed = true;
         } else {
+            // корректный HMAC: приглашение расходуется, идём до бинда —
+            // состояние JOINING (GET_INVITE_STATE). Секрет в реестре
+            // больше не нужен: relay-linker владеет своей копией.
             app.invites[matched.?].used = true;
+            app.invites[matched.?].joining = true;
+            invite_done_id = app.invites[matched.?].invite_id;
             relay_addr_len = app.invites[matched.?].relay_len;
             @memcpy(relay_addr_buf[0..relay_addr_len], app.invites[matched.?].relay_buf[0..relay_addr_len]);
+            // Relay-присутствие ещё использует секрет после JOIN; direct-код
+            // можно стереть сразу. inviteDonePutLocked сотрёт relay-секрет.
+            if (relay_addr_len == 0) std.crypto.secureZero(u8, &app.invites[matched.?].secret);
             if (contactIdByBundle(app, j.bundle)) |existing| {
                 cid = existing; // переподключение держателем кода
             } else {
@@ -824,11 +1386,20 @@ fn handleJoinEnvelope(sc: *SessCtx, env: envelope.Envelope) void {
                 sc.cid = cid;
                 app.bindSessionLocked(cid, sess, sc) catch {
                     failed = true;
+                    bind_failed = true;
                 };
             }
         }
     }
+    releasePendingLocked(sc);
     if (failed) {
+        // bind не удался после корректного HMAC — приглашение FAILED
+        // (секрет уже погашен: повторный JOIN тем же кодом невозможен)
+        if (bind_failed) {
+            app.lock();
+            defer app.unlock();
+            inviteDonePutLocked(app, invite_done_id, .failed, 0);
+        }
         sess.shutdown();
         return;
     }
@@ -844,6 +1415,9 @@ fn handleJoinEnvelope(sc: *SessCtx, env: envelope.Envelope) void {
     const name = app.eng.contacts.items[@intCast(cid - 1)].getName();
     evContactJoined(app, cid, name);
     evPresence(app, cid, true, app.nowMs());
+    // приглашение погашено контактом: CONSUMED + представление — в ревизию
+    inviteDonePutLocked(app, invite_done_id, .consumed, @intCast(cid));
+    bumpContactLocked(app, cid);
 }
 
 /// Сессия умерла (её rx-поток завершился и рапортовал сюда). Снимаем
@@ -854,7 +1428,11 @@ fn handleJoinEnvelope(sc: *SessCtx, env: envelope.Envelope) void {
 /// сторонах. Сессию уводим в retired: drain тикера сделает join+destroy.
 fn onClosed(ctx: *anyopaque) void {
     const sc: *SessCtx = @ptrCast(@alignCast(ctx));
-    if (sc.cid < 1) return; // pending-join: привязки не было
+    if (sc.cid < 1) {
+        // pending-сессия могла оборваться до JOIN и до таймера.
+        releasePending(sc);
+        return;
+    }
     const s = sc.s orelse return;
     const app = sc.app;
     app.lock();
@@ -870,6 +1448,11 @@ fn onClosed(ctx: *anyopaque) void {
         if (app.eng.ev.onPresence) |cb|
             cb(app.eng.ev.ctx, &app.eng.contacts.items[idx], false, app.nowMs());
     }
+    // наблюдаемое состояние (2.7.0): сессия потеряна — OFFLINE;
+    // ожидание PROFILE-эха больше не имеет смысла
+    _ = app.conn_await.remove(sc.cid);
+    connSetLocked(app, sc.cid, .offline, .none, null);
+    bumpContactLocked(app, sc.cid);
 }
 
 /// Индекс контакта по указателю (события движка отдают *const Contact).
@@ -916,6 +1499,8 @@ fn onAvatarEv(ctx: *anyopaque, from: *const engine_mod.Contact, avatar_id: [16]u
         }
     }
     evAvatarReceived(app, @intCast(idx + 1), avatar_id, data);
+    // avatar_id контакта изменился — представление для дельты/бутстрапа
+    bumpContactLocked(app, @intCast(idx + 1));
 }
 
 /// FILE_META: начать приём файла (состояние под app.mu) и ответить
@@ -1070,13 +1655,27 @@ fn onReactionEv(ctx: *anyopaque, from: *const engine_mod.Contact, r: engine_mod.
 fn onPresenceEv(ctx: *anyopaque, from: *const engine_mod.Contact, online: bool, last_seen_ms: i64) void {
     const app: *App = @ptrCast(@alignCast(ctx));
     const idx = contactIndexOf(app, from) orelse return;
-    evPresence(app, @intCast(idx + 1), online, last_seen_ms);
+    const cid: i64 = @intCast(idx + 1);
+    evPresence(app, cid, online, last_seen_ms);
+    // наблюдаемое состояние (2.7.0): presence flip синхронизирует conn_st
+    // (кроме JOINING — ждём PROFILE-эхо подтверждения добавления)
+    if (!app.conn_await.contains(cid)) {
+        connSetLocked(app, cid, if (online) .online else .offline, .none, null);
+    }
+    bumpContactLocked(app, cid);
 }
 
 fn onProfileEv(ctx: *anyopaque, from: *const engine_mod.Contact, name: []const u8, avatar_id: [16]u8) void {
     const app: *App = @ptrCast(@alignCast(ctx));
     const idx = contactIndexOf(app, from) orelse return;
-    evContactProfile(app, @intCast(idx + 1), name, avatar_id);
+    const cid: i64 = @intCast(idx + 1);
+    evContactProfile(app, cid, name, avatar_id);
+    // PROFILE-эхо: пир жив и обработал наш JOIN (если ждали) — добавление
+    // подтверждено. Эвристика, НЕ криптографическая квитанция.
+    if (app.conn_await.remove(cid)) {
+        connSetLocked(app, cid, .online, .none, null);
+    }
+    bumpContactLocked(app, cid);
 }
 
 /// CONTACT_CARD от пира: визитка третьего лица — наружу событием.
@@ -1480,7 +2079,22 @@ fn autodialLoop(app: *App) void {
             }
         }
         if (dial_cid >= 0) {
-            establishTo(app, addr_copy[0..addr_len], dial_cid, .initiator) catch {};
+            // single-flight + метка попытки ДО dial (сеть — без app.mu)
+            connFlightBegin(app, dial_cid) catch continue;
+            var gen: u32 = 0;
+            {
+                app.lock();
+                defer app.unlock();
+                gen = connBeginAttemptLocked(app, dial_cid);
+            }
+            establishTo(app, addr_copy[0..addr_len], dial_cid, .initiator) catch |e| {
+                // финальный провал: FAILED + классификация (gen-гейт
+                // отбрасывает отставшие рапорты прошлой попытки)
+                app.lock();
+                defer app.unlock();
+                connSetLocked(app, dial_cid, .failed, connErrOf(e), gen);
+            };
+            connFlightEnd(app, dial_cid);
             // backoff: 1s,2s,4s,8s,16s,32s -> потолок 60s (+ джиттер до 50%)
             app.lock();
             defer app.unlock();
@@ -1491,6 +2105,11 @@ fn autodialLoop(app: *App) void {
             const capped: i64 = @min(base, 60_000);
             const jitter: i64 = @mod(now, @divTrunc(capped, 2) + 1);
             next_try.put(app.alloc, dial_cid, now + capped + jitter) catch {};
+            // ревизия повтора — в наблюдаемое состояние (next_retry_at)
+            if (app.conn_st.getPtr(dial_cid)) |st| {
+                st.attempt = at;
+                st.next_retry_at = now + capped + jitter;
+            }
         }
     }
 }
@@ -1548,8 +2167,23 @@ fn linkerLoop(app: *App) void {
             if (!i_init and !join_due) continue;
             var ab: [32]u8 = undefined;
             const addr = discover_mod.fmtAddr(&ab, a.ip, a.port);
-            // markSeen не нужен: establishTo -> bindSession сам метит онлайн
-            establishTo(app, addr, cid, .initiator) catch continue;
+            // markSeen не нужен: establishTo -> bindSession сам метит онлайн.
+            // single-flight + метка попытки (2.7.0): dial по анонсу тоже
+            // учитывается в attempt/state (gen гасит отставшие рапорты)
+            connFlightBegin(app, cid) catch continue;
+            const gen: u32 = blk: {
+                app.lock();
+                defer app.unlock();
+                break :blk connBeginAttemptLocked(app, cid);
+            };
+            establishTo(app, addr, cid, .initiator) catch |e| {
+                app.lock();
+                defer app.unlock();
+                connSetLocked(app, cid, .failed, connErrOf(e), gen);
+                connFlightEnd(app, cid);
+                continue;
+            };
+            connFlightEnd(app, cid);
         }
         sysfd.sleepMs(2000);
     }
@@ -1581,7 +2215,19 @@ fn handleDeviceAnnounce(app: *App, ip: [4]u8, port: u16) void {
     if (dial_cid < 0) return;
     var ab: [32]u8 = undefined;
     const addr = discover_mod.fmtAddr(&ab, ip, port);
-    establishTo(app, addr, dial_cid, .initiator) catch {};
+    // single-flight + метка попытки (2.7.0): как и ручные пути
+    connFlightBegin(app, dial_cid) catch return;
+    const gen: u32 = blk: {
+        app.lock();
+        defer app.unlock();
+        break :blk connBeginAttemptLocked(app, dial_cid);
+    };
+    establishTo(app, addr, dial_cid, .initiator) catch |e| {
+        app.lock();
+        defer app.unlock();
+        connSetLocked(app, dial_cid, .failed, connErrOf(e), gen);
+    };
+    connFlightEnd(app, dial_cid);
 }
 
 /// Автолистенер: m1 несёт enc_pk звонящего — опознаём контакт и
@@ -1600,6 +2246,21 @@ fn identifyCb(ctx: *anyopaque, enc_pk: [32]u8) ?session_mod.Session.IdentifyResu
 }
 
 /// Окно pending-join: 3 с на валидный JOIN, иначе сессия закрывается.
+fn releasePendingLocked(sc: *SessCtx) void {
+    if (!sc.pending_counted) return;
+    const app = sc.app;
+    if (app.pending_sessions > 0) app.pending_sessions -= 1;
+    sc.pending_counted = false;
+}
+
+fn releasePending(sc: *SessCtx) void {
+    const app = sc.app;
+    app.lock();
+    releasePendingLocked(sc);
+    app.unlock();
+}
+
+/// Окно pending-join: 3 с на валидный JOIN, иначе сессия закрывается.
 fn joinTimeoutWatch(sc: *SessCtx) void {
     sysfd.sleepMs(3000);
     const app = sc.app;
@@ -1607,6 +2268,7 @@ fn joinTimeoutWatch(sc: *SessCtx) void {
     const still_pending = sc.cid == -1;
     app.unlock();
     if (still_pending) {
+        releasePending(sc);
         if (sc.s) |sp| sp.close();
     }
 }
@@ -1673,15 +2335,17 @@ fn handleAcceptedConn(app: *App, tc: *tcp.TcpConn) void {
             }
             break :blk false;
         };
+        const pending_slot = has_invite and app.pending_sessions < pending_session_cap;
+        if (pending_slot) app.pending_sessions += 1;
         app.unlock();
-        if (has_invite) {
+        if (pending_slot) {
             var eph2: [32]u8 = undefined;
             app.io.random(&eph2);
             const sc = app.alloc.create(SessCtx) catch {
                 tc.deinit();
                 return;
             };
-            sc.* = .{ .app = app, .cid = -1, .s = null };
+            sc.* = .{ .app = app, .cid = -1, .s = null, .pending_counted = true };
             const sp = session_mod.Session.establishPending(
                 app.alloc,
                 raw,
@@ -1909,6 +2573,8 @@ fn relayPresenceLoop(app: *App, cid: i64, from_server: bool) void {
 /// Спаривание -> handleAcceptedConn (JOIN поднимет контакт). Обрыв ->
 /// переподключение (пир может дозваниваться долго).
 fn relayLinkerLoop(app: *App, secret: [16]u8, addr: []const u8) void {
+    var secret_copy = secret;
+    defer std.crypto.secureZero(u8, &secret_copy);
     const addr_copy = app.alloc.dupe(u8, addr) catch return;
     defer app.alloc.free(addr_copy);
     while (app.running) {
@@ -1918,14 +2584,14 @@ fn relayLinkerLoop(app: *App, secret: [16]u8, addr: []const u8) void {
             defer app.unlock();
             var alive = false;
             for (&app.invites) |*reg| {
-                if (std.mem.eql(u8, &reg.secret, &secret) and !reg.used and reg.created_ms != 0) {
+                if (std.crypto.timing_safe.eql([invite_mod.secret_len]u8, reg.secret, secret_copy) and !reg.used and reg.created_ms != 0) {
                     alive = true;
                     break;
                 }
             }
             if (!alive) return;
         }
-        const tc = stille_messenger.net.relay.dial(app.alloc, addr_copy, secret) catch {
+        const tc = stille_messenger.net.relay.dial(app.alloc, addr_copy, secret_copy) catch {
             sysfd.sleepMs(2000);
             continue;
         };
@@ -1960,6 +2626,7 @@ fn apiCreateInvite(app: *App, payload: []const u8, w: *api.Writer) api.Status {
     // односторонний v2-код: держатель добавляется ONE accept-ом
     var secret: [invite_mod.secret_len]u8 = undefined;
     app.io.random(&secret);
+    defer std.crypto.secureZero(u8, &secret);
     {
         app.lock();
         defer app.unlock();
@@ -1997,10 +2664,21 @@ fn apiCreateInvite(app: *App, payload: []const u8, w: *api.Writer) api.Status {
     return .OK;
 }
 
-/// ACCEPT_INVITE: payload [code str16][my_name str16]. Единственное действие
-/// держателя кода. Ответ: [cid u32]. Подключение (если адрес в коде) —
-/// асинхронно: статус виден по событиям PRESENCE.
-fn apiAcceptInvite(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+/// Результат погашения инвайта (общее ядро ACCEPT_INVITE / _EX).
+const AcceptOut = struct {
+    cid: i64 = 0,
+    /// Информирует о постановке работы, НЕ о доверии: контакт
+    /// подтверждается только аутентифицированным JOIN.
+    disp: api.AcceptDisposition = .accepted,
+    state: api.ConnState = .pending,
+    attempt: u32 = 0,
+};
+
+/// Общее ядро погашения инвайт-кода (v1/v2/v3): разбор, дедуп по bundle,
+/// JOIN-данные и постановка работы подключения в планировщик (dial —
+/// НЕ в потоке API: ответ уходит сразу). Существующий контакт не
+/// дублируется: повторный код возвращает тот же cid.
+fn acceptInviteCommon(app: *App, payload: []const u8, out: *AcceptOut) api.Status {
     var r = api.Reader.init(payload);
     const code = r.readStr16() catch return .BAD_FRAME;
     const my_name_in = r.readStr16() catch return .BAD_FRAME;
@@ -2008,34 +2686,58 @@ fn apiAcceptInvite(app: *App, payload: []const u8, w: *api.Writer) api.Status {
     if (code.len == 0) return .BAD_INVITE_CODE;
     if (my_name_in.len > invite_mod.max_name) return .BAD_ARGS;
     const my_name: []const u8 = if (my_name_in.len == 0) "друг" else my_name_in;
-    if (!std.mem.startsWith(u8, code, invite_mod.v2_prefix) and
-        !std.mem.startsWith(u8, code, "shopot1.")) return .BAD_INVITE_CODE;
-    const inv = invite_mod.decode(code) catch return .BAD_INVITE_CODE;
-    const name = inv.name();
-    const bundle = inv.bundle;
+
+    // разбор: v3 (гибрид i3) или v1/v2
+    var bundle: [64]u8 = undefined;
+    var name_buf: [invite_mod.max_name]u8 = @splat(0);
+    var name_len: usize = 0;
     var addr_buf: [80]u8 = undefined;
     var addr: ?[]const u8 = null;
-    // inv.addr() — только хост: порт живёт отдельно, собираем "host:port"
-    if (inv.host_len > 0) {
-        addr = std.fmt.bufPrint(&addr_buf, "{s}:{d}", .{ inv.addr().?, inv.port }) catch return .BAD_ARGS;
-    }
-    // v2: держатель кода — JOIN первым конвертом после рукопожатия
-    var join_after: ?JoinInfo = null;
+    var relay_addr_buf: [80]u8 = undefined;
+    var relay_addr: ?[]const u8 = null;
     var relay_secret: ?[16]u8 = null;
-    if (inv.v2) {
-        if (inv.relay) relay_secret = inv.secret;
-        join_after = .{
-            .secret = inv.secret,
-            .name_len = @intCast(my_name.len),
-            .name_buf = blk: {
-                var nb: [32]u8 = @splat(0);
-                @memcpy(nb[0..my_name.len], my_name);
-                break :blk nb;
-            },
-        };
+    var code_secret: [16]u8 = @splat(0);
+    var has_code_secret = false; // v2/v3: JOIN-конверт погашает секрет кода
+    var hybrid = false;
+    if (std.mem.startsWith(u8, code, invite_mod.v3_prefix)) {
+        const inv = invite_mod.decode3(code) catch return .BAD_INVITE_CODE;
+        bundle = inv.bundle;
+        @memcpy(name_buf[0..inv.name_len], inv.name());
+        name_len = inv.name_len;
+        if (inv.has_direct) {
+            addr = inv.direct.addr(&addr_buf) orelse return .BAD_INVITE_CODE;
+        }
+        if (inv.has_relay) {
+            relay_addr = inv.relay.addr(&relay_addr_buf) orelse return .BAD_INVITE_CODE;
+            relay_secret = inv.secret;
+        }
+        code_secret = inv.secret;
+        has_code_secret = true;
+        hybrid = inv.has_direct and inv.has_relay;
+    } else {
+        if (!std.mem.startsWith(u8, code, invite_mod.v2_prefix) and
+            !std.mem.startsWith(u8, code, "shopot1.")) return .BAD_INVITE_CODE;
+        const inv = invite_mod.decode(code) catch return .BAD_INVITE_CODE;
+        bundle = inv.bundle;
+        @memcpy(name_buf[0..inv.name_len], inv.name());
+        name_len = inv.name_len;
+        // inv.addr() — только хост: порт живёт отдельно, собираем "host:port"
+        if (inv.host_len > 0) {
+            addr = std.fmt.bufPrint(&addr_buf, "{s}:{d}", .{ inv.addr().?, inv.port }) catch return .BAD_ARGS;
+        }
+        if (inv.v2) {
+            if (inv.relay) {
+                relay_addr = addr;
+                relay_secret = inv.secret;
+            }
+            code_secret = inv.secret;
+            has_code_secret = true;
+        }
     }
+    const name: []const u8 = name_buf[0..name_len];
+
     // мутации движка/хешмапы — строго под локом (ticker и рендер итерируют)
-    var cid: i64 = 0;
+    var enq: ?ConnWork = null;
     {
         app.lock();
         defer app.unlock();
@@ -2045,40 +2747,144 @@ fn apiAcceptInvite(app: *App, payload: []const u8, w: *api.Writer) api.Status {
         // линок неразличим с первым).
         const is_device = std.mem.eql(u8, &bundle, &app.id.bundle());
         if (is_device and app.sync.devices.count() > 0) return .TOO_BIG;
-        const idx = app.eng.addContact(name, bundle) catch return .INTERNAL;
-        cid = @intCast(idx + 1);
-        app.hb.put(cid, .{}) catch {};
-        // держатель кода линка всегда инициирует подключение (детерминизм:
-        // bundle устройств равны, порядок их не разведёт)
-        if (is_device) {
-            app.eng.contacts.items[idx].dev_role = dev_role_holder;
-            app.sync.addDevice(cid);
-        }
-        if (addr) |a| saveContactAddr(app, cid, a);
-        if (app.log) |log| {
-            // relay-инвайт: адрес релея в лог — присутствие после рестарта
-            logContact(app, log, name, bundle, addr, if (relay_secret != null) addr else null, if (is_device) dev_role_holder else 0);
-        }
-    }
-    w.putU32(@intCast(cid)) catch return .INTERNAL;
-    // v2: запомнить JOIN-данные — отправим первым конвертом после рукопожатия
-    if (join_after) |ji| {
-        app.join_map.put(app.alloc, cid, ji) catch {};
-    }
-    // Если код содержит адрес — подключение происходит сразу, без connect.
-    // Без адреса — LAN-захват: linkerLoop дозвонится до анонса приглашающего.
-    if (addr) |a| {
-        if (relay_secret) |sec| {
-            establishToRelay(app, a, cid, .initiator, sec) catch {};
-            // держатель relay-кода: сразу держим присутствие (marker из
-            // контакт-секрета) — реконнекты без нового инвайта
-            app.lock();
-            startRelayPresenceLocked(app, cid, a);
-            app.unlock();
+        const existing = contactIdByBundle(app, bundle);
+        if (existing) |ecid| {
+            // повторное погашение: тот же cid, дубль не создаётся
+            out.cid = ecid;
+            if (app.eng.sessions.get(ecid) != null) {
+                out.disp = .already_connected;
+                out.state = connStateOfLocked(app, ecid);
+                out.attempt = if (app.conn_st.get(ecid)) |e| e.attempt else 0;
+                return .OK;
+            }
+            // та же незавершённая работа уже в полёте — не дублируем;
+            // ДРУГОЙ секрет на летящую работу — не подменяем (BUSY)
+            if (connInflight(app, ecid)) {
+                if (has_code_secret) {
+                    if (app.join_map.get(ecid)) |ji| {
+                        if (!std.mem.eql(u8, &ji.secret, &code_secret)) return .BUSY;
+                    }
+                }
+                out.disp = .already_pending;
+                out.state = connStateOfLocked(app, ecid);
+                out.attempt = if (app.conn_st.get(ecid)) |e| e.attempt else 0;
+                return .OK;
+            }
+            // новая работа по тому же контакту: адрес обновить
+            if (addr) |a| saveContactAddr(app, ecid, a);
+            out.cid = ecid;
         } else {
-            establishTo(app, a, cid, .initiator) catch {};
+            const idx = app.eng.addContact(name, bundle) catch return .INTERNAL;
+            out.cid = @intCast(idx + 1);
+            app.hb.put(out.cid, .{}) catch {};
+            // держатель кода линка всегда инициирует подключение (детерминизм:
+            // bundle устройств равны, порядок их не разведёт)
+            if (is_device) {
+                app.eng.contacts.items[idx].dev_role = dev_role_holder;
+                app.sync.addDevice(out.cid);
+            }
+            if (addr) |a| saveContactAddr(app, out.cid, a);
+            if (app.log) |log| {
+                // relay-инвайт: адрес релея в лог — присутствие после рестарта
+                logContact(app, log, name, bundle, addr, if (relay_addr != null) relay_addr else null, if (is_device) dev_role_holder else 0);
+            }
+            // новый контакт: представление изменилось — ревизия
+            bumpContactLocked(app, out.cid);
         }
+        const cid = out.cid;
+        // v2/v3: JOIN-данные — первым конвертом после рукопожатия.
+        // Тот же секрет (повтор кода) — идемпотентно; новый секрет
+        // заменяет (работы в полёте нет — проверено выше).
+        if (has_code_secret) {
+            if (app.join_map.getPtr(cid)) |old| {
+                std.crypto.secureZero(u8, &old.secret);
+            }
+            app.join_map.put(app.alloc, cid, .{
+                .secret = code_secret,
+                .name_len = @intCast(my_name.len),
+                .name_buf = blk: {
+                    var nb: [32]u8 = @splat(0);
+                    @memcpy(nb[0..my_name.len], my_name);
+                    break :blk nb;
+                },
+            }) catch {};
+            std.crypto.secureZero(u8, &code_secret);
+        }
+        // состояние до работы: адрес есть — dial встанет в очередь;
+        // адреса нет — ждём LAN-анонс пира (DISCOVERING)
+        if (addr == null and relay_addr == null) {
+            if (has_code_secret) connSetLocked(app, cid, .pending, .none, null) else connDiscoveringLocked(app, cid);
+        } else {
+            if (app.conn_st.getPtr(cid)) |st| st.next_retry_at = 0;
+        }
+        // работа: адрес (прямой/релей) или гибрид
+        if (addr != null or relay_addr != null) {
+            var work = ConnWork{ .cid = cid };
+            if (hybrid) {
+                // i3: прямой адрес + relay-fallback (секрет marker-а)
+                work.hybrid = true;
+                work.relay_secret = relay_secret;
+                if (relay_addr) |ra| {
+                    if (ra.len <= work.relay_addr_buf.len) {
+                        @memcpy(work.relay_addr_buf[0..ra.len], ra);
+                        work.relay_addr_len = @intCast(ra.len);
+                    }
+                }
+                if (addr) |a| {
+                    if (a.len <= work.addr_buf.len) {
+                        @memcpy(work.addr_buf[0..a.len], a);
+                        work.addr_len = @intCast(a.len);
+                    }
+                }
+            } else if (relay_secret != null and relay_addr != null) {
+                // v2 relay: marker-спаривание
+                work.relay_secret = relay_secret;
+                if (relay_addr) |ra| {
+                    @memcpy(work.addr_buf[0..ra.len], ra);
+                    work.addr_len = @intCast(ra.len);
+                }
+            } else if (addr) |a| {
+                @memcpy(work.addr_buf[0..a.len], a);
+                work.addr_len = @intCast(a.len);
+            }
+            enq = work;
+        }
+        out.state = connStateOfLocked(app, cid);
+        out.attempt = if (app.conn_st.get(cid)) |e| e.attempt else 0;
     }
+    // постановка в очередь — БЕЗ app.mu (connq_mu — листовый лок)
+    if (enq) |work| {
+        connEnqueue(app, work) catch {
+            // уже в полёте (гонка с другим путём) — это уже_pending
+            out.disp = .already_pending;
+        };
+    }
+    return .OK;
+}
+
+/// ACCEPT_INVITE: payload [code str16][my_name str16]. Единственное действие
+/// держателя кода. Ответ: [cid u32]. Подключение — асинхронно (планировщик
+/// 2.7.0): dial не блокирует ответ, стадии видны через GET_CONTACT_STATE /
+/// CONTACT_STATE_CHANGED, а статус — по событиям PRESENCE.
+fn apiAcceptInvite(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    var out = AcceptOut{};
+    const st = acceptInviteCommon(app, payload, &out);
+    if (st != .OK) return st;
+    w.putU32(@intCast(out.cid)) catch return .INTERNAL;
+    return .OK;
+}
+
+/// ACCEPT_INVITE_EX (44): тот же payload, расширенный ответ:
+/// [cid u32][disposition u8][state u8][attempt u32]. disposition
+/// информирует о постановке работы, НЕ о доверии (см. PROTOCOL.md §6).
+fn apiAcceptInviteEx(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    var out = AcceptOut{};
+    const st = acceptInviteCommon(app, payload, &out);
+    if (st != .OK) return st;
+    w.putU32(@intCast(out.cid)) catch return .INTERNAL;
+    w.putU8(@backingInt(out.disp)) catch return .INTERNAL;
+    w.putU8(@backingInt(out.state)) catch return .INTERNAL;
+    w.putU32(out.attempt) catch return .INTERNAL;
     return .OK;
 }
 
@@ -2169,18 +2975,34 @@ fn faketlsServer(app: *App, tc: *tcp.TcpConn) !interfaces.Conn {
 }
 
 fn establishTo(app: *App, addr: []const u8, cid: i64, role: session_mod.HandshakeRole) !void {
-    return establishToRelay(app, addr, cid, role, null);
+    return establishToRelay(app, addr, .{ .cid = cid, .role = role });
 }
+
+/// Опции установления соединения (establishToRelay).
+const EstablishOpts = struct {
+    cid: i64,
+    role: session_mod.HandshakeRole = .initiator,
+    /// secret релея: адрес — релей, подключение через marker-спаривание
+    /// (пир не видит наш IP).
+    relay_secret: ?[16]u8 = null,
+    /// Поколение попытки для stage-меток (null — системный вызов без
+    /// метки: автодозвон/linker ставят её через connBeginAttemptLocked).
+    gen: ?u32 = null,
+    /// Таймаут прямого dial в мс (0 — блокирующий dial без дедлайна;
+    /// гибрид-инвайты i3 ставят окно direct_dial_timeout_ms).
+    dial_timeout_ms: u32 = 0,
+};
 
 /// establishTo с опциональным релеем: secret != null — адрес это релей,
 /// подключение через marker-спаривание (пир не видит наш IP).
 /// Прямые dial при включённом use_tor_mask идут через Tor SOCKS5
 /// (релей-подключения Tor не используют: релей и так скрывает IP).
-fn establishToRelay(app: *App, addr: []const u8, cid: i64, role: session_mod.HandshakeRole, relay_secret: ?[16]u8) !void {
+/// Стадии подключения (handshaking после dial) отмечаются в conn_st.
+fn establishToRelay(app: *App, addr: []const u8, opts: EstablishOpts) !void {
     // конфиг читаем под локом (SET_CONFIG меняет на живом демоне)
     var tor_buf: [config_mod.addr_max]u8 = undefined;
     var tor_len: usize = 0;
-    if (relay_secret == null) {
+    if (opts.relay_secret == null and opts.dial_timeout_ms == 0) {
         app.lock();
         defer app.unlock();
         if (app.cfg.use_tor_mask) {
@@ -2190,8 +3012,10 @@ fn establishToRelay(app: *App, addr: []const u8, cid: i64, role: session_mod.Han
             tor_len = ta.len;
         }
     }
-    const tc = if (relay_secret) |sec|
+    const tc = if (opts.relay_secret) |sec|
         stille_messenger.net.relay.dial(app.alloc, addr, sec) catch return error.NoRelay
+    else if (opts.dial_timeout_ms > 0)
+        try dialDeadline(app, addr, opts.dial_timeout_ms)
     else if (tor_len > 0)
         socks5.dial(app.alloc, tor_buf[0..tor_len], addr) catch return error.NoTor
     else
@@ -2200,13 +3024,15 @@ fn establishToRelay(app: *App, addr: []const u8, cid: i64, role: session_mod.Han
         app.lock();
         defer app.unlock();
         try app.raw_conns.append(app.alloc, tc);
+        // транспорт поднят: стадия handshaking (метка поколения попытки)
+        if (opts.gen) |g| connSetLocked(app, opts.cid, .handshaking, .none, g);
     }
-    if (role != .initiator) {
+    if (opts.role != .initiator) {
         // responder через релей: ждём m1 как accept
         handleAcceptedConn(app, tc);
         return;
     }
-    try establishSessionOnConn(app, cid, tc);
+    try establishSessionOnConn(app, opts.cid, tc);
 }
 
 /// Поднять сессию ИНИЦИАТОРОМ на уже подключённом конне (relay-присутствие
@@ -2264,27 +3090,88 @@ fn establishSessionOnConn(app: *App, cid: i64, tc: *tcp.TcpConn) !void {
     };
     // держатель инвайта: JOIN — ПЕРВЫМ конвертом, до bind/PROFILE:
     // пир-сторона в pending-режиме закрывает соединение на любом конверте,
-    // кроме JOIN
-    sendJoinIfDue(app, cid, s);
+    // кроме JOIN. До PROFILE-эха контакт НЕ считается подтверждённым.
+    const join_sent = sendJoinIfDue(app, cid, s);
+    if (join_sent) {
+        // окно ожидания PROFILE-эха (подтверждение добавления): бинд
+        // отметит JOINING; эхо/таймаут переведут в ONLINE
+        app.lock();
+        defer app.unlock();
+        const deadline = app.nowMs() + @as(i64, @intCast(join_echo_timeout_ms));
+        app.conn_await.put(app.alloc, cid, deadline) catch {};
+    }
     try app.bindSession(cid, s, sc);
+    if (join_sent) {
+        const th = std.Thread.spawn(.{}, joinEchoWatch, .{ app, cid }) catch null;
+        if (th) |t| t.detach();
+    }
 }
 
-/// Отправка JOIN по join_map (после установления сессии, без app.mu).
-fn sendJoinIfDue(app: *App, cid: i64, s: *session_mod.Session) void {
-    const ji = app.join_map.get(cid) orelse return;
-    _ = app.join_map.remove(cid);
-    const transcript = s.keys.transcript;
+/// Отправка JOIN по join_map (после установления сессии). true — JOIN
+/// отправлен (данные погашены в join_map, ждём PROFILE-эхо). Отказ
+/// отправки НЕ гасит данные: следующая попытка подключения отправит JOIN
+/// заново (секрет одноразовый только на стороне ПРИГЛАШАЮЩЕГО).
+fn sendJoinIfDue(app: *App, cid: i64, s: *session_mod.Session) bool {
+    var ji: JoinInfo = undefined;
+    var bundle: [64]u8 = undefined;
+    var transcript: [32]u8 = undefined;
+    app.lock();
+    const stored = app.join_map.get(cid) orelse {
+        app.unlock();
+        return false;
+    };
+    ji = stored;
+    bundle = app.id.bundle();
+    transcript = s.keys.transcript;
+    app.unlock();
+
     var sig: [64]u8 = undefined;
-    app.id.sign(&transcript, &sig) catch return;
+    app.id.sign(&transcript, &sig) catch {
+        std.crypto.secureZero(u8, &ji.secret);
+        return false;
+    };
     var mac: [32]u8 = undefined;
     std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, &transcript, &ji.secret);
     const j = envelope.Join{
-        .bundle = app.id.bundle(),
+        .bundle = bundle,
         .name = ji.name(),
         .sig = sig,
         .hmac = mac,
     };
-    s.sendEnvelope(.{ .join = j }) catch {};
+    s.sendEnvelope(.{ .join = j }) catch {
+        // отправка не удалась: JOIN-данные остаются в join_map —
+        // повторная попытка подключения отправит JOIN заново
+        std.crypto.secureZero(u8, &ji.secret);
+        return false;
+    };
+    app.lock();
+    if (app.join_map.getPtr(cid)) |pending| {
+        // Удаляем только ту же заявку; повторный ACCEPT с новым ключом
+        // не должен быть погашен старой отправкой.
+        if (std.crypto.timing_safe.eql([invite_mod.secret_len]u8, pending.secret, ji.secret)) {
+            std.crypto.secureZero(u8, &pending.secret);
+            _ = app.join_map.remove(cid);
+        }
+    }
+    app.unlock();
+    std.crypto.secureZero(u8, &ji.secret);
+    return true;
+}
+
+/// Окно PROFILE-эха после JOIN истекло: сессия аутентифицирована —
+/// ONLINE (код join_timeout фиксируется как диагностика; PROFILE —
+/// наблюдаемый признак, НЕ криптографическая квитанция JOIN).
+fn joinEchoWatch(app: *App, cid: i64) void {
+    sysfd.sleepMs(join_echo_timeout_ms);
+    app.lock();
+    defer app.unlock();
+    if (app.conn_await.remove(cid)) {
+        if (app.eng.sessions.get(cid) != null) {
+            connSetLocked(app, cid, .online, .join_timeout, null);
+        } else {
+            connSetLocked(app, cid, .failed, .join_timeout, null);
+        }
+    }
 }
 
 fn acceptLoop(app: *App, listener: *tcp.Listener, cid: i64) void {
@@ -2433,6 +3320,8 @@ fn apiBlock(app: *App, payload: []const u8, flag: bool) api.Status {
         syncEnqueue(app, @backingInt(sync_mod.RecKind.block), &buf);
         syncPumpLocked(app);
     }
+    // 2.7.0: флаг блокировки — часть представления контакта
+    bumpContactLocked(app, @intCast(cid));
     return .OK;
 }
 
@@ -2561,6 +3450,10 @@ fn apiDeleteChat(app: *App, payload: []const u8, w: *api.Writer) api.Status {
         std.mem.writeInt(u16, buf[1..3], @intCast(cid), .little);
         _ = log.append(.set, &buf) catch {};
     }
+    // 2.7.0: удаление — REMOVED-ревизия; летящая работа увидит deleted
+    // и погаснет (canceled), ожидание эха — снять
+    _ = app.conn_await.remove(@as(i64, @intCast(cid)));
+    bumpRemovedLocked(app, @intCast(cid));
     return .OK;
 }
 
@@ -3266,6 +4159,394 @@ fn apiGetHistory(app: *App, payload: []const u8, w: *api.Writer) api.Status {
 /// [ent_count u8] × {entity}
 /// [react_count u32] × {[flags u8 bit0 mine][codepoint u32][ts_ms u64]}.
 /// Нет записи — NOT_FOUND.
+/// GET_CONTACT_STATE (43): [cid u32] → [state u8][attempt u32]
+/// [last_error u16][next_retry_ms u32]. Дешёвый опрос стадии подключения
+/// вместо полных LIST_CONTACTS/событий. next_retry_ms — остаток до
+/// автодозвона (0 — повтора нет/уже пора).
+fn apiGetContactState(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    var r = api.Reader.init(payload);
+    const cid = r.readU32() catch return .BAD_FRAME;
+    if (r.hasMore()) return .BAD_FRAME;
+    app.lock();
+    defer app.unlock();
+    if (cid < 1 or cid > app.eng.contacts.items.len) return .NO_CONTACT;
+    const state: api.ConnState = connStateOfLocked(app, @intCast(cid));
+    const e = app.conn_st.get(@intCast(cid)) orelse ConnEntry{};
+    w.putU8(@backingInt(state)) catch return .INTERNAL;
+    w.putU32(e.attempt) catch return .INTERNAL;
+    w.putU16(e.last_error) catch return .INTERNAL;
+    w.putU32(retryRemainingMs(e.next_retry_at, app.nowMs())) catch return .INTERNAL;
+    return .OK;
+}
+
+/// SUBSCRIBE_CONTACT_UPDATES (45): ∅ → [epoch 16][revision u64].
+/// На этом конне включаются события CONTACT_STATE_CHANGED /
+/// CONTACTS_CHANGED / CONTACT_UPSERTED. Идемпотентно: повторная подписка
+/// обновляет revision-точку. Остальные события конну не отправляются.
+fn apiSubscribeContactUpdates(app: *App, conn: *api_srv.Conn, payload: []const u8, w: *api.Writer) api.Status {
+    if (payload.len != 0) return .BAD_FRAME;
+    app.lock();
+    defer app.unlock();
+    conn.subscribed = true;
+    w.putBytes(&app.contacts_epoch) catch return .INTERNAL;
+    w.putU64(app.contacts_rev) catch return .INTERNAL;
+    return .OK;
+}
+
+/// GET_BOOTSTRAP (46): ∅ → [api_version 3×u16][epoch 16][revision u64]
+/// [count u32] × ContactView. Один вызов вместо каскада GET_CONTACTS +
+/// GET_CONTACT_STATE: стартовая отрисовка списка. Порядок — порядку
+/// слотов движка (стабилен внутри запуска). TOO_BIG — контактов больше
+/// bootstrap_max_contacts: клиент обязан идти через GET_CONTACTS +
+/// GET_CONTACTS_DELTA.
+fn apiGetBootstrap(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    if (payload.len != 0) return .BAD_FRAME;
+    app.lock();
+    defer app.unlock();
+    if (!app.provisioned) return .NOT_INITIALIZED;
+    // фаза 1: счёт (бюджет кадра)
+    var count: usize = 0;
+    var budget: usize = 6 + 16 + 8 + 4;
+    for (app.eng.contacts.items) |*c| {
+        if (c.deleted) continue;
+        count += 1;
+        budget += contact_view_size + 32;
+        if (count >= bootstrap_max_contacts) return .TOO_BIG;
+        if (budget > api.max_payload) return .TOO_BIG;
+    }
+    w.putU16(api.api_version[0]) catch return .INTERNAL;
+    w.putU16(api.api_version[1]) catch return .INTERNAL;
+    w.putU16(api.api_version[2]) catch return .INTERNAL;
+    w.putBytes(&app.contacts_epoch) catch return .INTERNAL;
+    w.putU64(app.contacts_rev) catch return .INTERNAL;
+    w.putU32(@intCast(count)) catch return .INTERNAL;
+    // фаза 2: записи (мутаций под локом нет — размер совпадает)
+    for (app.eng.contacts.items, 0..) |*c, i| {
+        if (c.deleted) continue;
+        putContactViewLocked(app, w, @intCast(i + 1)) catch return .INTERNAL;
+    }
+    return .OK;
+}
+
+/// GET_CONTACTS_DELTA (47): [epoch 16][from_rev u64] → [epoch 16]
+/// [to_rev u64][count u32] × {[rev u64][kind u8][cid u32](+view)}.
+/// Воспроизведение кольца ревизий: клиент ведёт (epoch, rev) и
+/// докачивает пропущенное. RESYNC_REQUIRED — чужой epoch или rev вне
+/// окна кольца: полный пересинхрон (GET_BOOTSTRAP/GET_CONTACTS).
+fn apiGetContactsDelta(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    var r = api.Reader.init(payload);
+    const epoch = r.readBytes(16) catch return .BAD_FRAME;
+    const from_rev = r.readU64() catch return .BAD_FRAME;
+    if (r.hasMore()) return .BAD_FRAME;
+    app.lock();
+    defer app.unlock();
+    if (!app.provisioned) return .NOT_INITIALIZED;
+    if (!std.mem.eql(u8, epoch, &app.contacts_epoch)) return .RESYNC_REQUIRED;
+    if (from_rev > app.contacts_rev) return .BAD_ARGS;
+    // окно кольца: доступная история ревизий
+    if (app.contacts_rev == 0 or from_rev == app.contacts_rev) {
+        // пустая дельта — валидный ответ (пусто)
+        w.putBytes(&app.contacts_epoch) catch return .INTERNAL;
+        w.putU64(app.contacts_rev) catch return .INTERNAL;
+        w.putU32(0) catch return .INTERNAL;
+        return .OK;
+    }
+    const oldest: u64 = if (app.contacts_ring_len < contact_ring_cap)
+        app.contacts_rev - app.contacts_ring_len + 1
+    else
+        app.contacts_ring[app.contacts_ring_pos].rev;
+    if (from_rev + 1 < oldest) return .RESYNC_REQUIRED;
+    // фаза 1: сбор индексов записей (rev > from_rev, ревизии плотные)
+    const span: usize = @intCast(app.contacts_rev - from_rev);
+    if (span > contact_ring_cap) return .RESYNC_REQUIRED;
+    var budget: usize = 16 + 8 + 4 + span * (8 + 1 + 4);
+    var iter: usize = 0;
+    while (iter < span) : (iter += 1) {
+        const idx = (app.contacts_ring_pos + contact_ring_cap - span + iter) % contact_ring_cap;
+        const ch = app.contacts_ring[idx];
+        if (ch.kind == @backingInt(api.DeltaChange.upsert)) budget += contact_view_size + 32;
+    }
+    if (budget > api.max_payload) return .TOO_BIG;
+    w.putBytes(&app.contacts_epoch) catch return .INTERNAL;
+    w.putU64(app.contacts_rev) catch return .INTERNAL;
+    w.putU32(@intCast(span)) catch return .INTERNAL;
+    // фаза 2: записи (порядок возрастания rev)
+    iter = 0;
+    while (iter < span) : (iter += 1) {
+        const idx = (app.contacts_ring_pos + contact_ring_cap - span + iter) % contact_ring_cap;
+        const ch = app.contacts_ring[idx];
+        w.putU64(ch.rev) catch return .INTERNAL;
+        w.putU8(ch.kind) catch return .INTERNAL;
+        w.putU32(@intCast(ch.cid)) catch return .INTERNAL;
+        if (ch.kind == @backingInt(api.DeltaChange.upsert)) {
+            // view на ТЕКУЩИЙ момент: применение клиентом идемпотентно
+            putContactViewLocked(app, w, ch.cid) catch return .INTERNAL;
+        }
+    }
+    return .OK;
+}
+
+/// GET_REACHABLE_ENDPOINTS (48): ∅ → [count u8] × [address str16] —
+/// "ip:port" прямых адресов, по которым нас можно найти в LAN (для QR
+/// прямого приглашения без multicast-поиска). Пусто — не слушаем или
+/// включён use_tor_mask (прямой адрес раскрыть нельзя).
+fn apiGetReachableEndpoints(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    if (payload.len != 0) return .BAD_FRAME;
+    app.lock();
+    const listening = app.listening;
+    const port = app.listen_port;
+    const tor = app.cfg.use_tor_mask;
+    app.unlock();
+    if (!listening or tor) {
+        w.putU8(0) catch return .INTERNAL;
+        return .OK;
+    }
+    // перечисление интерфейсов — системные вызовы, БЕЗ app.mu
+    var ips: [endpoints_mod.max_endpoints][4]u8 = undefined;
+    const n = endpoints_mod.enumerateLocalV4(&ips) catch |e| switch (e) {
+        error.Network => {
+            // перечисление недоступно: пустой список, не ошибка
+            w.putU8(0) catch return .INTERNAL;
+            return .OK;
+        },
+    };
+    w.putU8(@intCast(n)) catch return .INTERNAL;
+    for (ips[0..n]) |ip| {
+        var hbuf: [endpoints_mod.host_max]u8 = undefined;
+        var ab: [endpoints_mod.host_max + 8]u8 = undefined;
+        const host = endpoints_mod.fmtHost(&hbuf, ip);
+        const addr = std.fmt.bufPrint(&ab, "{s}:{d}", .{ host, port }) catch return .INTERNAL;
+        w.putStr16(addr) catch return .INTERNAL;
+    }
+    return .OK;
+}
+
+/// CREATE_INVITE_EX (49): [mode u8][name str16][direct str16][relay str16]
+/// → [code str16][invite_id 16]. mode: 0 discovery / 1 direct / 2 relay_only /
+/// 3 direct_then_relay (i3-код: прямой адрес + relay-fallback в одном).
+/// direct/relay — "host:port". use_tor_mask + прямой режим — BAD_ARGS
+/// (свой IP не раскрываем; relay_only остаётся доступен).
+/// invite_id — НЕсекретный идентикатор для GET_INVITE_STATE.
+fn apiCreateInviteEx(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    var r = api.Reader.init(payload);
+    const mode_in = r.readU8() catch return .BAD_FRAME;
+    const mode = std.enums.fromInt(api.InviteExMode, mode_in) orelse return .BAD_ARGS;
+    const name_in = r.readStr16() catch return .BAD_FRAME;
+    const direct_in = r.readStr16() catch return .BAD_FRAME;
+    const relay_in = r.readStr16() catch return .BAD_FRAME;
+    if (r.hasMore()) return .BAD_FRAME;
+    if (name_in.len > invite_mod.max_name) return .BAD_ARGS;
+    if (direct_in.len > invite_mod.v3_addr_max or relay_in.len > invite_mod.v3_addr_max) return .BAD_ARGS;
+    const d: ?[]const u8 = if (direct_in.len > 0) direct_in else null;
+    const rl: ?[]const u8 = if (relay_in.len > 0) relay_in else null;
+    switch (mode) {
+        .discovery => {
+            if (d != null or rl != null) return .BAD_ARGS;
+        },
+        .direct => {
+            if (d == null or rl != null) return .BAD_ARGS;
+        },
+        .relay_only => {
+            if (rl == null or d != null) return .BAD_ARGS;
+        },
+        .direct_then_relay => {
+            if (d == null or rl == null) return .BAD_ARGS;
+        },
+    }
+    const name: []const u8 = if (name_in.len == 0) "stille-messenger" else name_in;
+    var secret: [invite_mod.secret_len]u8 = undefined;
+    app.io.random(&secret);
+    defer std.crypto.secureZero(u8, &secret);
+    var invite_id: [16]u8 = undefined;
+    app.io.random(&invite_id);
+    {
+        app.lock();
+        defer app.unlock();
+        if (mode == .direct or mode == .direct_then_relay) {
+            if (app.cfg.use_tor_mask) return .BAD_ARGS; // прямой адрес не раскрываем
+        }
+        var slot: ?usize = null;
+        for (&app.invites, 0..) |*reg, i| {
+            if (reg.used or reg.created_ms == 0) {
+                slot = i;
+                break;
+            }
+        }
+        const i = slot orelse return .TOO_MANY_INVITES;
+        app.invites[i] = .{ .secret = secret, .created_ms = app.nowMs(), .used = false, .invite_id = invite_id };
+        if (rl) |ra| {
+            const n = @min(ra.len, relay_addr_max);
+            @memcpy(app.invites[i].relay_buf[0..n], ra[0..n]);
+            app.invites[i].relay_len = @intCast(n);
+        }
+    }
+    // код: гибрид — v3 (i3), одиночные — v2 (обратная совместимость)
+    var out: [512]u8 = undefined;
+    var rbuf: [80]u8 = undefined;
+    const code: []const u8 = blk: {
+        switch (mode) {
+            .direct_then_relay => break :blk invite_mod.encode3(&out, app.id.bundle(), secret, name, d, rl) catch return .BAD_ARGS,
+            .relay_only => {
+                const s = std.fmt.bufPrint(&rbuf, "r/{s}", .{rl.?}) catch return .BAD_ARGS;
+                break :blk invite_mod.encode2(&out, app.id.bundle(), secret, name, s) catch return .BAD_ARGS;
+            },
+            .direct => break :blk invite_mod.encode2(&out, app.id.bundle(), secret, name, d) catch return .BAD_ARGS,
+            .discovery => break :blk invite_mod.encode2(&out, app.id.bundle(), secret, name, null) catch return .BAD_ARGS,
+        }
+    };
+    w.putStr16(code) catch return .INTERNAL;
+    w.putBytes(&invite_id) catch return .INTERNAL;
+    if (rl) |ra| {
+        const addr_copy = app.alloc.dupe(u8, ra) catch return .INTERNAL;
+        if (std.Thread.spawn(.{}, relayLinkerLoop, .{ app, secret, addr_copy })) |t| {
+            t.detach();
+        } else |_| {
+            app.alloc.free(addr_copy);
+        }
+    }
+    return .OK;
+}
+
+/// GET_INVITE_STATE (50): [invite_id 16] → [state u8][accepted_cid u32]
+/// [expires_at_ms i64]. Активные приглашения — из таблицы регистрации;
+/// погашенные (consumed/failed) — кольцо диагностики на invite_done_cap
+/// записей, дальше NOT_FOUND (клиент обязан держать последний ответ сам).
+/// expires_at_ms — 0 (lifetime приглашения управляется владением кода).
+fn apiGetInviteState(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    var r = api.Reader.init(payload);
+    const invite_id = r.readBytes(16) catch return .BAD_FRAME;
+    if (r.hasMore()) return .BAD_FRAME;
+    app.lock();
+    defer app.unlock();
+    // живая регистрация
+    for (&app.invites) |*reg| {
+        if (reg.created_ms == 0) continue;
+        if (!std.mem.eql(u8, &reg.invite_id, invite_id)) continue;
+        if (reg.used) continue;
+        const st: api.InviteState = if (reg.joining) .joining else .active;
+        w.putU8(@backingInt(st)) catch return .INTERNAL;
+        w.putU32(0) catch return .INTERNAL;
+        w.putI64(0) catch return .INTERNAL;
+        return .OK;
+    }
+    // кольцо завершённых (свежее поверх старого)
+    var i: usize = app.invite_done_len;
+    while (i > 0) {
+        i -= 1;
+        const idx = (app.invite_done_pos + invite_done_cap - 1 - i) % invite_done_cap;
+        const done = app.invite_done[idx];
+        if (!std.mem.eql(u8, &done.invite_id, invite_id)) continue;
+        w.putU8(done.state) catch return .INTERNAL;
+        w.putU32(done.accepted_cid) catch return .INTERNAL;
+        w.putI64(0) catch return .INTERNAL;
+        return .OK;
+    }
+    return .NOT_FOUND;
+}
+
+/// GET_HISTORY_PAGE (51): [cid u32][has_cursor u8][before_ts u64]
+/// [before_msg_id 16][limit u16] → [has_more u8][next_ts u64]
+/// [next_msg_id 16][count u32] × records (формат записей — как
+/// GET_HISTORY). Строгий порядок (ts, msg_id): пагинация курсором —
+/// экстремально дешёвая (никаких окон) и стабильная при удалении
+/// старых записей: граница — не позиция, а кортеж.
+fn apiGetHistoryPage(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    var r = api.Reader.init(payload);
+    const cid = r.readU32() catch return .BAD_FRAME;
+    const has_cursor = r.readU8() catch return .BAD_FRAME;
+    const before_ts = r.readU64() catch return .BAD_FRAME;
+    const before_msg_id = r.readBytes(16) catch return .BAD_FRAME;
+    var limit = r.readU16() catch return .BAD_FRAME;
+    if (r.hasMore()) return .BAD_FRAME;
+    if (limit == 0) limit = 30;
+    if (limit > 200) return .TOO_BIG;
+    app.lock();
+    defer app.unlock();
+    if (cid < 1 or cid > app.eng.contacts.items.len) return .NO_CONTACT;
+    if (app.eng.contacts.items[cid - 1].deleted) return .NO_CONTACT;
+
+    // фаза 1: собрать валидные записи чата в буфер индексов, отсортировать
+    // по строгому порядку (ts, msg_id) — устойчивая пагинация при равных ts
+    const RecIdx = struct { ts: u64, msg_id: [16]u8, rec: usize };
+    var recs_idx = std.ArrayListUnmanaged(RecIdx).empty;
+    defer recs_idx.deinit(app.alloc);
+    const all = app.hist.items;
+    for (all, 0..) |rec, i| {
+        if (rec.len < 29) continue;
+        if (std.mem.readInt(u16, rec[0..2], .little) != cid) continue;
+        const body_off = msgBodyOffset(rec) orelse continue;
+        const blen = msgBodyLen(rec) orelse continue;
+        if (rec.len < body_off + blen) continue;
+        if (recEntityTail(rec, blen) == null) continue;
+        recs_idx.append(app.alloc, .{
+            .ts = std.mem.readInt(u64, rec[19..27], .little),
+            .msg_id = rec[3 .. 3 + 16].*,
+            .rec = i,
+        }) catch return .INTERNAL;
+    }
+    const ctx = struct {
+        fn lt(_: void, a: RecIdx, b: RecIdx) bool {
+            if (a.ts != b.ts) return a.ts < b.ts;
+            return std.mem.order(u8, &a.msg_id, &b.msg_id) == .lt;
+        }
+    };
+    std.mem.sort(RecIdx, recs_idx.items, {}, ctx.lt);
+    // Страница выдаётся от новых записей к старым. Курсор исключает
+    // самую старую запись предыдущей страницы и всё, что новее неё.
+    var end: usize = recs_idx.items.len;
+    if (has_cursor != 0) {
+        end = 0;
+        while (end < recs_idx.items.len) {
+            const it = recs_idx.items[end];
+            const before = it.ts < before_ts or
+                (it.ts == before_ts and std.mem.order(u8, &it.msg_id, before_msg_id) == .lt);
+            if (!before) break;
+            end += 1;
+        }
+    }
+    var start: usize = 0;
+    if (end > limit) start = end - limit;
+    const has_more = start > 0;
+    // Курсор следующей страницы: самая старая выданная запись.
+    var next_ts: u64 = 0;
+    var next_msg_id: [16]u8 = @splat(0);
+    if (start < end) {
+        next_ts = recs_idx.items[start].ts;
+        next_msg_id = recs_idx.items[start].msg_id;
+    }
+    // фаза 2: бюджет и запись (записи — как GET_HISTORY)
+    var budget: usize = 1 + 8 + 16 + 4;
+    var i: usize = start;
+    while (i < end) : (i += 1) {
+        const rec = all[recs_idx.items[i].rec];
+        const blen = msgBodyLen(rec).?;
+        const tail = recEntityTail(rec, blen).?;
+        budget += 1 + 16 + 8 + 2 + blen + tail.len;
+    }
+    if (budget > api.max_payload) return .TOO_BIG;
+    w.putU8(@intFromBool(has_more)) catch return .INTERNAL;
+    w.putU64(next_ts) catch return .INTERNAL;
+    w.putBytes(&next_msg_id) catch return .INTERNAL;
+    w.putU32(@intCast(end - start)) catch return .INTERNAL;
+    i = end;
+    while (i > start) {
+        i -= 1;
+        const rec = all[recs_idx.items[i].rec];
+        const flags = rec[2];
+        const msg_id: [16]u8 = rec[3 .. 3 + 16].*;
+        const ts_ms = std.mem.readInt(u64, rec[19..27], .little);
+        const body_off = msgBodyOffset(rec).?;
+        const blen = msgBodyLen(rec).?;
+        const tail = recEntityTail(rec, blen).?;
+        w.putU8(flags) catch return .INTERNAL;
+        w.putBytes(&msg_id) catch return .INTERNAL;
+        w.putU64(ts_ms) catch return .INTERNAL;
+        w.putStr16(rec[body_off .. body_off + blen]) catch return .INTERNAL;
+        w.putBytes(tail) catch return .INTERNAL;
+    }
+    return .OK;
+}
+
 fn apiGetMessage(app: *App, payload: []const u8, w: *api.Writer) api.Status {
     var r = api.Reader.init(payload);
     const want: [16]u8 = (r.readBytes(16) catch return .BAD_FRAME)[0..16].*;
@@ -3938,6 +5219,15 @@ pub fn dispatchApi(app: *App, conn: *api_srv.Conn, req: ApiRequest) bool {
         .GET_PINNED_CHAT => respond(conn, req, apiGetPinnedChat(app, req.payload, &w), w.items()),
         .UNPIN_CHAT => respond(conn, req, apiUnpinChat(app, req.payload, &w), w.items()),
         .DELETE_CHAT => respond(conn, req, apiDeleteChat(app, req.payload, &w), w.items()),
+        .GET_CONTACT_STATE => respond(conn, req, apiGetContactState(app, req.payload, &w), w.items()),
+        .ACCEPT_INVITE_EX => respond(conn, req, apiAcceptInviteEx(app, req.payload, &w), w.items()),
+        .SUBSCRIBE_CONTACT_UPDATES => respond(conn, req, apiSubscribeContactUpdates(app, conn, req.payload, &w), w.items()),
+        .GET_BOOTSTRAP => respond(conn, req, apiGetBootstrap(app, req.payload, &w), w.items()),
+        .GET_CONTACTS_DELTA => respond(conn, req, apiGetContactsDelta(app, req.payload, &w), w.items()),
+        .GET_REACHABLE_ENDPOINTS => respond(conn, req, apiGetReachableEndpoints(app, req.payload, &w), w.items()),
+        .CREATE_INVITE_EX => respond(conn, req, apiCreateInviteEx(app, req.payload, &w), w.items()),
+        .GET_INVITE_STATE => respond(conn, req, apiGetInviteState(app, req.payload, &w), w.items()),
+        .GET_HISTORY_PAGE => respond(conn, req, apiGetHistoryPage(app, req.payload, &w), w.items()),
         .SEND_CONTACT => respond(conn, req, apiSendContact(app, req.payload, &w), w.items()),
         .PIN_MESSAGE => respond(conn, req, apiPinMessage(app, req.payload, &w), w.items()),
         .UNPIN_MESSAGE => respond(conn, req, apiUnpinMessage(app, req.payload, &w), w.items()),
@@ -4002,6 +5292,10 @@ fn startNetworking(app: *App) void {
     }
     if (lsn) |l| {
         app.listen_port = listen_port;
+        // 2.7.0: слушатель поднят — GET_REACHABLE_ENDPOINTS отдаёт адреса
+        app.lock();
+        app.listening = true;
+        app.unlock();
         const lp = app.alloc.create(tcp.Listener) catch return;
         lp.* = l;
         const lt = std.Thread.spawn(.{}, autoAcceptLoop, .{ app, lp }) catch return;
@@ -4023,16 +5317,21 @@ fn apiConnect(app: *App, payload: []const u8, w: *api.Writer) api.Status {
     const addr = r.readStr16() catch return .BAD_FRAME;
     if (r.hasMore()) return .BAD_FRAME;
     if (addr.len == 0) return .BAD_ARGS;
+    var work = ConnWork{ .cid = @intCast(cid) };
+    if (addr.len > work.addr_buf.len) return .BAD_ARGS;
     {
         app.lock();
         defer app.unlock();
         if (cid < 1 or cid > app.eng.contacts.items.len) return .NO_CONTACT;
+        // адрес контакта обновить (автодозвон видит последний известный)
+        saveContactAddr(app, @intCast(cid), addr);
     }
-    establishTo(app, addr, @intCast(cid), .initiator) catch |e| switch (statusOf(e)) {
-        .NO_CONTACT => return .NO_CONTACT,
-        .NO_RELAY => return .NO_RELAY,
-        else => return .TRANSPORT_FAILED,
-    };
+    @memcpy(work.addr_buf[0..addr.len], addr);
+    work.addr_len = @intCast(addr.len);
+    // 2.7.0: dial НЕ блокирует ответ — работа уходит планировщику;
+    // стадии/результат — GET_CONTACT_STATE и события. Обычно не нужен:
+    // ACCEPT_INVITE уже подключает из кода.
+    connEnqueue(app, work) catch return .BUSY;
     return .OK;
 }
 
@@ -4170,6 +5469,9 @@ pub fn main(start: std.process.Init) !void {
         app.sync.tr_ctx = &app;
         app.sync.tr_fn = syncTranslateBundle;
         @memcpy(app.home_buf[0..app.home_len], home[0..app.home_len]);
+        // epoch ревизий контактов: случайно на старте демона (RESYNC при
+        // перезапуске клиента/демона не отдаёт старую ревизию как валидную)
+        io.random(&app.contacts_epoch);
         eng.ev = app.events();
 
         // профиль грузится и сеть поднимается только на провиженном
@@ -4212,6 +5514,17 @@ pub fn main(start: std.process.Init) !void {
         app.client_recs.deinit(app.alloc);
         app.client_macs.deinit(app.alloc);
         app.server_runs.deinit(app.alloc);
+        // планировщик подключений (2.7.0): очередь/состояния/ожидания эха
+        app.conn_work.deinit(app.alloc);
+        app.conn_inflight.deinit(app.alloc);
+        app.conn_st.deinit(app.alloc);
+        app.conn_await.deinit(app.alloc);
+        var join_it = app.join_map.valueIterator();
+        while (join_it.next()) |ji| std.crypto.secureZero(u8, &ji.secret);
+        app.join_map.deinit(app.alloc);
+        for (&app.invites) |*reg| std.crypto.secureZero(u8, &reg.secret);
+        app.hb.deinit();
+        app.sess_ctx.deinit();
         return;
     }
 
@@ -4443,4 +5756,443 @@ test "recovery API: CREATE/RESTORE через хендлеры и статусы
     try req6.putBytes(&secret);
     try req6.putU8(0);
     try t.expectEqual(api.Status.BAD_FRAME, apiCreateRecoveryBackup(&src.app, req6.items(), &w5));
+}
+
+// ------------------------------------------------------------ тесты 2.7.0
+// Хендлер-уровень (как recovery-тесты): фикстура без сети/лога, все
+// новые методы дергаются напрямую, потоки не поднимаются (адреса в
+// кодах нет — работы подключения не ставится в очередь).
+
+test "2.7.0: ACCEPT_INVITE_EX, состояние, бутстрап, дельта, страница истории" {
+    const t = std.testing;
+    const alloc = t.allocator;
+    const seed: [32]u8 = @splat(0x55);
+    var id = try identity.Identity.fromSeed(seed);
+    defer id.deinit();
+    var eng = engine_mod.Engine.init(alloc, t.io, id, .{ .ctx = undefined });
+    defer eng.deinit();
+    var app = App{
+        .alloc = alloc,
+        .io = t.io,
+        .id = &id,
+        .eng = &eng,
+        .log = null,
+        .hb = std.AutoHashMap(i64, hb.State).init(alloc),
+        .sess_ctx = std.AutoHashMap(i64, *SessCtx).init(alloc),
+        .provisioned = true,
+        .no_network = true,
+    };
+    defer app.hb.deinit();
+    defer app.sess_ctx.deinit();
+    defer app.conn_st.deinit(alloc);
+    defer app.conn_await.deinit(alloc);
+    defer app.conn_inflight.deinit(alloc);
+    defer app.conn_work.deinit(alloc);
+    defer app.join_map.deinit(alloc);
+    defer {
+        for (app.hist.items) |rec| alloc.free(rec);
+        app.hist.deinit(alloc);
+        app.hist_idx.deinit(alloc);
+    }
+
+    // v2-код без адреса: контакт + DISCOVERING (ждёт LAN-анонс)
+    var bundle: [64]u8 = @splat(0xAB);
+    bundle[0] = 1;
+    const secret: [invite_mod.secret_len]u8 = @splat(0x11);
+    var cb: [256]u8 = undefined;
+    const code = try invite_mod.encode2(&cb, bundle, secret, "mom", null);
+
+    var req = api.Writer.init(alloc);
+    defer req.deinit();
+    try req.putStr16(code);
+    try req.putStr16("son");
+    var resp = api.Writer.init(alloc);
+    defer resp.deinit();
+    try t.expectEqual(api.Status.OK, apiAcceptInviteEx(&app, req.items(), &resp));
+    {
+        var rr = api.Reader.init(resp.items());
+        const cid = try rr.readU32();
+        const disp = try rr.readU8();
+        const state = try rr.readU8();
+        const attempt = try rr.readU32();
+        try t.expect(!rr.hasMore());
+        try t.expectEqual(@as(u32, 1), cid);
+        try t.expectEqual(@as(u8, @backingInt(api.AcceptDisposition.accepted)), disp);
+        try t.expectEqual(@as(u8, @backingInt(api.ConnState.pending)), state);
+        try t.expectEqual(@as(u32, 0), attempt);
+    }
+    // повторное погашение того же кода: тот же cid, дубль контакта не создаётся
+    var resp2 = api.Writer.init(alloc);
+    defer resp2.deinit();
+    try t.expectEqual(api.Status.OK, apiAcceptInviteEx(&app, req.items(), &resp2));
+    var rr2 = api.Reader.init(resp2.items());
+    try t.expectEqual(@as(u32, 1), try rr2.readU32());
+    try t.expectEqual(@as(usize, 1), app.eng.contacts.items.len);
+    // JOIN-данные заряжены (отправит первым конвертом после рукопожатия)
+    try t.expect(app.join_map.contains(1));
+
+    // GET_CONTACT_STATE: дешёвый опрос стадии
+    var gs = api.Writer.init(alloc);
+    defer gs.deinit();
+    var gc = api.Writer.init(alloc);
+    defer gc.deinit();
+    try gc.putU32(1);
+    try t.expectEqual(api.Status.OK, apiGetContactState(&app, gc.items(), &gs));
+    {
+        var rr = api.Reader.init(gs.items());
+        try t.expectEqual(@as(u8, @backingInt(api.ConnState.pending)), try rr.readU8());
+        try t.expectEqual(@as(u32, 0), try rr.readU32());
+        try t.expectEqual(@as(u16, 0), try rr.readU16());
+        try t.expectEqual(@as(u32, 0), try rr.readU32());
+        try t.expect(!rr.hasMore());
+    }
+    try t.expectEqual(api.Status.NO_CONTACT, apiGetContactState(&app, &.{ 9, 0, 0, 0 }, &gs));
+    try t.expectEqual(api.Status.BAD_FRAME, apiGetContactState(&app, &.{1}, &gs));
+
+    // GET_BOOTSTRAP: версия API, epoch, ревизия, счёт, представление
+    var bs = api.Writer.init(alloc);
+    defer bs.deinit();
+    try t.expectEqual(api.Status.OK, apiGetBootstrap(&app, &.{}, &bs));
+    var br = api.Reader.init(bs.items());
+    try t.expectEqual(api.api_version[0], try br.readU16());
+    try t.expectEqual(api.api_version[1], try br.readU16());
+    try t.expectEqual(api.api_version[2], try br.readU16());
+    const epoch = try br.readBytes(16);
+    const rev0 = try br.readU64();
+    const cnt = try br.readU32();
+    try t.expectEqual(@as(u32, 1), cnt);
+    {
+        const vcid = try br.readU32();
+        const vflags = try br.readU8();
+        _ = try br.readI64();
+        const vname = try br.readStr16();
+        _ = try br.readBytes(16);
+        const vstate = try br.readU8();
+        _ = try br.readU32();
+        _ = try br.readU16();
+        _ = try br.readU32();
+        try t.expect(!br.hasMore());
+        try t.expectEqual(@as(u32, 1), vcid);
+        try t.expectEqual(@as(u8, 4), vflags); // pending (bit2)
+        try t.expectEqualStrings("mom", vname);
+        try t.expectEqual(@as(u8, @backingInt(api.ConnState.pending)), vstate);
+    }
+    try t.expect(rev0 > 0);
+
+    // SUBSCRIBE_CONTACT_UPDATES: epoch/revision + флаг конна
+    var conn = api_srv.Conn{ .fd = -1, .srv = undefined };
+    var ss = api.Writer.init(alloc);
+    defer ss.deinit();
+    try t.expectEqual(api.Status.OK, apiSubscribeContactUpdates(&app, &conn, &.{}, &ss));
+    try t.expect(conn.subscribed);
+    {
+        var rr = api.Reader.init(ss.items());
+        try t.expectEqualSlices(u8, epoch, try rr.readBytes(16));
+        try t.expectEqual(rev0, try rr.readU64());
+        try t.expect(!rr.hasMore());
+    }
+    try t.expectEqual(api.Status.BAD_FRAME, apiSubscribeContactUpdates(&app, &conn, &.{1}, &ss));
+
+    // GET_CONTACTS_DELTA: свежая ревизия — пусто; нулевая — полное кольцо
+    var ds = api.Writer.init(alloc);
+    defer ds.deinit();
+    var dq = api.Writer.init(alloc);
+    defer dq.deinit();
+    try dq.putBytes(epoch);
+    try dq.putU64(rev0);
+    try t.expectEqual(api.Status.OK, apiGetContactsDelta(&app, dq.items(), &ds));
+    {
+        var rr = api.Reader.init(ds.items());
+        try t.expectEqualSlices(u8, epoch, try rr.readBytes(16));
+        try t.expectEqual(rev0, try rr.readU64());
+        try t.expectEqual(@as(u32, 0), try rr.readU32());
+        try t.expect(!rr.hasMore());
+    }
+    ds.list.clearRetainingCapacity();
+    dq.list.clearRetainingCapacity();
+    try dq.putBytes(epoch);
+    try dq.putU64(0);
+    try t.expectEqual(api.Status.OK, apiGetContactsDelta(&app, dq.items(), &ds));
+    var last_kind: u8 = 0xFF;
+    {
+        var rr = api.Reader.init(ds.items());
+        try t.expectEqualSlices(u8, epoch, try rr.readBytes(16));
+        const to_rev = try rr.readU64();
+        try t.expectEqual(rev0, to_rev);
+        const n = try rr.readU32();
+        try t.expect(n > 0);
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            const r = try rr.readU64();
+            const kind = try rr.readU8();
+            const c = try rr.readU32();
+            try t.expect(r > 0); // ревизии плотные, от 1
+            try t.expectEqual(@as(u32, 1), c);
+            if (kind == @backingInt(api.DeltaChange.upsert)) {
+                // за заголовком — полный contact_view
+                _ = try rr.readU32();
+                _ = try rr.readU8();
+                _ = try rr.readI64();
+                _ = try rr.readStr16();
+                _ = try rr.readBytes(16);
+                _ = try rr.readU8();
+                _ = try rr.readU32();
+                _ = try rr.readU16();
+                _ = try rr.readU32();
+            }
+            last_kind = kind;
+        }
+        try t.expect(!rr.hasMore());
+        try t.expectEqual(@as(u8, @backingInt(api.DeltaChange.upsert)), last_kind);
+    }
+    // чужой epoch / ревизия из будущего — пересинхрон
+    dq.list.clearRetainingCapacity();
+    try dq.putBytes(&@as([16]u8, @splat(9)));
+    try dq.putU64(0);
+    try t.expectEqual(api.Status.RESYNC_REQUIRED, apiGetContactsDelta(&app, dq.items(), &ds));
+    dq.list.clearRetainingCapacity();
+    try dq.putBytes(epoch);
+    try dq.putU64(rev0 + 1);
+    try t.expectEqual(api.Status.BAD_ARGS, apiGetContactsDelta(&app, dq.items(), &ds));
+
+    // GET_HISTORY_PAGE: строгий порядок (ts, msg_id), курсор, has_more
+    var ids: [5][16]u8 = undefined;
+    for (&ids, 0..) |*m, i| {
+        m.* = @splat(@truncate(i + 1));
+        persistMsg(&app, 1, true, m.*, null, true, 1000 + @as(i64, @intCast(i)), "msg", &.{});
+    }
+    var pq = api.Writer.init(alloc);
+    defer pq.deinit();
+    try pq.putU32(1);
+    try pq.putU8(0); // без курсора: хвост
+    try pq.putU64(0);
+    try pq.putBytes(&@as([16]u8, @splat(0)));
+    try pq.putU16(2);
+    var ps = api.Writer.init(alloc);
+    defer ps.deinit();
+    try t.expectEqual(api.Status.OK, apiGetHistoryPage(&app, pq.items(), &ps));
+    var next_ts: u64 = 0;
+    var next_id: [16]u8 = @splat(0);
+    {
+        var rr = api.Reader.init(ps.items());
+        const has_more = try rr.readU8();
+        next_ts = try rr.readU64();
+        const nid = try rr.readBytes(16);
+        next_id = nid[0..16].*;
+        const n = try rr.readU32();
+        try t.expect(has_more != 0);
+        try t.expectEqual(@as(u32, 2), n);
+        // последние две записи: ts 1003/1004
+        var prev_ts: u64 = std.math.maxInt(u64);
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            _ = try rr.readU8(); // flags
+            const mids = try rr.readBytes(16);
+            const mid = mids[0..16].*;
+            const ts = try rr.readU64();
+            _ = try rr.readStr16();
+            _ = try rr.readU8(); // счётчик entities
+            try t.expect(ts < prev_ts); // убывание внутри страницы
+            prev_ts = ts;
+            if (i == 0) try t.expectEqual(@as(u64, 1004), ts);
+            if (i == 1) try t.expectEqualSlices(u8, &ids[3], &mid);
+        }
+        try t.expect(!rr.hasMore());
+    }
+    try t.expectEqual(@as(u64, 1003), next_ts);
+    // вторая страница тем же курсором — продолжение без дублей
+    pq.list.clearRetainingCapacity();
+    try pq.putU32(1);
+    try pq.putU8(1);
+    try pq.putU64(next_ts);
+    try pq.putBytes(&next_id);
+    try pq.putU16(2);
+    ps.list.clearRetainingCapacity();
+    try t.expectEqual(api.Status.OK, apiGetHistoryPage(&app, pq.items(), &ps));
+    {
+        var rr = api.Reader.init(ps.items());
+        const has_more = try rr.readU8();
+        _ = try rr.readU64();
+        _ = try rr.readBytes(16);
+        const n = try rr.readU32();
+        try t.expect(has_more != 0);
+        try t.expectEqual(@as(u32, 2), n);
+        _ = try rr.readU8();
+        var mid: [16]u8 = undefined;
+        @memcpy(&mid, try rr.readBytes(16));
+        try t.expectEqualSlices(u8, &ids[2], &mid); // строго старее курсора
+    }
+    // лимит: 0 → 30 по умолчанию не роняет, 201 → TOO_BIG
+    pq.list.clearRetainingCapacity();
+    try pq.putU32(1);
+    try pq.putU8(0);
+    try pq.putU64(0);
+    try pq.putBytes(&@as([16]u8, @splat(0)));
+    try pq.putU16(201);
+    try t.expectEqual(api.Status.TOO_BIG, apiGetHistoryPage(&app, pq.items(), &ps));
+    pq.list.clearRetainingCapacity();
+    try pq.putU32(99);
+    try pq.putU8(0);
+    try pq.putU64(0);
+    try pq.putBytes(&@as([16]u8, @splat(0)));
+    try pq.putU16(5);
+    try t.expectEqual(api.Status.NO_CONTACT, apiGetHistoryPage(&app, pq.items(), &ps));
+
+    // DELETE_CHAT → REMOVED-ревизия в дельте
+    var dc = api.Writer.init(alloc);
+    defer dc.deinit();
+    try dc.putU32(1);
+    try t.expectEqual(api.Status.OK, apiDeleteChat(&app, dc.items(), &ps));
+    dq.list.clearRetainingCapacity();
+    try dq.putBytes(epoch);
+    try dq.putU64(rev0);
+    ds.list.clearRetainingCapacity();
+    try t.expectEqual(api.Status.OK, apiGetContactsDelta(&app, dq.items(), &ds));
+    {
+        var rr = api.Reader.init(ds.items());
+        _ = try rr.readBytes(16);
+        _ = try rr.readU64();
+        const n = try rr.readU32();
+        try t.expect(n > 0);
+        var i: u32 = 0;
+        while (i < n - 1) : (i += 1) {
+            _ = try rr.readU64();
+            const kind = try rr.readU8();
+            const c = try rr.readU32();
+            _ = c;
+            if (kind == @backingInt(api.DeltaChange.upsert)) {
+                _ = try rr.readU32();
+                _ = try rr.readU8();
+                _ = try rr.readI64();
+                _ = try rr.readStr16();
+                _ = try rr.readBytes(16);
+                _ = try rr.readU8();
+                _ = try rr.readU32();
+                _ = try rr.readU16();
+                _ = try rr.readU32();
+            }
+        }
+        _ = try rr.readU64();
+        const kind = try rr.readU8();
+        const c = try rr.readU32();
+        try t.expectEqual(@as(u8, @backingInt(api.DeltaChange.removed)), kind);
+        try t.expectEqual(@as(u32, 1), c);
+        try t.expect(!rr.hasMore());
+    }
+
+    // CREATE_INVITE_EX: discovery → v2-код + invite_id; state по нему
+    var cq = api.Writer.init(alloc);
+    defer cq.deinit();
+    try cq.putU8(@backingInt(api.InviteExMode.discovery));
+    try cq.putStr16("host");
+    try cq.putStr16("");
+    try cq.putStr16("");
+    var cs = api.Writer.init(alloc);
+    defer cs.deinit();
+    try t.expectEqual(api.Status.OK, apiCreateInviteEx(&app, cq.items(), &cs));
+    var invite_id: [16]u8 = @splat(0);
+    {
+        var rr = api.Reader.init(cs.items());
+        const ic = try rr.readStr16();
+        try t.expect(std.mem.startsWith(u8, ic, invite_mod.v2_prefix));
+        @memcpy(&invite_id, try rr.readBytes(16));
+        try t.expect(!rr.hasMore());
+    }
+    var iq = api.Writer.init(alloc);
+    defer iq.deinit();
+    try iq.putBytes(&invite_id);
+    var is = api.Writer.init(alloc);
+    defer is.deinit();
+    try t.expectEqual(api.Status.OK, apiGetInviteState(&app, iq.items(), &is));
+    {
+        var rr = api.Reader.init(is.items());
+        try t.expectEqual(@as(u8, @backingInt(api.InviteState.active)), try rr.readU8());
+        try t.expectEqual(@as(u32, 0), try rr.readU32());
+        try t.expectEqual(@as(i64, 0), try rr.readI64());
+        try t.expect(!rr.hasMore());
+    }
+    // случайный идентификатор — NOT_FOUND
+    var iq2 = api.Writer.init(alloc);
+    defer iq2.deinit();
+    try iq2.putBytes(&@as([16]u8, @splat(0xEE)));
+    try t.expectEqual(api.Status.NOT_FOUND, apiGetInviteState(&app, iq2.items(), &is));
+    // валидация режимов: прямой без адреса / discovery с адресом / битый mode
+    cq.list.clearRetainingCapacity();
+    try cq.putU8(@backingInt(api.InviteExMode.direct));
+    try cq.putStr16("h");
+    try cq.putStr16("");
+    try cq.putStr16("");
+    try t.expectEqual(api.Status.BAD_ARGS, apiCreateInviteEx(&app, cq.items(), &cs));
+    cq.list.clearRetainingCapacity();
+    try cq.putU8(9);
+    try t.expectEqual(api.Status.BAD_ARGS, apiCreateInviteEx(&app, cq.items(), &cs));
+    cq.list.clearRetainingCapacity();
+    try cq.putU8(@backingInt(api.InviteExMode.discovery));
+    try cq.putStr16("h");
+    try cq.putStr16("10.0.0.1:7777");
+    try cq.putStr16("");
+    try t.expectEqual(api.Status.BAD_ARGS, apiCreateInviteEx(&app, cq.items(), &cs));
+
+    // GET_REACHABLE_ENDPOINTS: не слушаем — пусто (не ошибка)
+    var es = api.Writer.init(alloc);
+    defer es.deinit();
+    try t.expectEqual(api.Status.OK, apiGetReachableEndpoints(&app, &.{}, &es));
+    try t.expectEqual(@as(usize, 1), es.items().len);
+    try t.expectEqual(@as(u8, 0), es.items()[0]);
+}
+
+test "2.7.0: GET_CONTACTS_DELTA окно и RESYNC за границей кольца" {
+    const t = std.testing;
+    const alloc = t.allocator;
+    const seed: [32]u8 = @splat(0x66);
+    var id = try identity.Identity.fromSeed(seed);
+    defer id.deinit();
+    var eng = engine_mod.Engine.init(alloc, t.io, id, .{ .ctx = undefined });
+    defer eng.deinit();
+    var app = App{
+        .alloc = alloc,
+        .io = t.io,
+        .id = &id,
+        .eng = &eng,
+        .log = null,
+        .hb = std.AutoHashMap(i64, hb.State).init(alloc),
+        .sess_ctx = std.AutoHashMap(i64, *SessCtx).init(alloc),
+        .provisioned = true,
+        .no_network = true,
+    };
+    defer app.hb.deinit();
+    defer app.sess_ctx.deinit();
+
+    // кольцо фиксированного размера: известное число ревизий > cap
+    app.contacts_epoch = @splat(7);
+    for (0..contact_ring_cap + 10) |_| {
+        _ = app.eng.addContact("x", @as([64]u8, @splat(0xCD))) catch unreachable;
+        // ringAppend без контакта не имеет смысла: используем реальный бамп
+        const cid: i64 = @intCast(app.eng.contacts.items.len);
+        bumpContactLocked(&app, cid);
+    }
+    const total_rev = app.contacts_rev;
+    try t.expectEqual(@as(u64, contact_ring_cap + 10), total_rev);
+    // самая старая доступная ревизия = rev - cap + 1
+    {
+        var dq = api.Writer.init(alloc);
+        defer dq.deinit();
+        try dq.putBytes(&app.contacts_epoch);
+        try dq.putU64(total_rev - @as(u64, contact_ring_cap));
+        var ds = api.Writer.init(alloc);
+        defer ds.deinit();
+        try t.expectEqual(api.Status.OK, apiGetContactsDelta(&app, dq.items(), &ds));
+        var rr = api.Reader.init(ds.items());
+        _ = try rr.readBytes(16);
+        try t.expectEqual(total_rev, try rr.readU64());
+        try t.expectEqual(@as(u32, contact_ring_cap), try rr.readU32());
+    }
+    // за границей окна — RESYNC_REQUIRED
+    var dq = api.Writer.init(alloc);
+    defer dq.deinit();
+    try dq.putBytes(&app.contacts_epoch);
+    try dq.putU64(total_rev - @as(u64, contact_ring_cap) - 1);
+    var ds = api.Writer.init(alloc);
+    defer ds.deinit();
+    try t.expectEqual(api.Status.RESYNC_REQUIRED, apiGetContactsDelta(&app, dq.items(), &ds));
 }

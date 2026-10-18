@@ -34,6 +34,13 @@ Own avatar previews can be restored after a daemon or client restart with
 bytes, or `NOT_FOUND` if unavailable. Images remain in the encrypted log;
 clients need no plaintext disk cache. See the [API specification](core/docs/CORE-API.md#44-own-profile).
 
+Adding a friend is a one-key request: `CREATE_INVITE` produces one
+`shopot://i/...` code; the holder performs exactly one `ACCEPT_INVITE`.
+The inviter needs no second key or manual confirmation: the core verifies the
+signed, HMAC-authenticated JOIN and adds the peer automatically. API 2.7.0
+also exposes bounded asynchronous connection and invite state, plus a v3
+`shopot://i3/...` direct-then-relay code for hybrid routing.
+
 A lost device does not lose the account: `stille-messenger serve` without a
 seed file starts unprovisioned and waits for
 [`RESTORE_RECOVERY_BACKUP`](core/docs/CORE-API.md#410-account-recovery-since-api-260)
@@ -66,12 +73,8 @@ stille-messenger serve         # daemon: core + UDS API (~/.shopot/api.sock)
 There is no CLI/TUI: the only client interface is the GUI, which talks to
 the core over UDS using the binary framed protocol (typed responses,
 machine error codes, events). Specification for client authors:
-[`core/docs/CORE-API.md`](core/docs/CORE-API.md) (API 2.6.0).
+[`core/docs/CORE-API.md`](core/docs/CORE-API.md) (API 2.7.0).
 
-Adding a friend is one action: `CREATE_INVITE` produces a one-way code
-(`shopot://i/...`); the holder performs a single `ACCEPT_INVITE`. The
-contact, session and delivery are established by the core itself (LAN
-discovery, autodial, offline outbox, delivery ACKs).
 
 ## Relay (IP hiding)
 
@@ -102,7 +105,7 @@ Details: [`core/docs/PROTOCOL.md`](core/docs/PROTOCOL.md),
 
 | Document | Content |
 |---|---|
-| [`core/docs/CORE-API.md`](core/docs/CORE-API.md) / [ru](core/docs/ru/CORE-API.md) | binary UDS interface for GUI clients (API 2.6.0) |
+| [`core/docs/CORE-API.md`](core/docs/CORE-API.md) / [ru](core/docs/ru/CORE-API.md) | binary UDS interface for GUI clients (API 2.7.0) |
 | [`CLIENT_RULES.md`](CLIENT_RULES.md) / [ru](docs/ru/CLIENT_RULES.md) | binding contract for GUI clients: bootstrap, events, account recovery UX |
 | [`core/docs/PROTOCOL.md`](core/docs/PROTOCOL.md) / [ru](core/docs/ru/PROTOCOL.md) | byte-level wire protocol v4 |
 | [`core/docs/ARCHITECTURE.md`](core/docs/ARCHITECTURE.md) / [ru](core/docs/ru/ARCHITECTURE.md) | layers, data flow, threading |
