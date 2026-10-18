@@ -21,7 +21,7 @@ Layer and data-flow reference for the `stille-messenger` core. Russian version:
 
 | Layer | Directory | Responsibility |
 |---|---|---|
-| app | `src/stille-messenger/app/` | daemon: UDS API server, invites, LAN discovery, autodial, outbox flushing, call audio loop, file transfers, configuration (config.zig), device sync (sync.zig), Tor SOCKS5 dialing |
+| app | `src/stille-messenger/app/` | daemon: UDS API server, invites, LAN discovery, autodial, outbox flushing, call audio loop, file transfers, configuration (config.zig), device sync (sync.zig), account recovery (recovery.zig: build/apply the sealed profile package; unprovisioned serve mode), Tor SOCKS5 dialing |
 | core | `src/stille-messenger/core/` | engine (contacts, locks, dispatch, outbox, file Tx state machines), session (handshake + sealed frames) |
 | proto | `src/stille-messenger/proto/` | binary envelopes, allocation-free codec |
 | crypto | `src/stille-messenger/crypto/` | identity, handshake, ratchet, call keys, AEAD, padding |

@@ -9,6 +9,7 @@ pub const crypto = struct {
     pub const ratchet = @import("stille-messenger/crypto/ratchet.zig");
     pub const call_keys = @import("stille-messenger/crypto/call_keys.zig");
     pub const pad = @import("stille-messenger/crypto/pad.zig");
+    pub const recovery = @import("stille-messenger/crypto/recovery.zig");
 };
 
 pub const proto = struct {

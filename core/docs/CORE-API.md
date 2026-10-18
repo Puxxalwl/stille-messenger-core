@@ -9,7 +9,11 @@ renders. The protocol is **binary**: no strings-as-protocol, no JSON, no
 human-readable text on the wire — only typed byte frames and machine-readable
 codes (methods, statuses, events).
 
-- API version: **2.4.0** (returned by `GET_VERSION`, semver). History:
+- API version: **2.6.0** (returned by `GET_VERSION`, semver).
+  2.6.0 adds account recovery (§4.10: `CREATE_RECOVERY_BACKUP`/
+  `RESTORE_RECOVERY_BACKUP`, statuses `BAD_RECOVERY`/`NOT_INITIALIZED`/
+  `ALREADY_PROVISIONED`) and the unprovisioned serve mode, without peer
+  wire or storage migration. History: 2.5.0 — `GET_MY_AVATAR` (§4.4);
   2.0.0 — formatting-entities tail in message payloads (§4.3); 2.1.0 —
   `SEARCH_MESSAGE`/`GLOBAL_SEARCH_MESSAGE` (§4.3); 2.2.0 — chat pinning/
   deletion, message pinning, contact-card sharing (§4.8), the
@@ -44,7 +48,9 @@ steps — the core has already handled them.
 
 - UI, rendering, emoji glyphs, QR — client's job.
 - Third-party storage — there is none; content lives on the two devices only
-  (the encrypted log is local).
+  (the encrypted log is local). The recovery package (§4.10) is the one
+  deliberate exception in kind: a sealed, client-stored blob in the user's
+  own cloud holding identity/profile (never message content).
 - NAT traversal for two NAT-ed peers: the channel is LAN, direct TCP
   (auto-selected port range 7777–7786), or a relay (`stille-messenger relay` on any
   server).
@@ -99,6 +105,9 @@ responses.
 | 15 | `NO_RELAY` | relay unreachable |
 | 16 | `TRANSPORT_FAILED` | transport did not come up (dial/handshake) |
 | 17 | `TOR_UNAVAILABLE` | Tor SOCKS5 proxy unreachable (`use_tor_mask` on) |
+| 18 | `BAD_RECOVERY` | recovery blob unusable: not parsed, wrong unlock secret, unknown format version (§4.10) |
+| 19 | `NOT_INITIALIZED` | no profile: daemon runs unprovisioned (§4.10); `GET_IDENTITY` and `CREATE_RECOVERY_BACKUP` refuse |
+| 20 | `ALREADY_PROVISIONED` | profile already exists: `RESTORE_RECOVERY_BACKUP` requires an empty profile (§4.10) |
 | 255 | `INTERNAL` | internal core error |
 
 ## 4. Methods (REQUEST)
@@ -258,6 +267,17 @@ by the core). Response: `[avatar_id 16][size u32]`.
 - `avatar_id = SHA-256(data)[0..16]` — content addressing.
 - Storage: encrypted log, survives restarts.
 
+#### `GET_MY_AVATAR` (40, since API 2.5.0)
+Payload: ∅. Response: `[avatar_id 16][data str16 1..16000]`.
+Returns the current own avatar from the encrypted-log-backed cache, including
+with a fresh client after restarting the daemon. No peer connection is needed.
+Errors: `NOT_FOUND` if no own avatar is set or its bytes are unavailable;
+`BAD_FRAME` for a nonempty payload. Clients should call this once on connect
+to restore their own preview, and use the uploaded bytes after `SET_AVATAR`.
+No plaintext image file is created. Existing methods, peer wire format and
+storage format are unchanged; older cores return `UNKNOWN_METHOD` (check
+`GET_VERSION`).
+
 #### `GET_AVATAR_ID` (14)
 Payload: `[cid u32]`. Response: `[avatar_id 16]` (all zeros — no avatar).
 The bytes themselves arrive as the `AVATAR_RECEIVED` event: the core requests
@@ -416,6 +436,49 @@ protocol may express deletions as its own records). Avatars and pinned
 state are not synced in v1. The link itself: the invite holder always
 initiates, so exactly one side redials.
 
+### 4.10 Account recovery (since API 2.6.0)
+
+Recovery restores **access, not history**. A fresh install of the daemon
+without `~/.shopot/zig-seed` starts in **unprovisioned serve mode**: an
+ephemeral random identity (never persisted, never on the network), no log,
+no networking threads — the UDS API is up and waits for the client to
+either create a profile (CLI `init`, then restart serve) or restore one.
+
+The backup is a sealed blob the client stores in the **user's own cloud**
+(reference: Google Drive `appDataFolder`, see
+[CLIENT_RULES.md](../../CLIENT_RULES.md) §4). The client supplies a
+32-byte **unlock secret** (WebAuthn PRF output or a recovery code); the
+core derives the AEAD key (HKDF-SHA256) and seals/opens the blob. The
+core never persists or logs the secret.
+
+Contents (what survives recovery): identity seed, profile name, avatar
+bytes, core config, contacts with routes (direct address, personal relay
+address, device-link role), block list. **Not included:** message
+history, files, pins, client-DB records. After restore the peer devices
+see the same identity (same bundle) and keep writing to the same chats.
+
+#### `CREATE_RECOVERY_BACKUP` (41)
+Request `[unlock_secret 32]` → response `[backup str32]`.
+Requires a provisioned profile (`NOT_INITIALIZED` otherwise; the seed is
+re-read from disk — if the file is gone, the package cannot include it).
+The blob is opaque to the client. `TOO_BIG` if the profile exceeds the
+package caps (§6).
+
+#### `RESTORE_RECOVERY_BACKUP` (42)
+Request `[backup str32][unlock_secret 32]` → response
+`[bundle 64][fingerprint 32][name str16]`. Empty blob → `BAD_ARGS`.
+Applies only to an empty profile: on a live profile or when a seed file
+appears on disk behind the daemon's back → `ALREADY_PROVISIONED` (never
+silently overwrites). Wrong secret / corrupt blob / unknown format →
+`BAD_RECOVERY`.
+
+Apply order (client-visible effect): all profile records are written to a
+fresh encrypted log, **then** the seed is saved (commit point) — a failure
+before that leaves the profile empty and the retry clean (a half-written
+log is discarded, no duplicate contacts). After success the identity is
+swapped in place, the profile reloads, and the daemon brings networking up
+by itself.
+
 ## 5. Events (EVENT)
 
 Broadcast to all connected clients, in any order, `request_id = 0`.
@@ -475,6 +538,8 @@ Broadcast to all connected clients, in any order, `request_id = 0`.
 | config address fields | 64 bytes each (`host:port`) |
 | client DB: one record's data | 65000 bytes |
 | client DB: live area total | 16 MiB |
+| recovery package | ≤ 92786 bytes (§4.10) |
+| recovery: contacts / blocks | 256 / 256 |
 | device sync queue | 512 records / 2 MiB per device; batch ≤ 64 records / 16000 bytes; one record ≤ 4034 bytes |
 | contact card name / address | 32 / 64 bytes |
 | presence | PING after 4 s idle; 5 s interval; 3 misses → offline |
@@ -506,6 +571,7 @@ Bootstrap (analog of a gateway READY):
 ```
 connect to $HOME/.shopot/api.sock
 GET_VERSION                       — readiness probe, check major
+GET_IDENTITY                      — OK → proceed; NOT_INITIALIZED → onboarding (§4.10)
 LIST_CONTACTS                     — full contact snapshot
 for each cid: GET_HISTORY(cid,50) — initial history
 render; from here on, state arrives via events only
@@ -513,6 +579,13 @@ render; from here on, state arrives via events only
 
 After bootstrap the client is purely event-driven: presence, messages,
 reactions, calls, avatars, files all arrive as events. Do not poll.
+
+`NOT_INITIALIZED` from `GET_IDENTITY` means the daemon is unprovisioned
+(no seed file at start, §4.10): the client shows onboarding — create a
+new profile (CLI `init` + serve restart) or restore one
+(`RESTORE_RECOVERY_BACKUP`). Identity-methods on the ephemeral identity
+are refused (`GET_IDENTITY`/`CREATE_RECOVERY_BACKUP`); transport methods
+fail naturally (`NO_CONTACT`/`NO_SESSION`).
 
 ## 9. Scenarios (in API terms)
 
@@ -541,6 +614,17 @@ phone:  CREATE_INVITE{}                        → code
 laptop: ACCEPT_INVITE{code}                    → cid (device link)
 both:   SET_CONFIG{device_sync=1}              → history/client DB replicate
         records flow while the session is up; the link redials by itself
+```
+
+### Account recovery (new device, no seed)
+```
+fresh:  stille-messenger serve                  — unprovisioned (no seed file)
+client: GET_IDENTITY                            → NOT_INITIALIZED
+client: downloads the blob + PRF salt from the user's cloud
+client: RESTORE_RECOVERY_BACKUP{blob, unlock_secret}
+        → [bundle 64][fingerprint 32][name str16]; networking comes up
+client: CREATE_RECOVERY_BACKUP{unlock_secret}   → fresh blob → upload
+        (after profile changes; see CLIENT_RULES.md §4.3)
 ```
 
 ## 10. Guarantees and boundaries

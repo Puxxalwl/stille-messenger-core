@@ -45,4 +45,14 @@ pub fn build(b: *std.Build) void {
     const integ = b.addTest(.{ .root_module = integ_mod });
     const run_integ = b.addRunArtifact(integ);
     test_step.dependOn(&run_integ.step);
+
+    const app_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/stille-messenger/app/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    app_test_mod.addImport("stille-messenger", mod);
+    const app_tests = b.addTest(.{ .root_module = app_test_mod });
+    const run_app_tests = b.addRunArtifact(app_tests);
+    test_step.dependOn(&run_app_tests.step);
 }

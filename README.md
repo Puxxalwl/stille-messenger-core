@@ -27,6 +27,22 @@ archive lives under the tag `cpp-archive`.
 | Messaging | Telegram-style formatting entities (bold/italic/spoiler/code/link), offline delivery (encrypted outbox, ACKs, dedup), reactions, 16 kHz E2EE voice calls (ADPCM, DTX), resumable file transfer |
 | Storage | Append-only AEAD log — zero plaintext bytes on disk |
 | Interface | Binary framed UDS API (`~/.shopot/api.sock`) — the only interface; GUI clients render, the core does everything else |
+| Recovery | Account recovery without history: passkey (WebAuthn PRF) or recovery code unlocks a sealed backup blob (identity + profile + contacts) stored in the user's own cloud |
+
+Own avatar previews can be restored after a daemon or client restart with
+`GET_MY_AVATAR` (40, API 2.5.0): `[avatar_id 16][data str16]`, up to 16000 image
+bytes, or `NOT_FOUND` if unavailable. Images remain in the encrypted log;
+clients need no plaintext disk cache. See the [API specification](core/docs/CORE-API.md#44-own-profile).
+
+A lost device does not lose the account: `stille-messenger serve` without a
+seed file starts unprovisioned and waits for
+[`RESTORE_RECOVERY_BACKUP`](core/docs/CORE-API.md#410-account-recovery-since-api-260)
+(42, API 2.6.0). The client downloads the sealed blob from the user's own
+cloud, derives the 32-byte unlock secret from a passkey (WebAuthn PRF) or a
+recovery code, and the core restores identity, profile, contacts with routes
+and blocks — history stays empty but peers see the same identity. The
+mandatory client-side flow is specified in
+[CLIENT_RULES.md](CLIENT_RULES.md) (+ [ru](docs/ru/CLIENT_RULES.md)).
 
 ## Build
 
@@ -50,7 +66,7 @@ stille-messenger serve         # daemon: core + UDS API (~/.shopot/api.sock)
 There is no CLI/TUI: the only client interface is the GUI, which talks to
 the core over UDS using the binary framed protocol (typed responses,
 machine error codes, events). Specification for client authors:
-[`core/docs/CORE-API.md`](core/docs/CORE-API.md) (API 2.0.0).
+[`core/docs/CORE-API.md`](core/docs/CORE-API.md) (API 2.6.0).
 
 Adding a friend is one action: `CREATE_INVITE` produces a one-way code
 (`shopot://i/...`); the holder performs a single `ACCEPT_INVITE`. The
@@ -86,7 +102,8 @@ Details: [`core/docs/PROTOCOL.md`](core/docs/PROTOCOL.md),
 
 | Document | Content |
 |---|---|
-| [`core/docs/CORE-API.md`](core/docs/CORE-API.md) / [ru](core/docs/ru/CORE-API.md) | binary UDS interface for GUI clients (API 2.0.0) |
+| [`core/docs/CORE-API.md`](core/docs/CORE-API.md) / [ru](core/docs/ru/CORE-API.md) | binary UDS interface for GUI clients (API 2.6.0) |
+| [`CLIENT_RULES.md`](CLIENT_RULES.md) / [ru](docs/ru/CLIENT_RULES.md) | binding contract for GUI clients: bootstrap, events, account recovery UX |
 | [`core/docs/PROTOCOL.md`](core/docs/PROTOCOL.md) / [ru](core/docs/ru/PROTOCOL.md) | byte-level wire protocol v4 |
 | [`core/docs/ARCHITECTURE.md`](core/docs/ARCHITECTURE.md) / [ru](core/docs/ru/ARCHITECTURE.md) | layers, data flow, threading |
 | [`core/docs/ROADMAP.md`](core/docs/ROADMAP.md) / [ru](core/docs/ru/ROADMAP.md) | technical plan and anti-plan |

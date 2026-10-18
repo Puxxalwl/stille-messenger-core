@@ -19,6 +19,8 @@ const audio_mod = @import("audio.zig");
 const adpcm_mod = @import("adpcm.zig");
 const api_srv = @import("api_server.zig");
 const api = @import("api.zig");
+const recovery_mod = @import("recovery.zig");
+const recovery_codec = stille_messenger.crypto.recovery;
 const search_mod = @import("search.zig");
 const config_mod = stille_messenger.app.config;
 const sync_mod = stille_messenger.app.sync;
@@ -32,12 +34,19 @@ const usage =
     \\
     \\  init    создать личность (~/.shopot/zig-seed, 0600)
     \\  relay   режим IP-скрывающего релея (для сервера)
-    \\  serve   демон: ядро + UDS-апи (см. docs/CORE-API.md)
+    \\  serve   демон: ядро + UDS-апи; без сида — режим восстановления
+    \\
 ;
-const app_home_max = 512;
+pub const app_home_max = 512;
+
+// тесты app-модулей, не импортируемых на уровне файла: zig build test
+// (root main.zig) собирает тесты только явно процитированных файлов
+test {
+    _ = @import("recovery.zig");
+}
 
 /// $HOME копия App.home_buf.
-fn appHomeDir(app: *const App) []const u8 {
+pub fn appHomeDir(app: *const App) []const u8 {
     return app.home_buf[0..app.home_len];
 }
 
@@ -49,7 +58,9 @@ fn stille_messengerDir(io: std.Io, home: []const u8) ![512]u8 {
     return buf;
 }
 
-fn loadSeed(io: std.Io, home: []const u8) ![32]u8 {
+/// Прочитать сид личности с диска (0600-файл). Используется стартом serve
+/// и recovery-пакетом: в памяти ядра сид не удерживается.
+pub fn loadSeed(io: std.Io, home: []const u8) ![32]u8 {
     _ = try stille_messengerDir(io, home);
     var path_buf: [512]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "{s}/.shopot/zig-seed", .{home});
@@ -61,7 +72,8 @@ fn loadSeed(io: std.Io, home: []const u8) ![32]u8 {
     return seed;
 }
 
-fn saveSeed(io: std.Io, home: []const u8, seed: [32]u8) !void {
+/// Записать сид на диск (эксклюзивно, 0600): точка фиксации профиля.
+pub fn saveSeed(io: std.Io, home: []const u8, seed: [32]u8) !void {
     _ = try stille_messengerDir(io, home);
     var path_buf: [512]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "{s}/.shopot/zig-seed", .{home});
@@ -205,6 +217,17 @@ pub const App = struct {
     /// Присутствие контактов на СВОЁМ сервере (server_mode): cid -> run.
     /// Отдельно от contact_relays (персональные релеи контактов).
     server_runs: std.AutoHashMapUnmanaged(i64, void) = .empty,
+
+    /// Тесты: подавить сетевые потоки из loadContacts (relay-присутствие,
+    /// server-присутствие) — поток с dial'ами переживёт приложение из
+    /// tmp-каталога. Продуктовый код флаг не устанавливает.
+    no_network: bool = false,
+
+    /// Профиль провижен: сид на диске, личность своя, лог открыт.
+    /// false — режим восстановления (serve без сида): эфемерная личность,
+    /// сети нет, RESTORE_RECOVERY_BACKUP доводит профиль до готовности
+    /// (см. app/recovery.zig). Тесты по умолчанию провижнены.
+    provisioned: bool = true,
 
     running: bool = true,
 
@@ -433,7 +456,9 @@ fn evConfigChanged(app: *App) void {
 // ------------------------------------------- синхронизация устройств (2.4.0)
 
 /// Переводчик cid → bundle для очереди синхронизации (под app.mu).
-fn syncTranslateBundle(ctx: ?*anyopaque, cid: i64) ?[64]u8 {
+/// Переводчик cid → bundle для SYNC (вызывается только под app.mu).
+/// Публичен для app/recovery.zig (перепривязка после восстановления).
+pub fn syncTranslateBundle(ctx: ?*anyopaque, cid: i64) ?[64]u8 {
     const app: *App = @ptrCast(@alignCast(ctx.?));
     if (cid < 1 or cid > app.eng.contacts.items.len) return null;
     return app.eng.contacts.items[@intCast(cid - 1)].bundle;
@@ -696,7 +721,9 @@ const JoinInfo = struct {
     }
 };
 
-const SessCtx = struct {
+/// Контекст rx-потока сессии. Публичен как тип поля App.sess_ctx
+/// (app/recovery.zig создаёт App в тестах).
+pub const SessCtx = struct {
     app: *App,
     cid: i64,
     /// Сессия контекста: pending-join (cid == -1) — до промоушена,
@@ -1743,6 +1770,9 @@ fn startRelayPresenceLocked(app: *App, cid: i64, addr: []const u8) void {
             return;
         };
     }
+    // тесты: relay-адрес в карте есть (восстановление маршрута
+    // проверяемо), но сетевой поток не поднимаем — переживёт тест
+    if (app.no_network) return;
     if (app.presence_runs.contains(cid)) return;
     app.presence_runs.put(app.alloc, cid, {}) catch return;
     const th = std.Thread.spawn(.{}, relayPresenceLoop, .{ app, cid, false }) catch {
@@ -1759,6 +1789,8 @@ fn startRelayPresenceLocked(app: *App, cid: i64, addr: []const u8) void {
 fn startServerPresenceLocked(app: *App, cid: i64) void {
     if (!app.cfg.server_mode) return;
     if (app.cfg.serverAddr().len == 0) return;
+    // тесты: сетевые потоки не поднимаем (профиль загружен, сети нет)
+    if (app.no_network) return;
     if (app.presence_runs.contains(cid)) return; // персональный релей уже держит слот
     if (app.server_runs.contains(cid)) return;
     app.server_runs.put(app.alloc, cid, {}) catch return;
@@ -2051,11 +2083,13 @@ fn apiAcceptInvite(app: *App, payload: []const u8, w: *api.Writer) api.Status {
 }
 
 /// GET_IDENTITY: свои публичные данные (сверка отпечатка голосом/QR).
-/// Ответ: [bundle 64][fingerprint 32].
+/// Ответ: [bundle 64][fingerprint 32]. На непровиженном профиле —
+/// NOT_INITIALIZED: GUI показывает онбординг, а не эфемерный bundle.
 fn apiGetIdentity(app: *App, payload: []const u8, w: *api.Writer) api.Status {
     if (payload.len != 0) return .BAD_FRAME;
     app.lock();
     defer app.unlock();
+    if (!app.provisioned) return .NOT_INITIALIZED;
     const bundle = app.id.bundle();
     var digest: [32]u8 = undefined;
     std.crypto.hash.blake2.Blake2s256.hash(&bundle, &digest, .{});
@@ -2659,13 +2693,14 @@ fn apiGetPinnedMessages(app: *App, payload: []const u8, w: *api.Writer) api.Stat
     return .OK;
 }
 
-/// Записать контакт в лог (с адресом, если известен; relay_addr — хвост
-/// [rlen][rhost][rport LE] для восстановления присутствия после рестарта;
-/// dev_role — хвостовой байт роли линка устройства, 0 = не устройство).
-fn logContact(app: *App, log: *store_mod.Log, name: []const u8, bundle: [64]u8, addr_: ?[]const u8, relay_addr: ?[]const u8, dev_role: u8) void {
+/// Закодировать контактную запись формата лога (kind contact) в `buf`;
+/// вернуть длину. Имя ≤ 32, хвосты: [alen][host][port u16 LE] адреса,
+/// [rlen][rhost][rport u16 LE] релея, затем байт роли линка устройства
+/// (пишется только для устройств; старые читатели хвост не знают).
+/// Используется логом (logContact) и recovery-пакетом (app/recovery.zig).
+pub fn encodeContactRecord(buf: []u8, name: []const u8, bundle: [64]u8, addr_: ?[]const u8, relay_addr: ?[]const u8, dev_role: u8) usize {
     const a: []const u8 = addr_ orelse "";
     const ra: []const u8 = relay_addr orelse "";
-    var buf: [64 + 1 + 32 + 1 + 64 + 2 + 1 + 64 + 2]u8 = undefined;
     var n: usize = 0;
     buf[0] = @intCast(name.len);
     n = 1;
@@ -2700,6 +2735,16 @@ fn logContact(app: *App, log: *store_mod.Log, name: []const u8, bundle: [64]u8, 
         buf[n] = dev_role;
         n += 1;
     }
+    return n;
+}
+
+/// Записать контакт в лог (с адресом, если известен; relay_addr — хвост
+/// [rlen][rhost][rport LE] для восстановления присутствия после рестарта;
+/// dev_role — хвостовой байт роли линка устройства, 0 = не устройство).
+fn logContact(app: *App, log: *store_mod.Log, name: []const u8, bundle: [64]u8, addr_: ?[]const u8, relay_addr: ?[]const u8, dev_role: u8) void {
+    // 232 = максимум записи (имя 32 + bundle + оба хвоста + роль линка)
+    var buf: [232]u8 = undefined;
+    const n = encodeContactRecord(&buf, name, bundle, addr_, relay_addr, dev_role);
     _ = log.append(.contact, buf[0..n]) catch {};
     syncEnqueue(app, @backingInt(sync_mod.RecKind.contact), buf[0..n]);
     syncPumpLocked(app);
@@ -3001,6 +3046,76 @@ fn apiSetAvatar(app: *App, payload: []const u8, w: *api.Writer) api.Status {
     }
     w.putBytes(&id) catch return .INTERNAL;
     w.putU32(@intCast(bytes.len)) catch return .INTERNAL;
+    return .OK;
+}
+
+/// GET_MY_AVATAR: empty payload; response [avatar_id 16][data str16].
+/// Reads the same encrypted-log-backed cache used for peer AVATAR_REQ.
+fn apiGetMyAvatar(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    if (payload.len != 0) return .BAD_FRAME;
+    app.lock();
+    defer app.unlock();
+    const id = app.eng.my_avatar_id;
+    if (std.mem.eql(u8, &id, &@as([16]u8, @splat(0)))) return .NOT_FOUND;
+    const data = app.avatars.get(id) orelse return .NOT_FOUND;
+    w.putBytes(&id) catch return .INTERNAL;
+    w.putStr16(data) catch return .INTERNAL;
+    return .OK;
+}
+
+/// CREATE_RECOVERY_BACKUP (41): payload [unlock_secret 32] → [backup str32].
+/// Запечатывает сид+профиль+контакты (БЕЗ истории) ключом из секрета GUI
+/// (passkey PRF / recovery-код); блоб GUI хранит в пользовательском
+/// облаке. Секрет по UDS (0700-сокет на машине пользователя) передаётся
+/// один раз и ядром не сохраняется. Nonce — до лока (io вне спин-лока).
+fn apiCreateRecoveryBackup(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    var r = api.Reader.init(payload);
+    const secret = r.readBytes(recovery_codec.secret_length) catch return .BAD_FRAME;
+    if (r.hasMore()) return .BAD_FRAME;
+    var nonce: [recovery_codec.nonce_length]u8 = undefined;
+    app.io.random(&nonce);
+    app.lock();
+    defer app.unlock();
+    const res = recovery_mod.createBackup(app, secret[0..recovery_codec.secret_length], nonce);
+    const blob = switch (res) {
+        .ok => |b| b,
+        .err => |st| return st,
+    };
+    defer app.alloc.free(blob);
+    w.putStr32(blob) catch return .INTERNAL;
+    return .OK;
+}
+
+/// RESTORE_RECOVERY_BACKUP (42): payload [backup str32][unlock_secret 32]
+/// → [bundle 64][fingerprint 32][name str16]. Только пустой профиль
+/// (демон без сида); битый пакет или чужой секрет — BAD_RECOVERY. После
+/// успеха профиль провижен, сетевые потоки поднимаются сами (main loop).
+fn apiRestoreRecoveryBackup(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    var r = api.Reader.init(payload);
+    const blob = r.readStr32() catch return .BAD_FRAME;
+    const secret = r.readBytes(recovery_codec.secret_length) catch return .BAD_FRAME;
+    if (r.hasMore()) return .BAD_FRAME;
+    if (blob.len == 0) return .BAD_ARGS;
+    var backup = recovery_codec.open(app.alloc, blob, secret[0..recovery_codec.secret_length]) catch |e| switch (e) {
+        error.BadFormat, error.Tampered, error.TooBig => return .BAD_RECOVERY,
+        error.OutOfMemory => return .INTERNAL,
+    };
+    defer backup.deinit(app.alloc);
+    app.lock();
+    defer app.unlock();
+    recovery_mod.applyBackup(app, &backup) catch |e| switch (e) {
+        error.AlreadyProvisioned => return .ALREADY_PROVISIONED,
+        error.BadRecovery => return .BAD_RECOVERY,
+        error.Internal => return .INTERNAL,
+    };
+    // ответ — как GET_IDENTITY + имя: GUI сразу показывает восстановленный
+    // профиль и сверяет отпечаток
+    const bundle = app.id.bundle();
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.blake2.Blake2s256.hash(&bundle, &digest, .{});
+    w.putBytes(&bundle) catch return .INTERNAL;
+    w.putBytes(&digest) catch return .INTERNAL;
+    w.putStr16(app.eng.myName()) catch return .INTERNAL;
     return .OK;
 }
 
@@ -3338,7 +3453,11 @@ fn apiGlobalSearchMessage(app: *App, payload: []const u8, w: *api.Writer) api.St
     return searchRun(app, args, w);
 }
 
-fn loadContacts(app: *App) void {
+/// Загрузка профиля из лога: конфигурация, контакты (+relay-присутствие),
+/// настройки (set), история-кэш, аватары, блокировки, клиентская БД.
+/// Вызывается стартом serve и восстановлением профиля (app/recovery.zig)
+/// ПОД app.mu. Публична для тестов приложения.
+pub fn loadContacts(app: *App) void {
     const log = app.log orelse return;
     // конфигурация первой: server_mode поднимает присутствие в конце
     // загрузки, device_sync нужен для регистраций линков. Последняя
@@ -3825,6 +3944,9 @@ pub fn dispatchApi(app: *App, conn: *api_srv.Conn, req: ApiRequest) bool {
         .GET_PINNED_MESSAGES => respond(conn, req, apiGetPinnedMessages(app, req.payload, &w), w.items()),
         .SET_NAME => respond(conn, req, apiSetName(app, req.payload, &w), w.items()),
         .SET_AVATAR => respond(conn, req, apiSetAvatar(app, req.payload, &w), w.items()),
+        .GET_MY_AVATAR => respond(conn, req, apiGetMyAvatar(app, req.payload, &w), w.items()),
+        .CREATE_RECOVERY_BACKUP => respond(conn, req, apiCreateRecoveryBackup(app, req.payload, &w), w.items()),
+        .RESTORE_RECOVERY_BACKUP => respond(conn, req, apiRestoreRecoveryBackup(app, req.payload, &w), w.items()),
         .GET_AVATAR_ID => respond(conn, req, apiGetAvatarId(app, req.payload, &w), w.items()),
         .SEND_FILE => respond(conn, req, apiSendFile(app, req.payload, &w), w.items()),
         .START_CALL => respond(conn, req, apiStartCall(app, req.payload, &w), w.items()),
@@ -3852,6 +3974,44 @@ fn respond(conn: *api_srv.Conn, req: ApiRequest, status: api.Status, payload: []
 fn internal(conn: *api_srv.Conn, req: ApiRequest) bool {
     conn.sendResponse(@backingInt(req.method), req.request_id, .INTERNAL, &.{});
     return true;
+}
+
+/// Поднять сетевую часть демона: тикер presence (PING/автодозвон/слив
+/// retired), автолистенер 7777-7786 и LAN-поиск. Вызывается на провиженном
+/// старте serve и после восстановления профиля. Потоки — best-effort:
+/// неудача спавна/бинда не роняет демон (UDS-апи работает, ошибка — в лог).
+fn startNetworking(app: *App) void {
+    const th = std.Thread.spawn(.{}, tickerLoop, .{app}) catch {
+        std.debug.print("startNetworking: тикер не поднялся\n", .{});
+        return;
+    };
+    th.detach();
+
+    // автолистенер: любой контакт из списка может подключиться сам
+    var lsn: ?tcp.Listener = null;
+    var listen_port: u16 = 7777;
+    var attempt: u16 = 7777;
+    while (attempt < 7787) : (attempt += 1) {
+        var pbuf: [24]u8 = undefined;
+        const a = std.fmt.bufPrint(&pbuf, "0.0.0.0:{d}", .{attempt}) catch unreachable;
+        if (tcp.listen(a)) |l| {
+            lsn = l;
+            listen_port = attempt;
+            break;
+        } else |_| {}
+    }
+    if (lsn) |l| {
+        app.listen_port = listen_port;
+        const lp = app.alloc.create(tcp.Listener) catch return;
+        lp.* = l;
+        const lt = std.Thread.spawn(.{}, autoAcceptLoop, .{ app, lp }) catch return;
+        lt.detach();
+        const linker = std.Thread.spawn(.{}, linkerLoop, .{app}) catch return;
+        linker.detach();
+        std.debug.print("авто-режим: слушаю 0.0.0.0:{d}, LAN-поиск включён\n", .{listen_port});
+    } else {
+        std.debug.print("авто-режим: порты 7777-7786 заняты, LAN-поиск выключен\n", .{});
+    }
 }
 
 /// CONNECT: payload [cid u32][addr str16] — прямое подключение к контакту
@@ -3939,8 +4099,27 @@ pub fn main(start: std.process.Init) !void {
         return;
     }
 
-    // все остальные команды требуют существующей личности
-    const seed = try loadSeed(io, home);
+    // serve без сида — режим восстановления: эфемерная личность (никуда
+    // не сохраняется) ждёт RESTORE_RECOVERY_BACKUP от GUI; остальные
+    // команды, требующие личности, отвечают NOT_INITIALIZED. Битый сид
+    // (не 32 байта) — фатально, молча создавать новый поверх нельзя.
+    var provisioned = true;
+    var seed: [32]u8 = undefined;
+    if (std.mem.eql(u8, cmd, "serve")) {
+        if (loadSeed(io, home)) |loaded| {
+            seed = loaded;
+        } else |e| switch (e) {
+            error.FileNotFound => {
+                provisioned = false;
+                io.random(&seed);
+                std.debug.print("serve: сид не найден — режим восстановления (GUI: RESTORE_RECOVERY_BACKUP)\n", .{});
+            },
+            else => return e,
+        }
+    } else {
+        // все остальные команды требуют существующей личности
+        seed = try loadSeed(io, home);
+    }
     var id = try identity.Identity.fromSeed(seed);
     defer id.deinit();
 
@@ -3950,15 +4129,17 @@ pub fn main(start: std.process.Init) !void {
         const alloc = dbg_state.allocator();
 
         var eng = engine_mod.Engine.init(alloc, io, id, undefined);
-        var store_path_buf: [512]u8 = undefined;
-        const store_path = try std.fmt.bufPrint(&store_path_buf, "{s}/.shopot/zig-log", .{home});
         var log_ptr: ?*store_mod.Log = null;
-        if (store_mod.Log.open(alloc, store_path, &seed)) |l| {
-            const lp = try alloc.create(store_mod.Log);
-            lp.* = l;
-            log_ptr = lp;
-        } else |e| {
-            std.debug.print("лог не открылся: {s} (продолжаю без хранения)\n", .{@errorName(e)});
+        if (provisioned) {
+            var store_path_buf: [512]u8 = undefined;
+            const store_path = try std.fmt.bufPrint(&store_path_buf, "{s}/.shopot/zig-log", .{home});
+            if (store_mod.Log.open(alloc, store_path, &seed)) |l| {
+                const lp = try alloc.create(store_mod.Log);
+                lp.* = l;
+                log_ptr = lp;
+            } else |e| {
+                std.debug.print("лог не открылся: {s} (продолжаю без хранения)\n", .{@errorName(e)});
+            }
         }
 
         var pcm_buf: [512]u8 = undefined;
@@ -3975,6 +4156,7 @@ pub fn main(start: std.process.Init) !void {
             .id = &id,
             .eng = &eng,
             .log = log_ptr,
+            .provisioned = provisioned,
             .home_len = @min(home.len, app_home_max),
             .hb = std.AutoHashMap(i64, hb.State).init(alloc),
             .sess_ctx = std.AutoHashMap(i64, *SessCtx).init(alloc),
@@ -3982,51 +4164,38 @@ pub fn main(start: std.process.Init) !void {
         };
         // синхронизация устройств: ключ — HKDF от сида (один сид на все
         // устройства пользователя); переводчик cid→bundle вызывается
-        // только под app.mu
+        // только под app.mu. При восстановлении ключ пересчитывается
+        // от нового сида (applyBackup).
         app.sync = sync_mod.Sync.init(alloc, &seed);
         app.sync.tr_ctx = &app;
         app.sync.tr_fn = syncTranslateBundle;
         @memcpy(app.home_buf[0..app.home_len], home[0..app.home_len]);
         eng.ev = app.events();
 
-        loadContacts(&app);
-
-        const th = std.Thread.spawn(.{}, tickerLoop, .{&app}) catch return error.OutOfMemory;
-        th.detach();
-
-        // автолистенер: любой контакт из списка может подключиться сам
-        var lsn: ?tcp.Listener = null;
-        var listen_port: u16 = 7777;
-        {
-            var attempt: u16 = 7777;
-            while (attempt < 7787) : (attempt += 1) {
-                var pbuf: [24]u8 = undefined;
-                const a = std.fmt.bufPrint(&pbuf, "0.0.0.0:{d}", .{attempt}) catch unreachable;
-                if (tcp.listen(a)) |l| {
-                    lsn = l;
-                    listen_port = attempt;
-                    break;
-                } else |_| {}
-            }
-            if (lsn) |l| {
-                app.listen_port = listen_port;
-                const lp = app.alloc.create(tcp.Listener) catch return error.OutOfMemory;
-                lp.* = l;
-                const lt = std.Thread.spawn(.{}, autoAcceptLoop, .{ &app, lp }) catch return error.OutOfMemory;
-                lt.detach();
-                const linker = std.Thread.spawn(.{}, linkerLoop, .{&app}) catch return error.OutOfMemory;
-                linker.detach();
-                std.debug.print("авто-режим: слушаю 0.0.0.0:{d}, LAN-поиск включён\n", .{listen_port});
-            } else {
-                std.debug.print("авто-режим: порты 7777-7786 заняты, LAN-поиск выключен\n", .{});
-            }
+        // профиль грузится и сеть поднимается только на провиженном
+        // старте; после восстановления (RESTORE_RECOVERY_BACKUP) их
+        // поднимает цикл ожидания ниже
+        if (provisioned) {
+            loadContacts(&app);
+            startNetworking(&app);
         }
 
         // Единственный интерфейс: бинарное UDS-апи для GUI-клиента
         api_srv.start(&app, home);
         std.debug.print("serve: демон работает, UDS-апи готово\n", .{});
+        var net_started = provisioned;
         while (app.running) {
-            sysfd.sleepMs(1000);
+            sysfd.sleepMs(250);
+            if (!net_started) {
+                // восстановление довело профиль до готовности: поднять сеть
+                app.lock();
+                const up = app.provisioned;
+                app.unlock();
+                if (up) {
+                    net_started = true;
+                    startNetworking(&app);
+                }
+            }
         }
 
         eng.deinit();
@@ -4047,4 +4216,231 @@ pub fn main(start: std.process.Init) !void {
     }
 
     std.debug.print("{s}\n", .{usage});
+}
+
+test "own avatar API survives encrypted log reopen with fresh application state" {
+    const t = std.testing;
+    const alloc = t.allocator;
+    const seed: [32]u8 = @splat(0x73);
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [4096]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(t.io, &dir_buf);
+    const path = try std.fmt.allocPrint(alloc, "{s}/avatar-log", .{dir_buf[0..dir_len]});
+    defer alloc.free(path);
+    var expected_id: [16]u8 = undefined;
+    const image: [envelope.max_avatar_data]u8 = @splat(0x91);
+
+    // Each iteration owns a new engine, application and reopened store.
+    for (0..2) |run| {
+        var id = try identity.Identity.fromSeed(seed);
+        defer id.deinit();
+        var eng = engine_mod.Engine.init(alloc, t.io, id, .{ .ctx = undefined });
+        defer eng.deinit();
+        var log = try store_mod.Log.open(alloc, path, &seed);
+        defer log.deinit();
+        var app: App = .{
+            .alloc = alloc,
+            .io = t.io,
+            .id = &id,
+            .eng = &eng,
+            .log = &log,
+            .hb = std.AutoHashMap(i64, hb.State).init(alloc),
+            .sess_ctx = std.AutoHashMap(i64, *SessCtx).init(alloc),
+        };
+        defer {
+            var it = app.avatars.valueIterator();
+            while (it.next()) |data| alloc.free(data.*);
+            app.avatars.deinit(alloc);
+            app.hb.deinit();
+            app.sess_ctx.deinit();
+        }
+        var response = api.Writer.init(alloc);
+        defer response.deinit();
+        if (run == 0) {
+            try t.expectEqual(api.Status.NOT_FOUND, apiGetMyAvatar(&app, &.{}, &response));
+            try t.expectEqual(api.Status.BAD_FRAME, apiGetMyAvatar(&app, &.{0}, &response));
+            try t.expectEqual(@as(usize, 0), response.items().len);
+            // A configured id without cached bytes must not return stale data.
+            eng.my_avatar_id = @splat(1);
+            try t.expectEqual(api.Status.NOT_FOUND, apiGetMyAvatar(&app, &.{}, &response));
+            for ([_][]const u8{ "old avatar", &image }) |bytes| {
+                var request = api.Writer.init(alloc);
+                defer request.deinit();
+                try request.putStr32(bytes);
+                var set_response = api.Writer.init(alloc);
+                defer set_response.deinit();
+                try t.expectEqual(api.Status.OK, apiSetAvatar(&app, request.items(), &set_response));
+                expected_id = set_response.items()[0..16].*;
+            }
+        } else {
+            loadContacts(&app);
+        }
+        try t.expectEqual(api.Status.OK, apiGetMyAvatar(&app, &.{}, &response));
+        try t.expectEqualSlices(u8, &expected_id, response.items()[0..16]);
+        var reader = api.Reader.init(response.items()[16..]);
+        try t.expectEqualSlices(u8, &image, try reader.readStr16());
+        try t.expect(!reader.hasMore());
+    }
+}
+
+test "recovery API: CREATE/RESTORE через хендлеры и статусы" {
+    const t = std.testing;
+    const alloc = t.allocator;
+    const secret: [recovery_codec.secret_length]u8 = @splat(0x42);
+    const seed: [32]u8 = @splat(0x73);
+    // локальная фикстура: seed-файл/лог в tmp-каталоге, потоки сети
+    // подавлены (no_network), адреса полей стабильны (var-локаль теста)
+    const Fixture = struct {
+        id: identity.Identity,
+        eng: engine_mod.Engine,
+        log: ?store_mod.Log,
+        app: App,
+        home: []u8,
+        tmp: std.testing.TmpDir,
+
+        fn init(self: *@This(), a: std.mem.Allocator, io: std.Io, fix_seed: [32]u8, provisioned: bool) !void {
+            self.tmp = t.tmpDir(.{});
+            errdefer self.tmp.cleanup();
+            var db: [4096]u8 = undefined;
+            const dl = try self.tmp.dir.realPath(io, &db);
+            self.home = try a.dupe(u8, db[0..dl]);
+            errdefer a.free(self.home);
+            var pb: [512]u8 = undefined;
+            const shopot = try std.fmt.bufPrint(&pb, "{s}/.shopot", .{self.home});
+            std.Io.Dir.createDirAbsolute(io, shopot, @fromBackingInt(@intCast(0o700))) catch {};
+            if (provisioned) {
+                var sb: [512]u8 = undefined;
+                const sp = try std.fmt.bufPrint(&sb, "{s}/.shopot/zig-seed", .{self.home});
+                const f = try std.Io.Dir.createFileAbsolute(io, sp, .{ .exclusive = true });
+                defer f.close(io);
+                try f.writePositionalAll(io, &fix_seed, 0);
+                f.setPermissions(io, .fromMode(0o600)) catch {};
+            }
+            self.log = null;
+            self.id = try identity.Identity.fromSeed(fix_seed);
+            errdefer self.id.deinit();
+            self.eng = engine_mod.Engine.init(a, io, self.id, .{ .ctx = undefined });
+            errdefer self.eng.deinit();
+            if (provisioned) {
+                var lb: [512]u8 = undefined;
+                const lp = try std.fmt.bufPrint(&lb, "{s}/.shopot/zig-log", .{self.home});
+                self.log = try store_mod.Log.open(a, lp, &fix_seed);
+            }
+            self.app = .{
+                .alloc = a,
+                .io = io,
+                .id = &self.id,
+                .eng = &self.eng,
+                .log = if (self.log) |*l| l else null,
+                .hb = std.AutoHashMap(i64, hb.State).init(a),
+                .sess_ctx = std.AutoHashMap(i64, *SessCtx).init(a),
+                .provisioned = provisioned,
+                .no_network = true,
+            };
+            self.app.sync = sync_mod.Sync.init(a, &fix_seed);
+            self.app.sync.tr_ctx = &self.app;
+            self.app.sync.tr_fn = syncTranslateBundle;
+            self.app.home_len = @min(self.home.len, app_home_max);
+            @memcpy(self.app.home_buf[0..self.app.home_len], self.home[0..self.app.home_len]);
+        }
+
+        fn deinit(self: *@This(), a: std.mem.Allocator) void {
+            self.app.sync.deinit();
+            self.app.hb.deinit();
+            self.app.sess_ctx.deinit();
+            if (self.app.log) |lp| {
+                lp.deinit();
+                if (self.log == null or lp != &self.log.?) a.destroy(lp);
+            } else if (self.log) |*l| {
+                l.deinit();
+            }
+            self.eng.deinit();
+            self.id.deinit();
+            a.free(self.home);
+            self.tmp.cleanup();
+        }
+    };
+
+    // провижненный профиль: сид на диске, лог, имя
+    var src: Fixture = undefined;
+    try src.init(alloc, t.io, seed, true);
+    defer src.deinit(alloc);
+    src.eng.setMyProfile("recovery-user", src.eng.my_avatar_id);
+    {
+        var nb: [1 + 32]u8 = undefined;
+        nb[0] = 2;
+        @memcpy(nb[1 .. 1 + "recovery-user".len], "recovery-user");
+        _ = try src.log.?.append(.set, nb[0 .. 1 + "recovery-user".len]);
+    }
+
+    // CREATE: [secret 32] → [backup str32]
+    var request = api.Writer.init(alloc);
+    defer request.deinit();
+    try request.putBytes(&secret);
+    var response = api.Writer.init(alloc);
+    defer response.deinit();
+    try t.expectEqual(api.Status.OK, apiCreateRecoveryBackup(&src.app, request.items(), &response));
+    var rr = api.Reader.init(response.items());
+    const blob = try rr.readStr32();
+    try t.expect(!rr.hasMore());
+    try t.expect(blob.len >= recovery_codec.min_backup_len);
+
+    // свежий демон: GET_IDENTITY — NOT_INITIALIZED (сигнал онбординга)
+    var dst: Fixture = undefined;
+    try dst.init(alloc, t.io, @splat(0), false);
+    defer dst.deinit(alloc);
+    {
+        var g = api.Writer.init(alloc);
+        defer g.deinit();
+        try t.expectEqual(api.Status.NOT_INITIALIZED, apiGetIdentity(&dst.app, &.{}, &g));
+        try t.expectEqual(@as(usize, 0), g.items().len);
+    }
+
+    // RESTORE: [backup str32][secret 32] → [bundle 64][fp 32][name str16]
+    var req2 = api.Writer.init(alloc);
+    defer req2.deinit();
+    try req2.putStr32(blob);
+    try req2.putBytes(&secret);
+    var resp2 = api.Writer.init(alloc);
+    defer resp2.deinit();
+    try t.expectEqual(api.Status.OK, apiRestoreRecoveryBackup(&dst.app, req2.items(), &resp2));
+    try t.expectEqualSlices(u8, &src.id.bundle(), resp2.items()[0..64]);
+    var rn = api.Reader.init(resp2.items()[96..]);
+    try t.expectEqualStrings("recovery-user", try rn.readStr16());
+    try t.expect(!rn.hasMore());
+    try t.expect(dst.app.provisioned);
+
+    // повторный RESTORE на живой профиль — ALREADY_PROVISIONED
+    try t.expectEqual(api.Status.ALREADY_PROVISIONED, apiRestoreRecoveryBackup(&dst.app, req2.items(), &resp2));
+
+    // чужой секрет — BAD_RECOVERY, профиль не создаётся
+    var dst2: Fixture = undefined;
+    try dst2.init(alloc, t.io, @splat(0), false);
+    defer dst2.deinit(alloc);
+    var req3 = api.Writer.init(alloc);
+    defer req3.deinit();
+    try req3.putStr32(blob);
+    try req3.putBytes(&@as([32]u8, @splat(0xEE)));
+    try t.expectEqual(api.Status.BAD_RECOVERY, apiRestoreRecoveryBackup(&dst2.app, req3.items(), &resp2));
+    try t.expect(!dst2.app.provisioned);
+
+    // пустой блоб — BAD_ARGS
+    var req4 = api.Writer.init(alloc);
+    defer req4.deinit();
+    try req4.putStr32("");
+    try req4.putBytes(&secret);
+    try t.expectEqual(api.Status.BAD_ARGS, apiRestoreRecoveryBackup(&dst2.app, req4.items(), &resp2));
+
+    // CREATE на непровиженном — NOT_INITIALIZED
+    var w5 = api.Writer.init(alloc);
+    defer w5.deinit();
+    try t.expectEqual(api.Status.NOT_INITIALIZED, apiCreateRecoveryBackup(&dst2.app, request.items(), &w5));
+
+    // малформ: лишний байт в CREATE — BAD_FRAME
+    var req6 = api.Writer.init(alloc);
+    defer req6.deinit();
+    try req6.putBytes(&secret);
+    try req6.putU8(0);
+    try t.expectEqual(api.Status.BAD_FRAME, apiCreateRecoveryBackup(&src.app, req6.items(), &w5));
 }

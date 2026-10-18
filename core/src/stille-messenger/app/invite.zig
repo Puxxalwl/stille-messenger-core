@@ -79,10 +79,12 @@ test "invite: имя макс. длины + адрес не переполняю
     var buf: [256]u8 = undefined;
     var name: [max_name]u8 = @splat('a');
     const code = try encode(&buf, @splat(7), &name, "192.168.100.100:65535");
-    // декод обратно: имя и адрес выживают
+    // декод обратно: имя и адрес выживают (addr() — только хост,
+    // порт отдельно: см. decode/main.zig acceptInvite)
     const inv = try decode(code);
     try std.testing.expectEqualSlices(u8, &name, inv.name());
-    try std.testing.expectEqualStrings("192.168.100.100:65535", inv.addr().?);
+    try std.testing.expectEqualStrings("192.168.100.100", inv.addr().?);
+    try std.testing.expectEqual(@as(u16, 65535), inv.port);
 }
 
 /// Кодирует v2 (одностороннее приглашение): bundle|secret16|имя.
@@ -216,7 +218,8 @@ test "invite: roundtrip с адресом и без" {
     const inv = try decode(code);
     try testing.expectEqualSlices(u8, &bundle, &inv.bundle);
     try testing.expectEqualStrings("puxxal", inv.name());
-    try testing.expectEqualStrings("192.168.1.5:7777", inv.addr().?);
+    // addr() — только хост: порт отдельно (semantics decode)
+    try testing.expectEqualStrings("192.168.1.5", inv.addr().?);
     try testing.expectEqual(@as(u16, 7777), inv.port);
     const code2 = try encode(&buf, bundle, "eryn", null);
     const inv2 = try decode(code2);

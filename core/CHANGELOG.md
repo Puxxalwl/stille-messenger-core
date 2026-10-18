@@ -1,5 +1,78 @@
 # Changelog — stille-messenger
 
+## [Unreleased / неизданное] — API 2.6.0: восстановление доступа
+
+- Added account recovery: `CREATE_RECOVERY_BACKUP` (41) seals the identity
+  seed, profile name, avatar, core config, contacts (with routes) and
+  blocks into an AEAD blob keyed by a 32-byte client-supplied unlock
+  secret (HKDF-SHA256 → ChaCha20-Poly1305). `RESTORE_RECOVERY_BACKUP` (42)
+  applies the package to an empty profile. New statuses: `BAD_RECOVERY`
+  (18), `NOT_INITIALIZED` (19), `ALREADY_PROVISIONED` (20). Additive API
+  change; peer wire and storage formats are untouched; older cores answer
+  `UNKNOWN_METHOD`.
+- New serve behavior: a daemon started without `~/.shopot/zig-seed` no
+  longer exits — it runs unprovisioned (ephemeral identity, no network
+  threads) and waits for `RESTORE_RECOVERY_BACKUP`; identity methods
+  answer `NOT_INITIALIZED`. A corrupt seed file is still fatal.
+- Apply ordering: profile records go to a fresh encrypted log before the
+  seed is saved (commit point); failures before it delete the log and
+  keep the profile empty, so retries are clean (no duplicate contacts).
+  A seed file appearing behind a daemon's back is never silently
+  overwritten (`ALREADY_PROVISIONED`).
+- Message history, files, pins and client-DB records are deliberately not
+  part of the package: recovery restores access, peers see the same
+  identity and keep writing to the same chats. The client-side flow
+  (passkey with WebAuthn PRF or a recovery code, storage in the user's
+  own cloud) is specified in the new `CLIENT_RULES.md` (+ Russian mirror).
+- Fixed `logContact`'s encode buffer (231 → 232 bytes) which dropped the
+  device-link role byte at maximum name+relay sizes, and refreshed two
+  never-executed invite tests to the current `addr()` semantics (host
+  only; port is a separate field) now that the app test root collects
+  them.
+- Добавлено восстановление доступа: `CREATE_RECOVERY_BACKUP` (41)
+  запечатывает сид личности, имя, аватар, конфигурацию, контакты (с
+  маршрутами) и блокировки в AEAD-блоб с ключом из 32-байтного секрета
+  разблокировки от клиента (HKDF-SHA256 → ChaCha20-Poly1305).
+  `RESTORE_RECOVERY_BACKUP` (42) применяет пакет в пустой профиль. Новые
+  статусы: `BAD_RECOVERY` (18), `NOT_INITIALIZED` (19),
+  `ALREADY_PROVISIONED` (20). Аддитивное изменение API; протокол пиров и
+  форматы хранения не тронуты; старые ядра ответят `UNKNOWN_METHOD`.
+- Новое поведение serve: демон без `~/.shopot/zig-seed` больше не
+  завершается — работает непровижненным (эфемерная личность, без сетевых
+  потоков) и ждёт `RESTORE_RECOVERY_BACKUP`; методы личности отвечают
+  `NOT_INITIALIZED`. Битый файл сида по-прежнему фатален.
+- Порядок применения: записи профиля пишутся в свежий шифрованный лог до
+  сохранения сида (точка фиксации); неудача до неё удаляет лог и оставляет
+  профиль пустым — повтор чист, дублей контактов нет. Сид-файл, возникший
+  за спиной демона, молча не затирается (`ALREADY_PROVISIONED`).
+- История сообщений, файлы, закрепления и записи клиентской БД в пакет
+  намеренно не входят: восстановление возвращает доступ, пиру видна та же
+  личность, переписка продолжается в тех же чатах. Клиентский сценарий
+  (passkey с WebAuthn PRF или код восстановления, хранение в личном облаке
+  пользователя) описан в новом `CLIENT_RULES.md` (+ русское зеркало).
+- Исправлен буфер кодирования в `logContact` (231 → 232 байта), который
+  терял байт роли линка устройства при максимальных размерах имени и
+  релея, и обновлены два никогда не выполнявшихся теста invite под
+  текущую семантику `addr()` (только хост; порт — отдельное поле) —
+  теперь app-тестовый рут их собирает.
+
+## [Unreleased / неизданное] — API 2.5.0: own avatar retrieval
+
+- Added `GET_MY_AVATAR` (40): empty request, `[avatar_id 16][data str16]`
+  response (1..16000 bytes), `NOT_FOUND` if unset/unavailable. Clients can
+  restore their own preview after daemon restart from the existing encrypted
+  log. No plaintext disk cache, dependency or peer/storage format change.
+  This is an additive API change; older cores return `UNKNOWN_METHOD`.
+- Added regression coverage with a fresh application and reopened encrypted
+  log, avatar replacement, maximum size, missing data and malformed requests.
+- Добавлен `GET_MY_AVATAR` (40): пустой запрос, ответ `[avatar_id 16][data str16]`
+  (1..16000 байт), `NOT_FOUND`, если аватарка не задана/недоступна. Свой
+  предпросмотр восстанавливается после рестарта из существующего шифрованного
+  лога, без открытого дискового кэша и новых зависимостей. Дополнение API;
+  форматы хранения и протокола пиров прежние. Старые ядра: `UNKNOWN_METHOD`.
+  Регрессионный тест: новое приложение с повторно открытым логом, смена фото,
+  максимальный размер, отсутствие данных и некорректный запрос.
+
 ## [Unreleased / неизданное] — stille-messenger branding
 
 - Renamed the project, Zig module/source paths, executable and release artifacts

@@ -33,7 +33,11 @@ pub const header_len = 16;
 /// 2.4.0: конфигурация ядра (GET_CONFIG/SET_CONFIG, событие
 /// CONFIG_CHANGED) и прямой доступ клиента к БД (WRITE_DB/READ_DB/
 /// DELETE_DB).
-pub const api_version = [3]u16{ 2, 4, 0 };
+/// 2.5.0: GET_MY_AVATAR (40) — own avatar bytes, including after restart.
+/// 2.6.0: восстановление доступа без истории — CREATE_RECOVERY_BACKUP (41),
+/// RESTORE_RECOVERY_BACKUP (42) и статусы BAD_RECOVERY/NOT_INITIALIZED/
+/// ALREADY_PROVISIONED; serve без сида поднимается в режиме восстановления.
+pub const api_version = [3]u16{ 2, 6, 0 };
 
 /// Тип кадра.
 pub const Kind = enum(u8) {
@@ -138,6 +142,21 @@ pub const Method = enum(u16) {
     /// Удалить клиентскую запись: [rec_id u32] → ∅. Идемпотентно (tombstone
     /// лога); память освобождается при компакции.
     DELETE_DB = 39,
+    /// Read own current avatar: ∅ → [avatar_id 16][data str16 1..16000].
+    /// NOT_FOUND if unset or its bytes are unavailable; no ownership transfer.
+    GET_MY_AVATAR = 40,
+    /// Запечатать recovery-пакет: [unlock_secret 32] → [backup str32].
+    /// Пакет = сид+профиль+контакты+блокировки+конфиг (БЕЗ истории),
+    /// AEAD-запечатанный ключом из секрета GUI; блоб GUI хранит в
+    /// пользовательском облаке. Требует провижненный профиль
+    /// (NOT_INITIALIZED иначе); секрет ядро не сохраняет.
+    CREATE_RECOVERY_BACKUP = 41,
+    /// Восстановить профиль из пакета: [backup str32][unlock_secret 32]
+    /// → [bundle 64][fingerprint 32][name str16]. Только пустой профиль
+    /// (демон без сида): на живом — ALREADY_PROVISIONED; битый пакет или
+    /// чужой секрет — BAD_RECOVERY. После успеха профиль провижен, сеть
+    /// поднимается сама.
+    RESTORE_RECOVERY_BACKUP = 42,
 };
 
 /// Коды статуса ответа (u16 на проводе, имена SCREAMING_SNAKE — контракт;
@@ -179,6 +198,15 @@ pub const Status = enum(u16) {
     TRANSPORT_FAILED = 16,
     /// Tor SOCKS5-прокси недоступен (use_tor_mask включён).
     TOR_UNAVAILABLE = 17,
+    /// Recovery-пакет непригоден: не разбирается, не расшифровывается
+    /// (чужой секрет разблокировки) или неизвестная версия формата.
+    BAD_RECOVERY = 18,
+    /// Профиль не создан (демон в режиме восстановления без сида):
+    /// личность ещё нет. GET_IDENTITY/CREATE_RECOVERY_BACKUP отказывают.
+    NOT_INITIALIZED = 19,
+    /// Профиль уже существует: RESTORE_RECOVERY_BACKUP требует пустой
+    /// профиль (перезапись живого — отдельная явная операция сброса).
+    ALREADY_PROVISIONED = 20,
     /// Внутренняя ошибка ядра.
     INTERNAL = 255,
 };
@@ -444,6 +472,12 @@ test "method ids стабильны (контракт провода)" {
     try std.testing.expectEqual(@as(u16, 37), @backingInt(Method.WRITE_DB));
     try std.testing.expectEqual(@as(u16, 38), @backingInt(Method.READ_DB));
     try std.testing.expectEqual(@as(u16, 39), @backingInt(Method.DELETE_DB));
+    // восстановление доступа — 2.6.0
+    try std.testing.expectEqual(@as(u16, 41), @backingInt(Method.CREATE_RECOVERY_BACKUP));
+    try std.testing.expectEqual(@as(u16, 42), @backingInt(Method.RESTORE_RECOVERY_BACKUP));
+    try std.testing.expectEqual(@as(u16, 18), @backingInt(Status.BAD_RECOVERY));
+    try std.testing.expectEqual(@as(u16, 19), @backingInt(Status.NOT_INITIALIZED));
+    try std.testing.expectEqual(@as(u16, 20), @backingInt(Status.ALREADY_PROVISIONED));
     // событие CONTACT_CARD — 2.2.0
     try std.testing.expectEqual(@as(u16, 12), @backingInt(Event.CONTACT_CARD));
     // событие CONFIG_CHANGED — 2.4.0

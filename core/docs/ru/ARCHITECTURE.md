@@ -21,7 +21,7 @@
 
 | Слой | Каталог | Ответственность |
 |---|---|---|
-| app | `src/stille-messenger/app/` | демон: UDS-апи-сервер, инвайты, LAN-поиск, автодозвон, выгрузка outbox, аудиоконтур звонка, передача файлов, конфигурация (config.zig), синхронизация устройств (sync.zig), dial через Tor SOCKS5 |
+| app | `src/stille-messenger/app/` | демон: UDS-апи-сервер, инвайты, LAN-поиск, автодозвон, выгрузка outbox, аудиоконтур звонка, передача файлов, конфигурация (config.zig), синхронизация устройств (sync.zig), восстановление доступа (recovery.zig: сборка/применение запечатанного пакета профиля; непровижненный режим serve), dial через Tor SOCKS5 |
 | core | `src/stille-messenger/core/` | engine (контакты, блокировки, dispatch, outbox, стейт-машины file Tx), session (рукопожатие + sealed-кадры) |
 | proto | `src/stille-messenger/proto/` | бинарные конверты, кодек без аллокаций |
 | crypto | `src/stille-messenger/crypto/` | identity, handshake, рэтчет, ключи звонка, AEAD, паддинг |

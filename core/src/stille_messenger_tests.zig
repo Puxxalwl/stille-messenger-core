@@ -12,6 +12,7 @@ test {
     _ = @import("stille-messenger/crypto/ratchet.zig");
     _ = @import("stille-messenger/crypto/call_keys.zig");
     _ = @import("stille-messenger/crypto/pad.zig");
+    _ = @import("stille-messenger/crypto/recovery.zig");
     _ = @import("stille-messenger/proto/codec.zig");
     _ = @import("stille-messenger/proto/envelope.zig");
     _ = @import("stille-messenger/net/framing.zig");

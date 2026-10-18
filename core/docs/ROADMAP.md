@@ -98,5 +98,9 @@ Fake-TLS hides the protocol from DPI; the relay hides the IP. What remains:
 - ❌ External dependencies (opus/libsodium/zlib-ng) — std only.
 - ❌ JSON over UDS — the binary frame protocol stays.
 - ❌ "Cloud" sync — serverless architecture; keys live with the users only.
+  This is about message/content sync and relaying through project or
+  third-party servers. Storing the client-encrypted recovery package
+  (identity + profile, no content) in the user's own cloud account is
+  allowed and shipped — see CORE-API.md §4.10.
 - ❌ Multi-device: one identity = one live instance (as of now; multi-device
   requires ratchet forwarding — a separate large project).
