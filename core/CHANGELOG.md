@@ -1,5 +1,18 @@
 # Changelog — stille-messenger
 
+## [Unreleased / неизданное] — LAN discovery fix
+
+- Fixed LAN discovery reception: the IPv4 multicast group address in
+  `joinMulticastGroup` was byte-reversed (239.77.77.77 joined as
+  77.77.77.239), so `IP_ADD_MEMBERSHIP` failed with EINVAL and the daemon
+  silently never received LAN announcements on interfaces without local
+  multicast loopback (e.g. VPN tunnels). Announce sending was unaffected.
+- Исправлен приём LAN-поиска: адрес IPv4-мультикаст-группы в
+  `joinMulticastGroup` был перевёрнут побайтово (239.77.77.77 вступала как
+  77.77.77.239), `IP_ADD_MEMBERSHIP` падал с EINVAL, и демон молча не
+  принимал LAN-анонсы на интерфейсах без локального мультикаст-лупбека
+  (например, VPN-туннелях). Отправка анонсов не пострадала.
+
 ## [Unreleased / неизданное] — API 2.7.0: single-key friend requests
 
 - One invite code is now the complete friend request: its holder accepts once;
