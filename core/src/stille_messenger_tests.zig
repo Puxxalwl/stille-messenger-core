@@ -22,6 +22,8 @@ test {
     _ = @import("stille-messenger/net/heartbeat.zig");
     _ = @import("stille-messenger/net/tcp.zig");
     _ = @import("stille-messenger/net/socks5.zig");
+    _ = @import("stille-messenger/net/sysfd.zig");
+    _ = @import("stille-messenger/net/punch.zig");
     _ = @import("stille-messenger/app/adpcm.zig");
     _ = @import("stille-messenger/app/api.zig");
     _ = @import("stille-messenger/app/config.zig");

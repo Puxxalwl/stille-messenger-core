@@ -40,6 +40,11 @@ const cabi = struct {
     extern "c" fn chmod(path: [*:0]const u8, mode: c_int) c_int;
     extern "c" fn open(path: [*:0]const u8, oflag: c_int, ...) c_int;
     extern "c" fn mkdir(path: [*:0]const u8, mode: c_int) c_int;
+    // NAT-punch (неблокирующий connect с дедлайном, getsockname/getpeername)
+    extern "c" fn fcntl(fd: c_int, cmd: c_int, arg: c_int) c_int;
+    extern "c" fn getsockopt(fd: c_int, level: c_int, optname: c_int, optval: [*]u8, optlen: *posix.socklen_t) c_int;
+    extern "c" fn getsockname(fd: c_int, addr: *posix.sockaddr, addrlen: *posix.socklen_t) c_int;
+    extern "c" fn getpeername(fd: c_int, addr: *posix.sockaddr, addrlen: *posix.socklen_t) c_int;
 };
 
 // Darwin open(2) флаги (Linux-вариант берётся из std.os.linux.O).
@@ -165,6 +170,141 @@ pub fn connectIn(fd: fd_t, sa: *const SockaddrIn) error{Network}!void {
         return;
     }
     if (cabi.connect(@intCast(fd), @ptrCast(sa), @sizeOf(SockaddrIn)) < 0) return error.Network;
+}
+
+// ---- NAT-punch (неблокирующий connect + опрос) ---------------------------
+// Требуется движку одновременного TCP-open (net/punch.zig): connect из
+// неблокирующего сокета с poll-дедлайном и последующим возвратом в
+// блокирующий режим. Отдельно от блокирующего connectIn выше.
+
+/// fcntl-константы (совпадают на linux/darwin): F_GETFL=3, F_SETFL=4.
+const fcntl_getfl: c_int = 3;
+const fcntl_setfl: c_int = 4;
+/// O_NONBLOCK: Linux 0o4000, Darwin 0x4.
+const o_nonblock: usize = if (is_linux) 0o4000 else 0x4;
+
+/// Переключить неблокирующий режим fd (NAT-punch: connect с дедлайном).
+pub fn setNonblock(fd: fd_t, on: bool) error{Network}!void {
+    if (is_linux) {
+        const fl = std.os.linux.fcntl(fd, fcntl_getfl, 0);
+        if (std.os.linux.errno(fl) != .SUCCESS) return error.Network;
+        const cur: usize = @intCast(fl);
+        const want: usize = if (on) cur | o_nonblock else cur & ~o_nonblock;
+        const rc = std.os.linux.fcntl(fd, fcntl_setfl, @intCast(want));
+        if (std.os.linux.errno(rc) != .SUCCESS) return error.Network;
+        return;
+    }
+    const cur = cabi.fcntl(@intCast(fd), fcntl_getfl, 0);
+    if (cur < 0) return error.Network;
+    const want: c_int = if (on) cur | @as(c_int, @intCast(o_nonblock)) else cur & ~@as(c_int, @intCast(o_nonblock));
+    if (cabi.fcntl(@intCast(fd), fcntl_setfl, want) < 0) return error.Network;
+}
+
+/// Неблокирующий connect: EINPROGRESS — норма (SYN в полёте), остальные
+/// ошибки — error.Network. Сокет обязан быть в неблокирующем режиме.
+pub fn connectInNonblock(fd: fd_t, sa: *const SockaddrIn) error{Network}!void {
+    if (is_linux) {
+        const rc = std.os.linux.connect(fd, @ptrCast(sa), @sizeOf(SockaddrIn));
+        const e = std.os.linux.errno(rc);
+        if (e != .SUCCESS and e != .INPROGRESS) return error.Network;
+        return;
+    }
+    const rc = cabi.connect(@intCast(fd), @ptrCast(sa), @sizeOf(SockaddrIn));
+    if (rc < 0) {
+        const e = posix.errno(rc);
+        if (e != .INPROGRESS) return error.Network;
+    }
+}
+
+/// Ждать доступности записи (завершение connect) до timeout_ms.
+/// true — сокет записываем (итог уточняет soError), false — таймаут.
+pub fn pollWritable(fd: fd_t, timeout_ms: u32) bool {
+    var pfd = [1]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT | posix.POLL.ERR | posix.POLL.HUP, .revents = 0 }};
+    const n = posix.poll(&pfd, @intCast(timeout_ms)) catch return false;
+    return n != 0;
+}
+
+/// SO_ERROR сокета (0 = успеха нет ошибки). null — сбой getsockopt.
+pub fn soError(fd: fd_t) ?i32 {
+    var so_err: i32 = 0;
+    var so_len: posix.socklen_t = @sizeOf(i32);
+    if (is_linux) {
+        const rc = std.os.linux.getsockopt(fd, posix.SOL.SOCKET, posix.SO.ERROR, @ptrCast(&so_err), &so_len);
+        if (std.os.linux.errno(rc) != .SUCCESS) return null;
+        return so_err;
+    }
+    if (cabi.getsockopt(@intCast(fd), posix.SOL.SOCKET, posix.SO.ERROR, @ptrCast(&so_err), &so_len) < 0) return null;
+    return so_err;
+}
+
+/// Локальный порт сокета (getsockname; NAT-punch переиспользует его как
+/// источник маппинга). null — сбой (сокет не подключён).
+pub fn localPort(fd: fd_t) ?u16 {
+    var sa: SockaddrIn = undefined;
+    var len: posix.socklen_t = @sizeOf(SockaddrIn);
+    const rc = if (is_linux)
+        std.os.linux.getsockname(fd, @ptrCast(&sa), &len)
+    else
+        cabi.getsockname(@intCast(fd), @ptrCast(&sa), &len);
+    if (is_linux) {
+        if (std.os.linux.errno(rc) != .SUCCESS) return null;
+    } else if (rc < 0) {
+        return null;
+    }
+    return std.mem.bigToNative(u16, sa.port);
+}
+
+/// Локальный адрес подключённого сокета (getsockname): NAT-punch биндит
+/// punch-сокеты на ЭТОТ же адрес+порт (переиспользование NAT-маппинга).
+/// null — сбой (сокет не подключён).
+pub fn localAddrIn(fd: fd_t) ?SockaddrIn {
+    var sa: SockaddrIn = undefined;
+    var len: posix.socklen_t = @sizeOf(SockaddrIn);
+    const rc = if (is_linux)
+        std.os.linux.getsockname(fd, @ptrCast(&sa), &len)
+    else
+        cabi.getsockname(@intCast(fd), @ptrCast(&sa), &len);
+    if (is_linux) {
+        if (std.os.linux.errno(rc) != .SUCCESS) return null;
+    } else if (rc < 0) {
+        return null;
+    }
+    return sa;
+}
+
+/// Разбор sockaddr.in: октеты IPv4 (сетевой порядок байт в памяти)
+/// + порт в host-порядке.
+pub fn ipPortOf(sa: SockaddrIn) struct { ip: [4]u8, port: u16 } {
+    return .{ .ip = @bitCast(sa.addr), .port = std.mem.bigToNative(u16, sa.port) };
+}
+
+/// Адрес подключённого пира (getpeername). null — сбой/не подключён.
+pub fn peerAddrIn(fd: fd_t) ?SockaddrIn {
+    var sa: SockaddrIn = undefined;
+    var len: posix.socklen_t = @sizeOf(SockaddrIn);
+    const rc = if (is_linux)
+        std.os.linux.getpeername(fd, @ptrCast(&sa), &len)
+    else
+        cabi.getpeername(@intCast(fd), @ptrCast(&sa), &len);
+    if (is_linux) {
+        if (std.os.linux.errno(rc) != .SUCCESS) return null;
+    } else if (rc < 0) {
+        return null;
+    }
+    return sa;
+}
+
+/// Заглянуть в сокет без чтения (MSG_PEEK; relay: распознать запись
+/// ECHO_REQ до её потребления). null — данных нет или сбой.
+pub fn peekIn(fd: fd_t, buf: []u8) ?usize {
+    if (is_linux) {
+        const rc = std.os.linux.recvfrom(fd, buf.ptr, buf.len, posix.MSG.PEEK, null, null);
+        if (std.os.linux.errno(rc) != .SUCCESS) return null;
+        return @intCast(rc);
+    }
+    const rc = cabi.recvfrom(@intCast(fd), buf.ptr, buf.len, posix.MSG.PEEK, null, null);
+    if (rc < 0) return null;
+    return @intCast(rc);
 }
 
 pub fn bindIn(fd: fd_t, sa: *const SockaddrIn) error{Network}!void {
@@ -448,4 +588,43 @@ test "monoNs: монотонно и не спит зря" {
     try testing.expect(b >= a);
     sleepMs(1);
     try testing.expect(monoNs() > a);
+}
+
+test "NAT-punch helpers: localPort/peerAddrIn на loopback-паре" {
+    // слушатель на свободном loopback-порту, dial с обеих сторон меток
+    const fd = try socketTcp();
+    defer close(fd);
+    setReuseAddr(fd);
+    const sa = sockaddrIn(.{ 127, 0, 0, 1 }, 0);
+    try bindIn(fd, &sa);
+    try listen(fd, 4);
+    // фактический порт слушателя
+    var lsa: SockaddrIn = undefined;
+    var llen: posix.socklen_t = @sizeOf(SockaddrIn);
+    _ = if (is_linux)
+        std.os.linux.getsockname(fd, @ptrCast(&lsa), &llen)
+    else
+        cabi.getsockname(@intCast(fd), @ptrCast(&lsa), &llen);
+    const port = std.mem.bigToNative(u16, lsa.port);
+    try testing.expect(port != 0);
+
+    const cfd = try socketTcp();
+    defer close(cfd);
+    const csa = sockaddrIn(.{ 127, 0, 0, 1 }, port);
+    try connectIn(cfd, &csa);
+    try testing.expect(localPort(cfd) != null); // эфемерный порт назначен
+    const peer = peerAddrIn(cfd);
+    try testing.expect(peer != null);
+    var ip_back: [4]u8 = undefined;
+    std.mem.writeInt(u32, &ip_back, peer.?.addr, .little);
+    try testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, &ip_back);
+
+    // неблокирующий connect на «занятый» слушателем порт: EINPROGRESS/OK
+    const nfd = try socketTcp();
+    defer close(nfd);
+    try setNonblock(nfd, true);
+    try connectInNonblock(nfd, &csa);
+    try testing.expect(pollWritable(nfd, 500));
+    try testing.expectEqual(@as(i32, 0), soError(nfd));
+    try setNonblock(nfd, false);
 }
