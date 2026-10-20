@@ -3,7 +3,7 @@
 Technical specification for GUI client authors. Russian version:
 [ru/CORE-API.md](ru/CORE-API.md).
 
-The core (the `stille-messenger serve` daemon) owns the cryptography, contacts,
+The core (the `stille-messenger-core serve` daemon) owns the cryptography, contacts,
 sessions, and delivery. A client connects over a Unix domain socket and
 renders. The protocol is **binary**: no strings-as-protocol, no JSON, no
 human-readable text on the wire — only typed byte frames and machine-readable
@@ -31,8 +31,8 @@ codes (methods, statuses, events).
 
 | Entity | Definition |
 |---|---|
-| core | the `stille-messenger serve` process. One user = one daemon = one `$HOME`; several users on a machine use different `$HOME`s |
-| client | any process connected to `$HOME/.shopot/api.sock` (UDS, mode 0700). Multiple concurrent connections are allowed; events are broadcast to all |
+| core | the `stille-messenger-core serve` process. One user = one daemon = one `$HOME`; several users on a machine use different `$HOME`s |
+| client | any process connected to `$HOME/.stille-messenger/api.sock` (UDS, mode 0700). Multiple concurrent connections are allowed; events are broadcast to all |
 | contact | the conversation peer, identified by its bundle (`enc_pk‖sign_pk`, 64 bytes). In this API a contact is an integer `cid` (u32), stable within a given `$HOME`: 1..N in order of addition |
 | msg_id | 16 random bytes identifying a message globally; used for reactions, statuses, `GET_MESSAGE` |
 
@@ -55,7 +55,7 @@ steps — the core has already handled them.
   deliberate exception in kind: a sealed, client-stored blob in the user's
   own cloud holding identity/profile (never message content).
 - NAT traversal for two NAT-ed peers: the channel is LAN, direct TCP
-  (auto-selected port range 7777–7786), or a relay (`stille-messenger relay` on any
+  (auto-selected port range 7777–7786), or a relay (`stille-messenger-core relay` on any
   server).
 - Parsing pictures/files: bytes are passed as-is.
 
@@ -139,8 +139,8 @@ Creates a one-key friend request. Payload: `[flags u8 (bit0 = relay)][name str16
   live invites in daemon memory (a restart invalidates the codes).
 
 Response: `[code str16]` — the one-way invite code (URL
-`shopot://i/...`, transferable over any messenger; v1 codes `shopot1.` are
-also accepted).
+`stille://i/...`, transferable over any messenger; legacy `shopot://i/...`
+and v1 codes `shopot1.` are also accepted).
 Errors: `TOO_MANY_INVITES`, `BAD_ARGS`.
 
 #### `ACCEPT_INVITE` (5)
@@ -160,7 +160,7 @@ Response: `[cid u32]`. Errors: `BAD_INVITE_CODE`, `BAD_ARGS`.
 
 `CREATE_INVITE_EX` (49) takes `[mode u8][name str16][direct str16][relay str16]`
 and responds `[code str16][invite_id 16]`. Modes: `0` discovery, `1` direct,
-`2` relay-only, `3` direct-then-relay (versioned `shopot://i3/` hybrid code).
+`2` relay-only, `3` direct-then-relay (versioned `stille://i3/` hybrid code; legacy `shopot://i3/` is also accepted).
 Addresses are `host:port`; direct modes are rejected while Tor IP masking is
 enabled. `invite_id` is random and non-secret; it cannot recover the invite key.
 
@@ -335,7 +335,7 @@ client only listens for the event and caches by id.
 
 #### `SEND_FILE` (15)
 Payload: `[cid u32][path str16]` — a path in the daemon user's filesystem
-(the client drops the file, e.g., into `$HOME/.shopot/tmp/`, and passes the
+(the client drops the file, e.g., into `$HOME/.stille-messenger/tmp/`, and passes the
 path).
 - Limit 64 MB. Without a live session the transfer is queued (outbox
   semantics) and flushed when a session appears.
@@ -343,7 +343,7 @@ path).
 
 Response: `[file_id 16][size u32][chunks u32]`.
 - `file_id = SHA-256(file)[0..16]`; the receiver verifies the hash and stores
-  the file at `~/.shopot/files/<hex>` (0600). A duplicate is not re-sent.
+  the file at `~/.stille-messenger/files/<hex>` (0600). A duplicate is not re-sent.
 - The receiver gets the `FILE_RECEIVED` event; the sender gets `FILE_SENT`
   when all chunks are acknowledged.
 - Errors: `NO_CONTACT`, `FILE_NOT_FOUND`, `TOO_BIG`, `BAD_ARGS`.
@@ -360,7 +360,7 @@ Response: `[file_id 16][size u32][chunks u32]`.
 - One line per daemon: `START_CALL` during an active call → `BUSY`;
   `ANSWER/END` without a call → `NO_CALL`. `START_CALL` without a session →
   `NO_SESSION`.
-- Audio flows through the FIFOs `~/.shopot/pcm/mic` and `~/.shopot/pcm/spk`
+- Audio flows through the FIFOs `~/.stille-messenger/pcm/mic` and `~/.stille-messenger/pcm/spk`
   (the core reads/writes).
 - State changes arrive as `CALL_STATE` events.
 
@@ -436,7 +436,7 @@ bit0 `server_mode`, bit1 `use_fake_tls`, bit2 `use_tor_mask`, bit3
 `server_mode` and `use_tor_mask`; `tor_addr` = `127.0.0.1:9050`.
 
 - `server_mode` — all peer traffic flows through the user's **own**
-  self-hosted relay (`server_addr`, `stille-messenger relay`). Requires `server_addr`
+  self-hosted relay (`server_addr`, `stille-messenger-core relay`). Requires `server_addr`
   (`BAD_ARGS` otherwise). Presence threads dial every contact through it.
 - `use_fake_tls` — wrap direct transports as fake-TLS. **Both peers must
   match**: a mismatched peer fails the handshake (existing sessions are
@@ -488,7 +488,7 @@ initiates, so exactly one side redials.
 ### 4.10 Account recovery (since API 2.6.0)
 
 Recovery restores **access, not history**. A fresh install of the daemon
-without `~/.shopot/zig-seed` starts in **unprovisioned serve mode**: an
+without `~/.stille-messenger/zig-seed` starts in **unprovisioned serve mode**: an
 ephemeral random identity (never persisted, never on the network), no log,
 no networking threads — the UDS API is up and waits for the client to
 either create a profile (CLI `init`, then restart serve) or restore one.
@@ -627,7 +627,7 @@ offline (`PRESENCE` with online=0).
 Bootstrap (analog of a gateway READY):
 
 ```
-connect to $HOME/.shopot/api.sock
+connect to $HOME/.stille-messenger/api.sock
 GET_VERSION                       — readiness probe, check major
 GET_IDENTITY                      — OK → proceed; NOT_INITIALIZED → onboarding (§4.10)
 LIST_CONTACTS                     — full contact snapshot
@@ -658,7 +658,7 @@ A: receives CONTACT_JOINED; no second key or manual confirmation is needed
 
 ### Remote (behind NAT, address known)
 A: `CREATE_INVITE{name, addr:"host:7777"}` → B: `ACCEPT_INVITE`.
-IP hiding: A runs `stille-messenger relay host:port` anywhere and issues
+IP hiding: A runs `stille-messenger-core relay host:port` anywhere and issues
 `CREATE_INVITE` with relay=1.
 
 ### Offline conversation
@@ -667,7 +667,7 @@ A writes to offline B → `queued=1` → B starts the daemon → the core delive
 
 ### Second device (phone + laptop)
 ```
-both:   one identity — copy ~/.shopot/zig-seed between installs (out of band)
+both:   one identity — copy ~/.stille-messenger/zig-seed between installs (out of band)
 phone:  CREATE_INVITE{}                        → code
 laptop: ACCEPT_INVITE{code}                    → cid (device link)
 both:   SET_CONFIG{device_sync=1}              → history/client DB replicate
@@ -676,7 +676,7 @@ both:   SET_CONFIG{device_sync=1}              → history/client DB replicate
 
 ### Account recovery (new device, no seed)
 ```
-fresh:  stille-messenger serve                  — unprovisioned (no seed file)
+fresh:  stille-messenger-core serve                  — unprovisioned (no seed file)
 client: GET_IDENTITY                            → NOT_INITIALIZED
 client: downloads the blob + PRF salt from the user's cloud
 client: RESTORE_RECOVERY_BACKUP{blob, unlock_secret}
@@ -689,10 +689,10 @@ client: CREATE_RECOVERY_BACKUP{unlock_secret}   → fresh blob → upload
 
 - Cryptography: XX-like handshake, AEAD transport, double ratchet — see
   PROTOCOL.md. The client never touches keys: the seed lives at
-  `~/.shopot/zig-seed` (0600).
+  `~/.stille-messenger/zig-seed` (0600).
 - Concurrent clients: commands execute sequentially; events are broadcast to
   all.
-- Permissions: `~/.shopot` — 0700, `api.sock` — 0700, `zig-seed` — 0600.
+- Permissions: `~/.stille-messenger` — 0700, `api.sock` — 0700, `zig-seed` — 0600.
   Everything is local to one OS user.
 - Call jitter buffer: frames play from a queue at an even pace (~40–60 ms
   latency); losses are concealed by skipping seq.

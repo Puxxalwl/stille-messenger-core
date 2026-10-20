@@ -197,7 +197,7 @@ pub const Method = enum(u16) {
     /// Создать инвайт-код (расширенный): [mode u8][name str16 ≤ 32]
     /// [direct str16][relay str16] → [code str16][invite_id 16].
     /// mode: 0 discovery (адреса пусты, v2-код), 1 direct, 2 relay_only,
-    /// 3 direct_then_relay (гибрид v3-код shopot://i3/). invite_id —
+    /// 3 direct_then_relay (гибрид v3-код stille://i3/). invite_id —
     /// случайный НЕсекретный идентификатор для GET_INVITE_STATE.
     CREATE_INVITE_EX = 49,
     /// Состояние приглашения: [invite_id 16] →
@@ -386,7 +386,7 @@ pub const InviteExMode = enum(u8) {
     direct = 1,
     /// Relay-адрес: v2-код с @r/relay (IP скрыт).
     relay_only = 2,
-    /// Гибрид: v3-код shopot://i3/ (direct, затем relay-fallback).
+    /// Гибрид: v3-код stille://i3/ (direct, затем relay-fallback).
     direct_then_relay = 3,
 };
 

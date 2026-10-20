@@ -149,7 +149,7 @@ pub fn applyBackup(app: *main.App, backup: *recovery.Backup) ApplyError!void {
     const new_id = identity_mod.Identity.fromSeed(backup.seed) catch return error.BadRecovery;
 
     var path_buf: [512]u8 = undefined;
-    const store_path = std.fmt.bufPrint(&path_buf, "{s}/.shopot/zig-log", .{main.appHomeDir(app)}) catch return error.Internal;
+    const store_path = std.fmt.bufPrint(&path_buf, "{s}/{s}/zig-log", .{ main.appHomeDir(app), main.data_dir_name }) catch return error.Internal;
 
     const lp = app.alloc.create(store_mod.Log) catch return error.Internal;
     var have_log = false; // lp.* инициализирован (файл открыт)
@@ -269,7 +269,7 @@ const TestApp = struct {
     home: []const u8,
     dir: testing.TmpDir,
 
-    /// provisioned: лог открывается по {home}/.shopot/zig-log.
+    /// provisioned: лог открывается по {home}/.stille-messenger/zig-log.
     /// write_seed: файл сида пишется (как после init CLI).
     fn initAt(self: *TestApp, alloc: std.mem.Allocator, io: std.Io, seed: [32]u8, provisioned: bool, write_seed: bool) !void {
         self.dir = testing.tmpDir(.{});
@@ -280,14 +280,14 @@ const TestApp = struct {
         self.home = try alloc.dupe(u8, dir_buf[0..real_len]);
         errdefer alloc.free(self.home);
 
-        // .shopot (0700): сид/лог живут здесь
+        // .stille-messenger (0700): сид/лог живут здесь
         var pb: [512]u8 = undefined;
-        const shopot = try std.fmt.bufPrint(&pb, "{s}/.shopot", .{self.home});
-        std.Io.Dir.createDirAbsolute(io, shopot, @fromBackingInt(@intCast(0o700))) catch {};
+        const data_dir = try std.fmt.bufPrint(&pb, "{s}/{s}", .{ self.home, main.data_dir_name });
+        std.Io.Dir.createDirAbsolute(io, data_dir, @fromBackingInt(@intCast(0o700))) catch {};
 
         if (write_seed) {
             var sb: [512]u8 = undefined;
-            const seed_path = try std.fmt.bufPrint(&sb, "{s}/.shopot/zig-seed", .{self.home});
+            const seed_path = try std.fmt.bufPrint(&sb, "{s}/{s}/zig-seed", .{ self.home, main.data_dir_name });
             const f = try std.Io.Dir.createFileAbsolute(io, seed_path, .{ .exclusive = true });
             defer f.close(io);
             try f.writePositionalAll(io, &seed, 0);
@@ -301,7 +301,7 @@ const TestApp = struct {
 
         if (provisioned) {
             var lb: [512]u8 = undefined;
-            const log_path = try std.fmt.bufPrint(&lb, "{s}/.shopot/zig-log", .{self.home});
+            const log_path = try std.fmt.bufPrint(&lb, "{s}/{s}/zig-log", .{ self.home, main.data_dir_name });
             self.log = try store_mod.Log.open(alloc, log_path, &seed);
         }
 

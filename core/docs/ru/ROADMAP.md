@@ -6,7 +6,7 @@
 
 ## P0 — ✅ ГОТОВО
 
-- ~~Релей~~: `stille-messenger relay` + `invite <имя> relay <addr>` — спаривание
+- ~~Релей~~: `stille-messenger-core relay` + `invite <имя> relay <addr>` — спаривание
   по HMAC-marker-у (секрет инвайта), байтовый сплит, само-переподключение
   A-стороны (e2e: E2E-RELAY-PASS).
 - ~~Fake-TLS~~: маскировка провода под TLS 1.3.

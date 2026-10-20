@@ -5,9 +5,12 @@ Implementation: `stille-messenger` (this repository). Russian version:
 [ru/PROTOCOL.md](ru/PROTOCOL.md).
 
 **Legacy compatibility:** the rebrand does not change protocol bytes. The
-`shopot-*` cryptographic domains, `SHOPOTD1` discovery marker, `shopot://i/`
-and `shopot1.` invitation prefixes, and `~/.shopot` data paths are retained
-for compatibility with existing identities, peers and encrypted history.
+`shopot-*` cryptographic domains, the `SHOPOTD1` discovery marker and the
+`shopot1.` invitation prefix are retained for compatibility with existing
+identities, peers and encrypted history. New invitation codes use the
+`stille://i/` and `stille://i3/` prefixes; legacy `shopot://i/` and
+`shopot://i3/` codes are still accepted. The legacy `~/.shopot` data
+directory migrates atomically to `~/.stille-messenger` on first start.
 
 **Rules of the wire**
 
@@ -23,7 +26,7 @@ for compatibility with existing identities, peers and encrypted history.
 
 | Object | Construction |
 |---|---|
-| seed | 32 random bytes, stored only on the owner's device (`~/.shopot/zig-seed`, mode 0600) |
+| seed | 32 random bytes, stored only on the owner's device (`~/.stille-messenger/zig-seed`, mode 0600) |
 | enc keypair | X25519, scalar = HKDF-SHA256(seed, "shopot-id-v3")[0..32] |
 | sign keypair | Ed25519, scalar = HKDF-SHA256(seed, "shopot-id-v3")[32..64] |
 | bundle | `enc_pk[32] || sign_pk[32]` — 64 bytes, the only identity material ever transmitted |
@@ -202,7 +205,7 @@ of the one-time invite secret and automatically adds the recipient as a contact.
 Invitation code (created by the inviter, handed over out of band):
 
 ```
-shopot://i/<base64url(bundle[64] || secret[16] || name_len u8 || name ≤32)>
+stille://i/<base64url(bundle[64] || secret[16] || name_len u8 || name ≤32)>
 [@host:port]            — optional direct address
 @r/<host:port>          — marks the address as a relay (§15)
 ```
@@ -370,7 +373,7 @@ mac    = HMAC-SHA256(HKDF(seed, "shopot-device-sync-v1"), kind ‖ data)
 - Idempotency: re-sending the same `file_id` does not duplicate the transfer
   (content addressing); receiving an already-assembled file short-circuits
   via the positional FILE_ACK. Cap: 8 concurrent transfers per peer.
-- Received files are stored at `~/.shopot/files/<id_hex>` (mode 0600).
+- Received files are stored at `~/.stille-messenger/files/<id_hex>` (mode 0600).
 
 ## 10. Calls (voice)
 
@@ -391,7 +394,7 @@ mac    = HMAC-SHA256(HKDF(seed, "shopot-device-sync-v1"), kind ‖ data)
   20 ms tick — at least 3 buffered frames or 60 ms elapsed before start;
   8+ queued → drain; a 200 ms hole → skip seq (loss concealment). Induced
   latency: ~40–60 ms.
-- Audio I/O runs through FIFOs `~/.shopot/pcm/mic` and `~/.shopot/pcm/spk`
+- Audio I/O runs through FIFOs `~/.stille-messenger/pcm/mic` and `~/.stille-messenger/pcm/spk`
   (the core reads/writes raw PCM); volume control and AGC belong to the
   client, not the core.
 
@@ -472,7 +475,7 @@ storage_key    = HKDF-SHA256(Expand(HKDF-Extract("shopot-store-v3", seed), "", 3
 
 ## 15. Relay (IP hiding)
 
-Self-hosted byte-split (`stille-messenger relay <host:port>` on any server): zero
+Self-hosted byte-split (`stille-messenger-core relay <host:port>` on any server): zero
 stille-messenger state, zero crypto of its own (E2EE is end-to-end; the relay sees a
 TLS-like noise stream). Both sides are relay *clients*:
 
@@ -493,7 +496,7 @@ then:          transparent byte split (fake-TLS stream passes through)
   second is paired; while a pair is active extra connections are closed.
   When the pair ends the slot is **freed** — either side can re-register and
   re-pair (this is what makes presence work).
-- Invite code with relay: `shopot://i/<b64>@r/<host:port>`.
+- Invite code with relay: `stille://i/<b64>@r/<host:port>`.
 - The A side (`invite <name> relay <addr>`) keeps its registration and
   reconnects on break until the invite is redeemed; the B side (`add <code>`)
   dials the relay with the marker, then the normal handshake+JOIN runs over
@@ -549,7 +552,7 @@ with first-generation fake-TLS: both ends must run the same core release
 
 ## 17. Core API (UDS)
 
-`stille-messenger serve` exposes the UDS socket `$HOME/.shopot/api.sock` (0700) with a
+`stille-messenger-core serve` exposes the UDS socket `$HOME/.stille-messenger/api.sock` (0700) with a
 binary framed protocol — the only interface of the core; GUI clients talk to
 it. Frame layout, methods, machine-readable statuses, events and scenarios:
 **[CORE-API.md](CORE-API.md)** (API version 2.4.0).

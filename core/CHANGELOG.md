@@ -73,6 +73,23 @@
 - Fixed `handleDeviceAnnounce`: selecting a known device-link contact no longer returns from the function while still in the selection block. The holder now proceeds to the existing single-flight authenticated dial path; waiter/blocked/deleted/already-online and `device_sync` guards remain unchanged. No wire or storage format change.
 - Исправлен `handleDeviceAnnounce`: поиск существующего контакта device-link больше не завершает функцию преждевременно. Держатель кода продолжает через существующий single-flight путь аутентифицированного подключения; проверки роли, блокировки, удаления, живой сессии и `device_sync` сохранены. Форматы протокола и хранилища не менялись.
 
+## [Unreleased / неизданное] — GUI namespace contract
+
+- Daemon binary is `stille-messenger-core` (the GUI client owns the
+  `stille-messenger` name; both ship in one release archive).
+- Data directory moves from `~/.shopot` to `~/.stille-messenger`: on the
+  first start the legacy directory migrates by an atomic rename; if both
+  exist the core refuses to start (`DataMigrationConflict`) instead of
+  silently merging or overwriting. Existing seed/log bytes are untouched.
+- New invite codes use `stille://i/` (v2) and `stille://i3/` (v3 hybrid)
+  prefixes; legacy `shopot://i/`, `shopot://i3/` and `shopot1.` codes are
+  still accepted. Wire format, crypto domains and storage are unchanged.
+- Бинарник демона — `stille-messenger-core` (имя `stille-messenger` занято
+  GUI-клиентом; оба попадают в один релизный архив). Каталог данных
+  переезжает из `~/.shopot` в `~/.stille-messenger` атомарным rename при
+  первом запуске; если существуют оба, ядро не стартует. Новые инвайт-коды
+  — `stille://i/` и `stille://i3/`; старые префиксы принимаются.
+
 ## [Unreleased / неизданное] — API 2.7.0: single-key friend requests
 
 - One invite code is now the complete friend request: its holder accepts once;

@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const exe = b.addExecutable(.{
-        .name = "stille-messenger",
+        .name = "stille-messenger-core",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/stille-messenger/app/main.zig"),
             .target = target,

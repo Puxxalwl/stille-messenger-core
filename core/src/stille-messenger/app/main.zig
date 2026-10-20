@@ -1,6 +1,6 @@
 //! stille-messenger: ядро шифрованного мессенджера. Только std, никаких JSON.
 //! Интерфейс для клиентов — UDS-апи (cli_server.zig, см. docs/CORE-API.md).
-//! Контакты, история и блокировки — в шифрованном логе (~/.shopot/zig-log).
+//! Контакты, история и блокировки — в шифрованном логе (~/.stille-messenger/zig-log).
 const std = @import("std");
 const builtin = @import("builtin");
 const stille_messenger = @import("stille-messenger");
@@ -32,16 +32,79 @@ const sysfd = stille_messenger.net.sysfd;
 const posix = std.posix;
 
 const usage =
-    \\stille-messenger — ядро шифрованного мессенджера (std-only Zig).
+    \\stille-messenger-core — ядро шифрованного мессенджера (std-only Zig).
     \\Клиенты (GUI) подключаются через бинарное UDS-апи
-    \\($HOME/.shopot/api.sock). Спецификация — docs/CORE-API.md.
+    \\($HOME/.stille-messenger/api.sock). Спецификация — docs/CORE-API.md.
     \\
-    \\  init    создать личность (~/.shopot/zig-seed, 0600)
+    \\  init    создать личность (~/.stille-messenger/zig-seed, 0600)
     \\  relay   режим IP-скрывающего релея (для сервера)
     \\  serve   демон: ядро + UDS-апи; без сида — режим восстановления
     \\
 ;
 pub const app_home_max = 512;
+
+/// Каталог данных: ~/.stille-messenger. Старый ~/.shopot мигрирует
+/// атомарным rename при первом запуске новой версии.
+pub const data_dir_name = ".stille-messenger";
+pub const legacy_data_dir_name = ".shopot";
+
+fn dataDirPath(out: []u8, home: []const u8, name: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(out, "{s}/{s}", .{ home, name });
+}
+
+fn directoryExists(io: std.Io, path: []const u8) !bool {
+    std.Io.Dir.accessAbsolute(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
+/// Подготовить каталог данных. Новый уже есть — ничего не делаем; есть
+/// только legacy — переносим атомарно; оба сразу — конфликт, запуск
+/// запрещён (две установки молча не сливаются).
+fn prepareDataDir(io: std.Io, home: []const u8) !void {
+    if (home.len == 0) return error.NoHome;
+    var current_buf: [app_home_max * 2]u8 = undefined;
+    var legacy_buf: [app_home_max * 2]u8 = undefined;
+    const current = try dataDirPath(&current_buf, home, data_dir_name);
+    const legacy = try dataDirPath(&legacy_buf, home, legacy_data_dir_name);
+    const has_current = try directoryExists(io, current);
+    const has_legacy = try directoryExists(io, legacy);
+    if (has_current and has_legacy) return error.DataMigrationConflict;
+    if (has_current) return;
+    if (has_legacy) {
+        try std.Io.Dir.renamePreserve(.cwd(), legacy, .cwd(), current, io);
+        return;
+    }
+    // 0700: каталог с сидом/логом/сокетом — только владелец
+    try std.Io.Dir.createDirAbsolute(io, current, @fromBackingInt(@intCast(0o700)));
+}
+
+test "legacy data dir migrates atomically and conflicts are rejected" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    var legacy_buf: [app_home_max * 2]u8 = undefined;
+    const legacy = try dataDirPath(&legacy_buf, home, legacy_data_dir_name);
+    try std.Io.Dir.createDirAbsolute(io, legacy, @fromBackingInt(@as(u16, 0o700)));
+    var legacy_seed_buf: [app_home_max * 2]u8 = undefined;
+    const legacy_seed = try std.fmt.bufPrint(&legacy_seed_buf, "{s}/zig-seed", .{legacy});
+    const seed_file = try std.Io.Dir.createFileAbsolute(io, legacy_seed, .{ .exclusive = true });
+    defer seed_file.close(io);
+    const seed_bytes: [32]u8 = @splat(0xA5);
+    try seed_file.writePositionalAll(io, &seed_bytes, 0);
+    try prepareDataDir(io, home);
+    var current_buf: [app_home_max * 2]u8 = undefined;
+    const current = try dataDirPath(&current_buf, home, data_dir_name);
+    try testing.expect(try directoryExists(io, current));
+    try testing.expect(!(try directoryExists(io, legacy)));
+    try std.Io.Dir.createDirAbsolute(io, legacy, @fromBackingInt(@as(u16, 0o700)));
+    try testing.expectError(error.DataMigrationConflict, prepareDataDir(io, home));
+}
 
 // тесты app-модулей, не импортируемых на уровне файла: zig build test
 // (root main.zig) собирает тесты только явно процитированных файлов
@@ -59,10 +122,9 @@ pub fn appHomeDir(app: *const App) []const u8 {
 }
 
 fn stille_messengerDir(io: std.Io, home: []const u8) ![512]u8 {
-    if (home.len == 0) return error.NoHome;
+    try prepareDataDir(io, home);
     var buf: [512]u8 = undefined;
-    // 0700: каталог с сидом/логом/сокетом — только владелец
-    std.Io.Dir.createDirAbsolute(io, try std.fmt.bufPrint(&buf, "{s}/.shopot", .{home}), @fromBackingInt(@intCast(0o700))) catch {};
+    _ = try dataDirPath(&buf, home, data_dir_name);
     return buf;
 }
 
@@ -71,7 +133,7 @@ fn stille_messengerDir(io: std.Io, home: []const u8) ![512]u8 {
 pub fn loadSeed(io: std.Io, home: []const u8) ![32]u8 {
     _ = try stille_messengerDir(io, home);
     var path_buf: [512]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "{s}/.shopot/zig-seed", .{home});
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}/zig-seed", .{ home, data_dir_name });
     const f = try std.Io.Dir.openFileAbsolute(io, path, .{ .mode = .read_only });
     defer f.close(io);
     var seed: [32]u8 = undefined;
@@ -84,7 +146,7 @@ pub fn loadSeed(io: std.Io, home: []const u8) ![32]u8 {
 pub fn saveSeed(io: std.Io, home: []const u8, seed: [32]u8) !void {
     _ = try stille_messengerDir(io, home);
     var path_buf: [512]u8 = undefined;
-    const path = try std.fmt.bufPrint(&path_buf, "{s}/.shopot/zig-seed", .{home});
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}/zig-seed", .{ home, data_dir_name });
     const f = try std.Io.Dir.createFileAbsolute(io, path, .{ .exclusive = true });
     defer f.close(io);
     try f.writePositionalAll(io, &seed, 0);
@@ -446,7 +508,7 @@ fn evFileSent(app: *App, cid: i64, file_id: [16]u8, size: u32, name: []const u8)
     api_srv.fanoutEventLocked(app, .FILE_SENT, w.items());
 }
 
-/// FILE_RECEIVED: файл принят целиком (байты в ~/.shopot/files).
+/// FILE_RECEIVED: файл принят целиком (байты в ~/.stille-messenger/files).
 fn evFileReceived(app: *App, cid: i64, file_id: [16]u8, size: u32, name: []const u8) void {
     var w = api.Writer.init(app.alloc);
     defer w.deinit();
@@ -1634,12 +1696,12 @@ fn dropRxFile(app: *App, file_id: [16]u8) void {
     app.alloc.destroy(rx);
 }
 
-/// Файл уже сохранён? (кэш ~/.shopot/files/<id_hex32>)
+/// Файл уже сохранён? (кэш ~/.stille-messenger/files/<id_hex32>)
 fn fileAlreadyStored(app: *App, file_id: [16]u8) bool {
     var hxb: [32]u8 = undefined;
     const hx = toHex(&hxb, &file_id) catch return false;
     var fbuf: [700]u8 = undefined;
-    const path = std.fmt.bufPrint(&fbuf, "{s}/.shopot/files/{s}", .{ appHomeDir(app), hx }) catch return false;
+    const path = std.fmt.bufPrint(&fbuf, "{s}/{s}/files/{s}", .{ appHomeDir(app), data_dir_name, hx }) catch return false;
     var zbuf: [701]u8 = undefined;
     @memcpy(zbuf[0..path.len], path);
     zbuf[path.len] = 0;
@@ -1651,7 +1713,7 @@ fn saveRxFile(app: *App, file_id: [16]u8, bytes: []const u8) bool {
     var hxb: [32]u8 = undefined;
     const hx = toHex(&hxb, &file_id) catch return false;
     var pbuf: [600]u8 = undefined;
-    const dir = std.fmt.bufPrint(&pbuf, "{s}/.shopot/files", .{appHomeDir(app)}) catch return false;
+    const dir = std.fmt.bufPrint(&pbuf, "{s}/{s}/files", .{ appHomeDir(app), data_dir_name }) catch return false;
     var zbuf: [601]u8 = undefined;
     @memcpy(zbuf[0..dir.len], dir);
     zbuf[dir.len] = 0;
@@ -1828,7 +1890,7 @@ fn contactIdByBundle(app: *App, bundle: [64]u8) ?i64 {
 fn startCallAudio(app: *App, c: *CallState) void {
     if (c.pcm != null) return;
     c.up = true;
-    // fifo в ~/.shopot/pcm — файл создаётся при старте чата
+    // fifo в ~/.stille-messenger/pcm — файл создаётся при старте чата
     if (app.call_pcm_dir) |dir| {
         if (audio_mod.PcmPort.openFifos(dir)) |p| {
             c.pcm = p;
@@ -2699,7 +2761,7 @@ fn relayLinkerLoop(app: *App, secret: [16]u8, addr: []const u8) void {
 }
 
 /// CREATE_INVITE: payload [flags u8 (bit0 = relay)][name str16][addr str16].
-/// Ответ: [code str16] — односторонний инвайт-код (URL shopot://i/...).
+/// Ответ: [code str16] — односторонний инвайт-код (URL stille://i/...).
 fn apiCreateInvite(app: *App, payload: []const u8, w: *api.Writer) api.Status {
     var r = api.Reader.init(payload);
     const flags = r.readU8() catch return .BAD_FRAME;
@@ -2787,7 +2849,9 @@ fn acceptInviteCommon(app: *App, payload: []const u8, out: *AcceptOut) api.Statu
     var code_secret: [16]u8 = @splat(0);
     var has_code_secret = false; // v2/v3: JOIN-конверт погашает секрет кода
     var hybrid = false;
-    if (std.mem.startsWith(u8, code, invite_mod.v3_prefix)) {
+    if (std.mem.startsWith(u8, code, invite_mod.v3_prefix) or
+        std.mem.startsWith(u8, code, invite_mod.legacy_v3_prefix))
+    {
         const inv = invite_mod.decode3(code) catch return .BAD_INVITE_CODE;
         bundle = inv.bundle;
         @memcpy(name_buf[0..inv.name_len], inv.name());
@@ -2804,6 +2868,7 @@ fn acceptInviteCommon(app: *App, payload: []const u8, out: *AcceptOut) api.Statu
         hybrid = inv.has_direct and inv.has_relay;
     } else {
         if (!std.mem.startsWith(u8, code, invite_mod.v2_prefix) and
+            !std.mem.startsWith(u8, code, invite_mod.legacy_v2_prefix) and
             !std.mem.startsWith(u8, code, "shopot1.")) return .BAD_INVITE_CODE;
         const inv = invite_mod.decode(code) catch return .BAD_INVITE_CODE;
         bundle = inv.bundle;
@@ -5478,7 +5543,7 @@ pub fn main(start: std.process.Init) !void {
     const cmd: []const u8 = std.mem.span(argv[1]);
 
     // relay <host:port>: байтовый сплит без состояния stille-messenger (скрытие IP).
-    // Запускается на любом сервере: stille-messenger relay 0.0.0.0:9000
+    // Запускается на любом сервере: stille-messenger-core relay 0.0.0.0:9000
     if (std.mem.eql(u8, cmd, "relay")) {
         const addr = if (argv.len >= 3) std.mem.span(argv[2]) else return badUsage();
         var listener = tcp.listen(addr) catch {
@@ -5499,7 +5564,7 @@ pub fn main(start: std.process.Init) !void {
         var id = try identity.Identity.fromSeed(seed);
         defer id.deinit();
         var fp_buf: [96]u8 = undefined;
-        std.debug.print("identity created, seed saved to ~/.shopot/zig-seed (0600)\nfingerprint: {s}\n", .{try id.fingerprintTo(&fp_buf)});
+        std.debug.print("identity created, seed saved to ~/.stille-messenger/zig-seed (0600)\nfingerprint: {s}\n", .{try id.fingerprintTo(&fp_buf)});
         return;
     }
 
@@ -5536,7 +5601,7 @@ pub fn main(start: std.process.Init) !void {
         var log_ptr: ?*store_mod.Log = null;
         if (provisioned) {
             var store_path_buf: [512]u8 = undefined;
-            const store_path = try std.fmt.bufPrint(&store_path_buf, "{s}/.shopot/zig-log", .{home});
+            const store_path = try std.fmt.bufPrint(&store_path_buf, "{s}/{s}/zig-log", .{ home, data_dir_name });
             if (store_mod.Log.open(alloc, store_path, &seed)) |l| {
                 const lp = try alloc.create(store_mod.Log);
                 lp.* = l;
@@ -5547,11 +5612,11 @@ pub fn main(start: std.process.Init) !void {
         }
 
         var pcm_buf: [512]u8 = undefined;
-        const pcm_dir = try std.fmt.bufPrint(&pcm_buf, "{s}/.shopot/pcm", .{home});
+        const pcm_dir = try std.fmt.bufPrint(&pcm_buf, "{s}/{s}/pcm", .{ home, data_dir_name });
         std.Io.Dir.createDirAbsolute(io, pcm_dir, .default_dir) catch {};
         var pcm_heap: []const u8 = "";
         if (home.len > 0) {
-            pcm_heap = std.fmt.allocPrint(alloc, "{s}/.shopot/pcm", .{home}) catch "";
+            pcm_heap = std.fmt.allocPrint(alloc, "{s}/{s}/pcm", .{ home, data_dir_name }) catch "";
         }
 
         var app = App{
@@ -5727,11 +5792,11 @@ test "recovery API: CREATE/RESTORE через хендлеры и статусы
             self.home = try a.dupe(u8, db[0..dl]);
             errdefer a.free(self.home);
             var pb: [512]u8 = undefined;
-            const shopot = try std.fmt.bufPrint(&pb, "{s}/.shopot", .{self.home});
-            std.Io.Dir.createDirAbsolute(io, shopot, @fromBackingInt(@intCast(0o700))) catch {};
+            const data_dir = try std.fmt.bufPrint(&pb, "{s}/{s}", .{ self.home, data_dir_name });
+            std.Io.Dir.createDirAbsolute(io, data_dir, @fromBackingInt(@intCast(0o700))) catch {};
             if (provisioned) {
                 var sb: [512]u8 = undefined;
-                const sp = try std.fmt.bufPrint(&sb, "{s}/.shopot/zig-seed", .{self.home});
+                const sp = try std.fmt.bufPrint(&sb, "{s}/{s}/zig-seed", .{ self.home, data_dir_name });
                 const f = try std.Io.Dir.createFileAbsolute(io, sp, .{ .exclusive = true });
                 defer f.close(io);
                 try f.writePositionalAll(io, &fix_seed, 0);
@@ -5744,7 +5809,7 @@ test "recovery API: CREATE/RESTORE через хендлеры и статусы
             errdefer self.eng.deinit();
             if (provisioned) {
                 var lb: [512]u8 = undefined;
-                const lp = try std.fmt.bufPrint(&lb, "{s}/.shopot/zig-log", .{self.home});
+                const lp = try std.fmt.bufPrint(&lb, "{s}/{s}/zig-log", .{ self.home, data_dir_name });
                 self.log = try store_mod.Log.open(a, lp, &fix_seed);
             }
             self.app = .{

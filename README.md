@@ -4,8 +4,11 @@
   <img src="docs/assets/stille_logo.png" alt="stille-messenger logo" width="280">
 </p>
 
-> **Legacy compatibility:** the data directory `~/.shopot`, invitation prefixes,
-> discovery marker and cryptographic domain strings retain their original values.
+> **Legacy compatibility:** on the first start the legacy data directory
+> `~/.shopot` migrates atomically to `~/.stille-messenger` (if both exist,
+> the core refuses to start instead of merging); legacy invitation prefixes
+> (`shopot://i/`, `shopot://i3/`, `shopot1.`), the discovery marker and
+> cryptographic domain strings retain their original values.
 > Existing identities, encrypted history and protocol formats are unchanged.
 
 **English** | [Русский](docs/ru/README.md)
@@ -21,12 +24,12 @@ archive lives under the tag `cpp-archive`.
 
 | Area | What the core does |
 |---|---|
-| Identity | X25519 + Ed25519 keypairs derived from one 32-byte seed (`~/.shopot/zig-seed`, 0600) |
+| Identity | X25519 + Ed25519 keypairs derived from one 32-byte seed (`~/.stille-messenger/zig-seed`, 0600) |
 | Transport | Direct TCP (ports 7777–7786) or self-hosted relay; persistent relay presence (reconnects without a new invite); LAN discovery over UDP multicast; wire disguised as TLS 1.3 |
 | Encryption | XX-like handshake, AEAD transport, double ratchet with post-compromise security (epoch rotation every 256 messages) |
 | Messaging | Telegram-style formatting entities (bold/italic/spoiler/code/link), offline delivery (encrypted outbox, ACKs, dedup), reactions, 16 kHz E2EE voice calls (ADPCM, DTX), resumable file transfer |
 | Storage | Append-only AEAD log — zero plaintext bytes on disk |
-| Interface | Binary framed UDS API (`~/.shopot/api.sock`) — the only interface; GUI clients render, the core does everything else |
+| Interface | Binary framed UDS API (`~/.stille-messenger/api.sock`) — the only interface; GUI clients render, the core does everything else |
 | Recovery | Account recovery without history: passkey (WebAuthn PRF) or recovery code unlocks a sealed backup blob (identity + profile + contacts) stored in the user's own cloud |
 
 Own avatar previews can be restored after a daemon or client restart with
@@ -35,13 +38,14 @@ bytes, or `NOT_FOUND` if unavailable. Images remain in the encrypted log;
 clients need no plaintext disk cache. See the [API specification](core/docs/CORE-API.md#44-own-profile).
 
 Adding a friend is a one-key request: `CREATE_INVITE` produces one
-`shopot://i/...` code; the holder performs exactly one `ACCEPT_INVITE`.
+`stille://i/...` code (legacy `shopot://i/...` is also accepted); the holder
+performs exactly one `ACCEPT_INVITE`.
 The inviter needs no second key or manual confirmation: the core verifies the
 signed, HMAC-authenticated JOIN and adds the peer automatically. API 2.7.0
 also exposes bounded asynchronous connection and invite state, plus a v3
-`shopot://i3/...` direct-then-relay code for hybrid routing.
+`stille://i3/...` direct-then-relay code for hybrid routing.
 
-A lost device does not lose the account: `stille-messenger serve` without a
+A lost device does not lose the account: `stille-messenger-core serve` without a
 seed file starts unprovisioned and waits for
 [`RESTORE_RECOVERY_BACKUP`](core/docs/CORE-API.md#410-account-recovery-since-api-260)
 (42, API 2.6.0). The client downloads the sealed blob from the user's own
@@ -60,14 +64,14 @@ make            # = cd core && zig build -Doptimize=ReleaseFast
 make test       # = cd core && zig build test --summary all
 ```
 
-Binary: `core/zig-out/bin/stille-messenger`. Release builds for
+Binary: `core/zig-out/bin/stille-messenger-core`. Release builds for
 x86_64-linux-musl and aarch64-macos are attached to every `zig-v*` tag.
 
 ## Running
 
 ```bash
-stille-messenger init          # identity: ~/.shopot/zig-seed (0600)
-stille-messenger serve         # daemon: core + UDS API (~/.shopot/api.sock)
+stille-messenger-core init          # identity: ~/.stille-messenger/zig-seed (0600)
+stille-messenger-core serve         # daemon: core + UDS API (~/.stille-messenger/api.sock)
 ```
 
 There is no CLI/TUI: the only client interface is the GUI, which talks to
@@ -80,7 +84,7 @@ machine error codes, events). Specification for client authors:
 
 ```bash
 # on any server (VPS):
-./stille-messenger relay 0.0.0.0:9000
+./stille-messenger-core relay 0.0.0.0:9000
 
 # on your side:
 > invite bob relay vps.example.com:9000
