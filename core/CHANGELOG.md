@@ -1,5 +1,74 @@
 # Changelog — stille-messenger
 
+## [Unreleased / неизданное] — NAT-обход: прямой путь поверх релея (2.9.0)
+
+- Feature (wire-compatible, API 2.9.0): relayed peers behind NAT now
+  upgrade their relay session to a **direct punched TCP connection**
+  (simultaneous open). The relay learns each side its reflexive address
+  via new ECHO_REQ/ECHO_ACK records (backward compatible: a 50 ms peek
+  window, old relays/clients never see them); candidates are exchanged
+  inside the authenticated session via the new PUNCH_CANDIDATES envelope
+  (0x47, `count u8 ≤ 8` × {type, ip, port}; old cores skip the unknown
+  tag and stay relayed); both cores then dial each other's reflexive
+  candidates from the same local address:port as their relay connection
+  (SO_REUSEADDR, cone NAT reuses the mapping). Host (LAN) candidates are
+  dialed by the bundle-smaller side. The punched connection carries a
+  fresh m1/m2/m3 and replaces the relay session (retired in bind); a
+  failure (symmetric NAT, filter) silently keeps the relay — no relay
+  downgrade is ever possible. No third-party STUN/TURN; the relay remains
+  the only rendezvous (serverless invariant). Engine: `net/punch.zig`
+  (budgets: ≤ 4 targets, 3 × 500 ms rounds with 50 ms retry slices, 5 s
+  between attempts, one worker per contact). App: config bit6 `nat_punch`
+  (default on), new ROUTE_STATE event (18: [cid][route 0 lan/1 relay/
+  2 direct-punched], subscription required). Known limits: two NAT-ed
+  peers with no relay/LAN channel cannot meet; after a successful punch
+  each peer learns the other's public NAT endpoint.
+- Фича (совместима на проводе, API 2.9.0): пара на релее за NAT теперь
+  поднимает relay-сессию до **прямого пробитого TCP-соединения**
+  (одновременный open). Релей сообщает каждой стороне её рефлексивный
+  адрес новыми записями ECHO_REQ/ECHO_ACK (обратная совместимость:
+  50-мс окно peek, старые релеи/клиенты их не видят); кандидаты
+  обмениваются внутри аутентифицированной сессии новым конвертом
+  PUNCH_CANDIDATES (0x47, `count u8 ≤ 8` × {type, ip, port}; старые ядра
+  пропускают неизвестный тег и остаются на релее); затем оба ядра диалят
+  рефлексивные кандидаты друг друга из того же локального адреса:порта,
+  что relay-подключение (SO_REUSEADDR, cone-NAT переиспользует маппинг).
+  Host-(LAN-)кандидаты дозванивает сторона с меньшим bundle. Пробитый
+  конн несёт свежие m1/m2/m3 и замещает relay-сессию (retired в бинде);
+  неудача (симметричный NAT, фильтр) молча оставляет релей — даунгрейда
+  на релей не бывает. Сторонних STUN/TURN нет; релей остаётся
+  единственной точкой рандеву (инвариант serverless). Движок:
+  `net/punch.zig` (бюджеты: ≤ 4 цели, 3 раунда × 500 мс со срезами
+  повтора 50 мс, 5 с между попытками, один воркер на контакт). Приложение:
+  бит конфигурации bit6 `nat_punch` (по умолчанию включён), новое событие
+  ROUTE_STATE (18: [cid][route 0 lan/1 relay/2 direct-punched], по
+  подписке). Известные ограничения: два узла за NAT без релея/LAN-канала
+  не встретятся; после успешного punch каждая сторона узнаёт публичный
+  endpoint NAT пира.
+
+## [Unreleased / неизданное] — чистка документации: версии и пути
+
+- Doc fixes only (no code/wire change): README EN/RU reworked — badges,
+  updated API version 2.7.0 → 2.8.0, wire protocol v4 → v5 (hybrid
+  ML-KEM-768 handshake now stated), the stale CLI relay example replaced
+  with the actual `CREATE_INVITE_EX` flow, detailed avatar/invite/recovery
+  prose moved to CORE-API/CLIENT_RULES links. PROTOCOL.md §17 now cites
+  API 2.8.0 (was 2.4.0). SECURITY.md hardening notes use the current
+  `~/.stille-messenger` paths (were `~/.shopot`). ARCHITECTURE.md gained a
+  compact module-dependency diagram (Mermaid) + hybrid-handshake layer row.
+  `make run` fixed: it invoked the nonexistent `chat` command, now `serve`.
+- Правки только документации (без изменений кода и провода): README EN/RU
+  переработан — бейджи, версия API 2.7.0 → 2.8.0, протокол провода v4 → v5
+  (указано гибридное ML-KEM-768-рукопожатие), несуществующий CLI-пример
+  релея заменён на реальный сценарий `CREATE_INVITE_EX`, детальные абзацы
+  про аватар/инвайты/восстановление вынесены ссылками в
+  CORE-API/CLIENT_RULES. PROTOCOL.md §17 теперь ссылается на API 2.8.0
+  (было 2.4.0). Заметки харденинга в SECURITY.md используют актуальные
+  пути `~/.stille-messenger` (было `~/.shopot`). ARCHITECTURE.md получил
+  компактную диаграмму зависимостей модулей (Mermaid) + строку слоя про
+  гибридное рукопожатие. Починен `make run`: вызывал несуществующую команду
+  `chat`, теперь `serve`.
+
 ## [Unreleased / неизданное] — инвайт-ссылка несёт полный код
 
 - Doc clarification (no code/wire change): a `stille.im/invite/…` link

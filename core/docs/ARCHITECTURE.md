@@ -24,9 +24,38 @@ Layer and data-flow reference for the `stille-messenger` core. Russian version:
 | app | `src/stille-messenger/app/` | daemon: UDS API server, invites, LAN discovery, autodial, outbox flushing, call audio loop, file transfers, configuration (config.zig), device sync (sync.zig), account recovery (recovery.zig: build/apply the sealed profile package; unprovisioned serve mode), Tor SOCKS5 dialing |
 | core | `src/stille-messenger/core/` | engine (contacts, locks, dispatch, outbox, file Tx state machines), session (handshake + sealed frames) |
 | proto | `src/stille-messenger/proto/` | binary envelopes, allocation-free codec |
-| crypto | `src/stille-messenger/crypto/` | identity, handshake, ratchet, call keys, AEAD, padding |
+| crypto | `src/stille-messenger/crypto/` | identity, hybrid handshake (X25519 + ML-KEM-768), ratchet, call keys, AEAD, padding |
 | net | `src/stille-messenger/net/` | TCP transport, stream obfuscation (fake-TLS framing), relay, heartbeat, SOCKS5 (Tor) |
 | store | `src/stille-messenger/store/` | encrypted append-only log |
+
+Dependencies run one way (app → engine → session → proto/crypto →
+interfaces); nothing reaches upward. The app layer is the only place that
+dials: it creates a transport (TCP, fake-TLS, relay, SOCKS5), wraps the raw
+connection into an obfuscated `interfaces.Conn` and hands it to the engine —
+sessions never see a socket:
+
+```mermaid
+graph TD
+    GUI["GUI client"] -- "binary UDS API" --> APP
+    subgraph daemon ["stille-messenger-core serve"]
+        APP["app<br>invites · discovery · recovery · UDS server"]
+        ENG["core/engine<br>dispatch · outbox · file transfers"]
+        SES["core/session<br>handshake · sealed frames"]
+        PROTO["proto<br>envelopes · zero-alloc codec"]
+        CRYPTO["crypto<br>identity · ratchet · AEAD"]
+        NET["net<br>TCP · fake-TLS · relay · SOCKS5"]
+        STORE["store<br>AEAD append-only log"]
+        IF["core/interfaces<br>Conn · Transport · Clock"]
+    end
+    APP --> ENG
+    APP --> STORE
+    APP -- "dial + wrap Conn" --> NET
+    ENG --> SES
+    SES --> PROTO
+    SES --> CRYPTO
+    NET -. implements .-> IF
+    SES -. reads/writes via .-> IF
+```
 
 ## 3. Message data flow
 
@@ -88,6 +117,18 @@ persist* (app, under app.mu)
 - Server-mode presence threads (one per contact when `server_mode` is on)
   re-read the configuration each iteration; turning the mode off stops
   them at the next cycle without teardown signalling.
+- NAT-punch workers (2.9.0, one per contact, deduplicated in
+  `punch_runs`) start when a relay-backed session receives the peer's
+  PUNCH_CANDIDATES. A worker snapshots the route under the app lock, then
+  works lock-free: host-candidate dials (initiator side only) and the
+  simultaneous open from the same local address as the relay connection
+  (`net/punch.zig`; budgets documented in PROTOCOL.md §15.1). A successful
+  punched/LAN connection goes through the regular
+  `establishSessionOnConn`/`handleAcceptedConn` paths — the new session
+  retires the relay session in `bindSessionLocked`; a failure just sleeps
+  and retries while the route is still the live session. No relay
+  downgrade is possible: the punched path is adopted only after a full
+  handshake.
 - Invite connection scheduling is bounded and asynchronous: `connq_mu` is a
   leaf lock held only while queue metadata is changed, with at most 64 queued
   jobs and 4 active dial workers. One in-flight job is allowed per contact.
