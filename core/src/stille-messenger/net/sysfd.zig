@@ -296,11 +296,17 @@ pub fn setMulticastTtl(fd: fd_t) void {
     setSockOptRaw(fd, posix.IPPROTO.IP, ip_multicast_ttl, &std.mem.toBytes(ttl));
 }
 
+/// Байты struct ip_mreq: адрес группы в сетевом порядке (как есть) +
+/// INADDR_ANY (интерфейс по умолчанию).
+fn mcastMreq(group_ip: [4]u8) [8]u8 {
+    var mreq: [8]u8 = @splat(0);
+    @memcpy(mreq[0..4], &group_ip);
+    return mreq;
+}
+
 /// Вступить в IPv4-мультикаст-группу (INADDR_ANY — интерфейс по умолчанию).
 pub fn joinMulticastGroup(fd: fd_t, group_ip: [4]u8) void {
-    var mreq: [8]u8 = undefined;
-    std.mem.writeInt(u32, mreq[0..4], std.mem.readInt(u32, &group_ip, .little), .big);
-    std.mem.writeInt(u32, mreq[4..8], 0, .big); // INADDR_ANY
+    const mreq = mcastMreq(group_ip);
     const opt: u32 = if (is_linux) ip_add_membership_linux else ip_add_membership_darwin;
     setSockOptRaw(fd, posix.IPPROTO.IP, opt, &mreq);
 }
@@ -419,6 +425,14 @@ pub fn sleepMs(ms: u64) void {
 
 // ==== Тесты ====
 const testing = std.testing;
+
+test "mcastMreq: адрес группы копируется без перестановки байт" {
+    // Регрессия: readInt(.little) + writeInt(.big) разворачивал адрес
+    // (239.77.77.77 -> 77.77.77.239), IP_ADD_MEMBERSHIP падал с EINVAL,
+    // и демон молча оставался без приёма мультикаста.
+    const mreq = mcastMreq(.{ 239, 77, 77, 77 });
+    try testing.expectEqualSlices(u8, &.{ 239, 77, 77, 77, 0, 0, 0, 0 }, &mreq);
+}
 
 test "sockaddrIn: порт big-endian и адрес в сетевом порядке" {
     const sa = sockaddrIn(.{ 192, 168, 1, 9 }, 7777);
