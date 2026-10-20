@@ -15,6 +15,9 @@
 //!                        (ближайший релей очереди, как outbox)
 //!   bit4 lan_discovery — UDP-мультикаст анонсы/поиск в LAN
 //!   bit5 autodial      — фоновый дозвон офлайн-контактов
+//!   bit6 nat_punch     — пробитие прямого пути между NAT: рефлексивные
+//!                        кандидаты от релея, simultaneous open (fallback
+//!                        на relay остаётся всегда)
 //!
 //! Правила как во всём проекте: little-endian, строки str16, без JSON.
 //! Неизвестная версия blob или незарезервированные биты — ошибка декода
@@ -35,11 +38,12 @@ pub const flag_use_tor_mask: u32 = 1 << 2;
 pub const flag_device_sync: u32 = 1 << 3;
 pub const flag_lan_discovery: u32 = 1 << 4;
 pub const flag_autodial: u32 = 1 << 5;
+pub const flag_nat_punch: u32 = 1 << 6;
 
 /// Маска известных флагов: всё вне её обязано быть 0.
 pub const flags_known: u32 = flag_server_mode | flag_use_fake_tls |
     flag_use_tor_mask | flag_device_sync | flag_lan_discovery |
-    flag_autodial;
+    flag_autodial | flag_nat_punch;
 
 /// Ошибки кодирования/декодирования blob.
 pub const Error = error{
@@ -76,6 +80,12 @@ pub const Config = struct {
     lan_discovery: bool = true,
     /// Фоновый автодозвон офлайн-контактов по сохранённым адресам.
     autodial: bool = true,
+    /// NAT-punch: обмен рефлексивными кандидатами (их видит relay) внутри
+    /// сессии и одновременный TCP-open в тот же локальный порт, что
+    /// relay-подключение (маппинг cone-NAT переиспользуется). Пробитый
+    /// путь сменяет relay-транспорт сессии; неудача (symmetric NAT,
+    /// фильтр) молча оставляет relay — даунгрейда пути не бывает.
+    nat_punch: bool = true,
 
     server_addr_buf: [addr_max]u8 = @splat(0),
     server_addr_len: u8 = 0,
@@ -133,6 +143,7 @@ pub const Config = struct {
         if (self.device_sync) flags |= flag_device_sync;
         if (self.lan_discovery) flags |= flag_lan_discovery;
         if (self.autodial) flags |= flag_autodial;
+        if (self.nat_punch) flags |= flag_nat_punch;
         var n: usize = 0;
         buf[0] = wire_ver;
         n = 1;
@@ -167,6 +178,7 @@ pub const Config = struct {
         c.device_sync = flags & flag_device_sync != 0;
         c.lan_discovery = flags & flag_lan_discovery != 0;
         c.autodial = flags & flag_autodial != 0;
+        c.nat_punch = flags & flag_nat_punch != 0;
         try c.validate();
         self.* = c;
     }
@@ -223,6 +235,7 @@ test "defaults: fake_tls/lan/autodial включены, адреса sane" {
     try testing.expect(!c.device_sync);
     try testing.expect(c.lan_discovery);
     try testing.expect(c.autodial);
+    try testing.expect(c.nat_punch);
     try testing.expectEqualStrings("127.0.0.1:9050", c.torAddr());
     try testing.expectEqualStrings("", c.serverAddr());
 }
@@ -232,6 +245,7 @@ test "encode/decode roundtrip со всеми полями" {
     c.server_mode = true;
     c.device_sync = true;
     c.use_fake_tls = false;
+    c.nat_punch = false;
     try c.setServerAddr("10.0.0.1:9000");
     try c.setTorAddr("127.0.0.1:9150");
     var buf: [blob_max]u8 = undefined;
@@ -243,6 +257,7 @@ test "encode/decode roundtrip со всеми полями" {
     try testing.expect(back.server_mode);
     try testing.expect(!back.use_fake_tls);
     try testing.expect(back.device_sync);
+    try testing.expect(!back.nat_punch);
     try testing.expectEqualStrings("10.0.0.1:9000", back.serverAddr());
     try testing.expectEqualStrings("127.0.0.1:9150", back.torAddr());
 }
@@ -281,7 +296,7 @@ test "decode: незарезервированный бит -> BadFlags" {
     var buf: [blob_max]u8 = undefined;
     const c0 = Config.defaults();
     const blob = try c0.encode(&buf);
-    buf[1] = 0x40; // bit6 — зарезервирован
+    buf[1] = 0x80; // bit7 — зарезервирован
     var c = Config{};
     try testing.expectError(error.BadFlags, c.decode(blob));
 }
@@ -315,7 +330,7 @@ test "decode: отказ не мутирует конфигурацию" {
     var c = Config.defaults();
     c.use_fake_tls = false;
     const blob = try c.encode(&buf);
-    buf[1] = 0x40;
+    buf[1] = 0x80; // bit7 — зарезервирован
     const before = c;
     try testing.expectError(error.BadFlags, c.decode(blob));
     try testing.expectEqual(before.use_fake_tls, c.use_fake_tls);

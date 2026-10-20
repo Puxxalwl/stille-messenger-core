@@ -337,6 +337,23 @@ pub const Event = enum(u16) {
     /// [cid u32] + contact_view (поля как GET_BOOTSTRAP). Заменяет собой
     /// «дёрнуть LIST_CONTACTS» после CONTACT_JOINED/CONTACT_PROFILE.
     CONTACT_UPSERTED = 17,
+    /// Транспорт сессии с контактом сменился (NAT-punch, 2.9.0; только
+    /// подписанным): [cid u32][route u8 (RouteState)]. route: 0 lan
+    /// (прямой dial по LAN/host-кандидату), 1 relay, 2 direct-punched
+    /// (пробитый simultaneous open). Даунгрейда с прямого пути на relay
+    /// не бывает: relay остаётся фолбэком только до подъёма прямого.
+    ROUTE_STATE = 18,
+};
+
+/// Транспорт сессии с контактом (u8 на проводе, ROUTE_STATE).
+pub const RouteState = enum(u8) {
+    /// Прямое LAN-соединение (host-кандидат/дискавери).
+    lan = 0,
+    /// Релей (marker-спаривание на self-hosted релее).
+    relay = 1,
+    /// Пробитый прямой путь (simultaneous open по рефлексивным
+    /// кандидатам, NAT-punch).
+    direct_punched = 2,
 };
 
 /// Стадия установки соединения с контактом (u8 на проводе).
@@ -686,6 +703,10 @@ test "method ids стабильны (контракт провода)" {
     try std.testing.expectEqual(@as(u16, 15), @backingInt(Event.CONTACT_STATE_CHANGED));
     try std.testing.expectEqual(@as(u16, 16), @backingInt(Event.CONTACTS_CHANGED));
     try std.testing.expectEqual(@as(u16, 17), @backingInt(Event.CONTACT_UPSERTED));
+    try std.testing.expectEqual(@as(u16, 18), @backingInt(Event.ROUTE_STATE));
+    try std.testing.expectEqual(@as(u8, 0), @backingInt(RouteState.lan));
+    try std.testing.expectEqual(@as(u8, 1), @backingInt(RouteState.relay));
+    try std.testing.expectEqual(@as(u8, 2), @backingInt(RouteState.direct_punched));
     try std.testing.expectEqual(@as(u16, 21), @backingInt(Status.RESYNC_REQUIRED));
     // значения стадий подключения — контракт u8
     try std.testing.expectEqual(@as(u8, 0), @backingInt(ConnState.pending));

@@ -29,6 +29,8 @@ const config_mod = stille_messenger.app.config;
 const sync_mod = stille_messenger.app.sync;
 const socks5 = stille_messenger.net.socks5;
 const sysfd = stille_messenger.net.sysfd;
+const relay_mod = stille_messenger.net.relay;
+const punch = stille_messenger.net.punch;
 const posix = std.posix;
 
 const usage =
@@ -296,6 +298,20 @@ pub const App = struct {
     /// Отдельно от contact_relays (персональные релеи контактов).
     server_runs: std.AutoHashMapUnmanaged(i64, void) = .empty,
 
+    // ---- NAT-punch (2.9.0) ----
+    /// Рефлексивный адрес (каким relay видит подключение) по relay-конну:
+    /// заполняется echo-dial-ами, читается один раз в bindSessionLocked
+    /// при рассылке PUNCH_CANDIDATES. Ключ — указатель TcpConn: запись
+    /// протухает с закрытием конна, карта ограничена relay_echo_cap
+    /// (значения 8 байт, очистка безболезненна).
+    relay_echo: std.AutoHashMapUnmanaged(*tcp.TcpConn, relay_mod.Reflexive) = .empty,
+    /// Транспортный путь relay-сессии (cid): локальный адрес relay-конна
+    /// + наши разосланные кандидаты + кандидаты пира (PUNCH_CANDIDATES).
+    /// Снимается при бинде прямого пути (punched/LAN) и в onClosed.
+    punch_routes: std.AutoHashMapUnmanaged(i64, PunchRoute) = .empty,
+    /// Идущие punch-потоки (cid): дедуп запусков.
+    punch_runs: std.AutoHashMapUnmanaged(i64, void) = .empty,
+
     /// Тесты: подавить сетевые потоки из loadContacts (relay-присутствие,
     /// server-присутствие) — поток с dial'ами переживёт приложение из
     /// tmp-каталога. Продуктовый код флаг не устанавливает.
@@ -398,6 +414,20 @@ pub const App = struct {
             connSetLocked(self, cid, .joining, .none, null);
         } else {
             connSetLocked(self, cid, .online, .none, null);
+        }
+        // NAT-punch (2.9.0): путь сессии. Пробитый/LAN-конн — снимаем
+        // punch-маршрут (даунгрейда на relay не бывает) и рапортуем
+        // ROUTE_STATE; relay-конн — рапортуем relay и рассылаем пир
+        // PUNCH_CANDIDATES (внутри аутентифицированной сессии).
+        if (sc.punched) {
+            _ = self.punch_routes.remove(cid);
+            evRouteState(self, cid, .direct_punched);
+        } else if (sc.lan_dial) {
+            _ = self.punch_routes.remove(cid);
+            evRouteState(self, cid, .lan);
+        } else if (sc.relay_tc) |tc| {
+            evRouteState(self, cid, .relay);
+            sendPunchCandidatesLocked(self, cid, s, sc, tc);
         }
         bumpContactLocked(self, cid);
     }
@@ -1387,7 +1417,60 @@ pub const SessCtx = struct {
     s: ?*session_mod.Session = null,
     /// Учитывается в App.pending_sessions до успешного JOIN или закрытия.
     pending_counted: bool = false,
+    /// Relay-конн, из которого поднята сессия (null — прямой путь:
+    /// punched/LAN/autodial). В bindSessionLocked по нему берётся
+    /// рефлексивный адрес и рассылаются PUNCH_CANDIDATES.
+    relay_tc: ?*tcp.TcpConn = null,
+    /// Конн пробит NAT-punch (simultaneous open): бинд рапортует
+    /// ROUTE_STATE=direct_punched и снимает punch-маршрут.
+    punched: bool = false,
+    /// Прямой dial по host-кандидату пира (punch-воркер, инициатор):
+    /// бинд рапортует ROUTE_STATE=lan.
+    lan_dial: bool = false,
 };
+
+/// Тип прямого пути для establishSessionOnConn/handleAcceptedConn:
+/// определяет маршрутизационные поля SessCtx (NAT-punch, 2.9.0).
+pub const RouteKind = enum {
+    /// Сессия поднимается на relay-конне: relay_tc заполняется, бинд
+    /// разошлёт PUNCH_CANDIDATES и рапортует ROUTE_STATE=relay.
+    relay,
+    /// Пробитый NAT-punch конн (simultaneous open).
+    punched,
+    /// Прямой dial по host-кандидату (punch-воркер инициатора).
+    lan_dial,
+    /// Прочий прямой путь (TCP-accept листенера, autodial, discovery):
+    /// punch не участвует, событий маршрута нет.
+    direct,
+};
+
+/// Транспортный путь relay-сессии (NAT-punch, 2.9.0). Заполняется в
+/// bindSessionLocked (наши адреса + факт рассылки), пополняется
+/// кандидатами пира в envIn; punch-воркер читает снимком. Снятие —
+/// бинд прямого пути либо onClosed relay-сессии.
+pub const PunchRoute = struct {
+    /// Локальный адрес relay-конна текущей сессии: punch-сокеты биндятся
+    /// на него же (переиспользование NAT-маппинга, cone NAT).
+    local_ip: [4]u8,
+    local_port: u16,
+    /// Наш рефлексивный кандидат (echo relay); port == 0 — relay без
+    /// echo (старый): simultaneous open невозможен, только host-кандидаты.
+    reflexive: relay_mod.Reflexive,
+    /// Кандидаты пира (PUNCH_CANDIDATES из envIn).
+    peer: envelope.Punch,
+};
+
+/// Лимит карты relay_echo (ключ — протухающие указатели коннов,
+/// значения 8 байт): при заполнении карта очищается целиком.
+const relay_echo_cap: usize = 64;
+
+/// Пауза между циклами punch-воркера (мс): relay-сессия живёт, пробитие
+/// не сложилось (symmetric NAT/фильтр) — повтор с умеренным ритмом.
+const punch_retry_period_ms: u64 = 5000;
+
+/// Таймаут host-dial из punch-воркера (мс): LAN-путь живой отвечает
+/// быстро, дольше ждать бессмысленно (simultaneous open — следом).
+const punch_host_dial_ms: u32 = 700;
 
 fn envIn(ctx: *anyopaque, env: envelope.Envelope) void {
     const sc: *SessCtx = @ptrCast(@alignCast(ctx));
@@ -1400,6 +1483,18 @@ fn envIn(ctx: *anyopaque, env: envelope.Envelope) void {
     const now = app.nowMs();
     app.lock();
     defer app.unlock();
+    // NAT-punch (2.9.0): кандидаты пира — до движка (движку кадр
+    // безразличен, exhaustiveness закрыт пустой веткой); старые ядра
+    // кадр просто пропускают — их маршрут остаётся на relay
+    switch (env) {
+        .punch => |p| {
+            app.eng.markSeen(sc.cid, now);
+            if (app.hb.getPtr(sc.cid)) |st| st.onInbound(now);
+            handlePunchInLocked(app, sc.cid, p);
+            return;
+        },
+        else => {},
+    }
     app.eng.markSeen(sc.cid, now);
     if (app.hb.getPtr(sc.cid)) |st| {
         st.onInbound(now);
@@ -1587,6 +1682,9 @@ fn onClosed(ctx: *anyopaque) void {
     if (cur != s) return; // уже заменена новой сессией — не трогаем
     app.eng.retireSession(sc.cid, s);
     _ = app.sess_ctx.remove(sc.cid);
+    // NAT-punch: relay-путь умер — кандидаты и запуск пробития сняты
+    // (воркер сам выйдет по отсутствию маршрута)
+    _ = app.punch_routes.remove(sc.cid);
     // неподтверждённые партии синхронизации — назад в очередь устройства
     app.sync.onSessionDown(sc.cid);
     if (app.eng.findIndex(sc.cid)) |idx| {
@@ -2479,13 +2577,13 @@ fn autoAcceptLoop(app: *App, listener: *tcp.Listener) void {
                 continue;
             };
         }
-        handleAcceptedConn(app, tc);
+        handleAcceptedConn(app, tc, .direct);
     }
 }
 
 /// Обработка входящего коннекта (TCP-accept ИЛИ спаренный релей-коннект):
 /// fake-TLS обёртка -> m1 -> опознание контакта / pending-join по инвайту.
-fn handleAcceptedConn(app: *App, tc: *tcp.TcpConn) void {
+fn handleAcceptedConn(app: *App, tc: *tcp.TcpConn, route: RouteKind) void {
     // весь провод завёрнут в fake-TLS: обёртку ставим ДО чтения m1,
     // кадр m1 [len u16][64] приходит внутри записей application_data
     const raw = faketlsServer(app, tc) catch {
@@ -2540,7 +2638,15 @@ fn handleAcceptedConn(app: *App, tc: *tcp.TcpConn) void {
                 tc.deinit();
                 return;
             };
-            sc.* = .{ .app = app, .cid = -1, .s = null, .pending_counted = true };
+            sc.* = .{
+                .app = app,
+                .cid = -1,
+                .s = null,
+                .pending_counted = true,
+                .relay_tc = if (route == .relay) tc else null,
+                .punched = route == .punched,
+                .lan_dial = route == .lan_dial,
+            };
             const sp = session_mod.Session.establishPending(
                 app.alloc,
                 raw,
@@ -2576,7 +2682,13 @@ fn handleAcceptedConn(app: *App, tc: *tcp.TcpConn) void {
         tc.deinit();
         return;
     };
-    sc.* = .{ .app = app, .cid = found_cid };
+    sc.* = .{
+        .app = app,
+        .cid = found_cid,
+        .relay_tc = if (route == .relay) tc else null,
+        .punched = route == .punched,
+        .lan_dial = route == .lan_dial,
+    };
     const s = session_mod.Session.establishIdentified(
         app.alloc,
         raw,
@@ -2670,7 +2782,235 @@ fn startServerPresenceForAllLocked(app: *App) void {
     }
 }
 
-/// Поток релей-присутствия контакта: пока контакт жив и не заблокирован,
+// ---------------------------------------------------------- NAT-punch (2.9.0)
+
+/// ROUTE_STATE: транспорт сессии сменился (relay -> пробитый прямой
+/// путь). ВЫЗЫВАТЬ ПОД app.mu (как все evXxx).
+fn evRouteState(app: *App, cid: i64, route: api.RouteState) void {
+    var w = api.Writer.init(app.alloc);
+    defer w.deinit();
+    w.putU32(@intCast(cid)) catch return;
+    w.putU8(@backingInt(route)) catch return;
+    api_srv.fanoutEventLocked(app, .ROUTE_STATE, w.items());
+}
+
+/// Сторона-инициатор прямого пути для cid (правило то же, что в
+/// relayPresenceLoop: меньший bundle инициирует; устройство-линк —
+/// держатель). ВЫЗЫВАТЬСЯ ПОД app.mu.
+fn punchAmInitiatorLocked(app: *App, cid: i64) bool {
+    const idx = app.eng.findIndex(cid) orelse return false;
+    const c = &app.eng.contacts.items[idx];
+    const my_bundle = app.id.bundle();
+    if (std.mem.eql(u8, &c.bundle, &my_bundle))
+        return c.dev_role == dev_role_holder;
+    return std.mem.order(u8, &my_bundle, &c.bundle) == .lt;
+}
+
+/// Рассылка своих кандидатов прямого пути пир и запись punch-маршрута.
+/// ВЫЗЫВАЕТСЯ ПОД app.mu из bindSessionLocked (relay-сессия только что
+/// аутентифицирована — кадр уходит внутри AEAD, подмена невозможна).
+fn sendPunchCandidatesLocked(
+    app: *App,
+    cid: i64,
+    s: *session_mod.Session,
+    sc: *SessCtx,
+    tc: *tcp.TcpConn,
+) void {
+    // выключен конфигом или тестовым режимом — маршрута нет, кадра нет
+    if (!app.cfg.nat_punch or app.no_network) return;
+    // локальный адрес relay-конна (fd жив: сессия поднята на нём)
+    const la = sysfd.localAddrIn(tc.fd) orelse return;
+    const lp = sysfd.ipPortOf(la);
+    // локальные адреса интерфейсов (LAN host-кандидаты) — системные
+    // вызовы БЕЗ app.mu недопустимы здесь (бindx под локом в этом
+    // файле обычен: flushOutbox/sendProfile пишут транспорт так же);
+    // enumerateLocalV4 только читает сокеты-таблицу, аллокаций нет
+    var ips: [endpoints_mod.max_endpoints][4]u8 = undefined;
+    const n_ips = endpoints_mod.enumerateLocalV4(&ips) catch 0;
+    // сборка кадра: reflexive (echo relay, если был) + host-кандидаты
+    var p: envelope.Punch = .{
+        .count = 0,
+        .types = @splat(0),
+        .ips = @splat(@splat(0)),
+        .ports = @splat(0),
+    };
+    var reflexive = relay_mod.Reflexive{ .ip = .{ 0, 0, 0, 0 }, .port = 0 };
+    if (app.relay_echo.get(tc)) |refl| {
+        if (refl.port != 0) {
+            reflexive = refl;
+            if (p.count < envelope.max_punch_candidates) {
+                p.types[p.count] = envelope.punch_reflexive;
+                p.ips[p.count] = refl.ip;
+                p.ports[p.count] = refl.port;
+                p.count += 1;
+            }
+        }
+    }
+    for (ips[0..n_ips]) |ip| {
+        if (p.count >= envelope.max_punch_candidates) break;
+        p.types[p.count] = envelope.punch_host;
+        p.ips[p.count] = ip;
+        p.ports[p.count] = app.listen_port;
+        p.count += 1;
+    }
+    if (p.count == 0) return; // нечего объявлять — маршрута тоже нет
+    // запись маршрута ДО отправки: ответ пира может прийти мгновенно
+    app.punch_routes.put(app.alloc, cid, .{
+        .local_ip = lp.ip,
+        .local_port = lp.port,
+        .reflexive = reflexive,
+        .peer = .{ .count = 0, .types = @splat(0), .ips = @splat(@splat(0)), .ports = @splat(0) },
+    }) catch return;
+    s.sendEnvelope(.{ .punch = p }) catch {};
+    _ = sc; // контекст не нужен: маршрут записан по cid
+}
+
+/// Вход PUNCH_CANDIDATES от пира (envIn, ПОД app.mu, cid привязан):
+/// запомнить кандидаты и запустить пробитие, если всё сходится.
+fn handlePunchInLocked(app: *App, cid: i64, p: envelope.Punch) void {
+    const route = app.punch_routes.getPtr(cid) orelse return; // не relay-путь
+    route.peer = p;
+    maybeStartPunchLocked(app, cid);
+}
+
+/// Запуск punch-воркера (дедуп punch_runs). ВЫЗЫВАЕТСЯ ПОД app.mu;
+/// поток сам берёт лок. Условия: конфиг включён, маршрут жив,
+/// у пира есть кандидаты.
+fn maybeStartPunchLocked(app: *App, cid: i64) void {
+    if (app.no_network) return;
+    if (!app.cfg.nat_punch) return;
+    if (app.punch_runs.contains(cid)) return;
+    const route = app.punch_routes.getPtr(cid) orelse return;
+    if (route.peer.count == 0) return;
+    if (app.punch_runs.put(app.alloc, cid, {})) |_| {
+        const th = std.Thread.spawn(.{}, punchRun, .{ app, cid }) catch {
+            _ = app.punch_runs.remove(cid);
+            return;
+        };
+        th.detach();
+    } else |_| {}
+}
+
+/// Запомнить рефлексивный адрес relay-конна (NAT-punch). ПОД app.mu;
+/// карта ограничена relay_echo_cap (ключи протухают с закрытием коннов,
+/// значения 8 байт — очистка целиком безболезненна).
+fn rememberRelayEchoLocked(app: *App, tc: *tcp.TcpConn, refl: relay_mod.Reflexive) void {
+    if (refl.port == 0) return; // relay без echo (старый): NAT-punch недоступен
+    if (app.relay_echo.count() >= relay_echo_cap) app.relay_echo.clearRetainingCapacity();
+    app.relay_echo.put(app.alloc, tc, refl) catch {};
+}
+
+/// Снимок задания punch-воркера (копируется ПОД локом одним куском).
+const PunchJob = struct {
+    local_ip: [4]u8,
+    local_port: u16,
+    peer: envelope.Punch,
+    me_initiator: bool,
+};
+
+/// Воркер NAT-punch: host-dial (инициатор) + simultaneous open по
+/// рефлексивным кандидатам пира из ТОГО ЖЕ локального адреса:порта,
+/// что relay-конн (SO_REUSEADDR; NAT переиспользует маппинг — cone NAT).
+/// Успех — прямой конн на смену relay-сессии (establish/handleAccepted
+/// по роли); неудача (symmetric NAT/фильтр) — relay остаётся, повтор
+/// с ритмом punch_retry_period_ms. Выход: путь сменился, конфиг
+/// выключен, контакт удалён, демон останавливается.
+fn punchRun(app: *App, cid: i64) void {
+    defer {
+        app.lock();
+        defer app.unlock();
+        _ = app.punch_runs.remove(cid);
+    }
+    while (app.running) {
+        var job: PunchJob = undefined;
+        {
+            app.lock();
+            defer app.unlock();
+            if (!app.cfg.nat_punch) return;
+            const route = app.punch_routes.get(cid) orelse return; // путь сменился/умер
+            if (app.eng.findIndex(cid) == null) return; // контакт удалён
+            if (!app.eng.sessions.contains(cid)) return; // relay-сессия умерла
+            job = .{
+                .local_ip = route.local_ip,
+                .local_port = route.local_port,
+                .peer = route.peer,
+                .me_initiator = punchAmInitiatorLocked(app, cid),
+            };
+        }
+        // 1) host-кандидаты пира (только инициатор): прямой dial в его
+        // листенер (LAN); респондер принимает штатным листенером
+        if (job.me_initiator) {
+            for (0..job.peer.count) |i| {
+                if (job.peer.types[i] != envelope.punch_host) continue;
+                var ab: [endpoints_mod.host_max + 8]u8 = undefined;
+                const ip = job.peer.ips[i];
+                const addr = std.fmt.bufPrint(&ab, "{d}.{d}.{d}.{d}:{d}", .{
+                    ip[0], ip[1], ip[2], ip[3], job.peer.ports[i],
+                }) catch continue;
+                const tc = dialDeadline(app, addr, punch_host_dial_ms) catch continue;
+                adoptPunchedConn(app, cid, tc, .lan_dial);
+                return;
+            }
+        }
+        // 2) simultaneous open по рефлексивным кандидатам пира
+        var targets: [punch.punch_max_targets]punch.Target = undefined;
+        var n_targets: usize = 0;
+        for (0..job.peer.count) |i| {
+            if (job.peer.types[i] != envelope.punch_reflexive) continue;
+            if (n_targets >= targets.len) break;
+            targets[n_targets] = .{ .ip = job.peer.ips[i], .port = job.peer.ports[i] };
+            n_targets += 1;
+        }
+        if (n_targets > 0) {
+            if (punch.dialSimultaneous(app.alloc, targets[0..n_targets], .{
+                .local_ip = job.local_ip,
+                .local_port = job.local_port,
+            })) |tc| {
+                adoptPunchedConn(app, cid, tc, .punched);
+                return;
+            } else |_| {}
+        }
+        // окно закрыто без пробития: relay работает, повтор позже
+        sysfd.sleepMs(punch_retry_period_ms);
+    }
+}
+
+/// Принять пробитый/прямой конн: поднять сессию по роли (инициатор —
+/// establishSessionOnConn, респондер — handleAcceptedConn ждёт m1).
+/// Роли как в relayPresenceLoop: пробитый конн симметричен, протокольная
+/// роль выбирается правилом bundle. Для LAN host-dial мы всегда
+/// инициатор (это мы дозвонились в листенер пира).
+fn adoptPunchedConn(app: *App, cid: i64, tc: *tcp.TcpConn, kind: RouteKind) void {
+    {
+        app.lock();
+        defer app.unlock();
+        // контакт мог умереть, пока пробивали
+        if (app.eng.findIndex(cid) == null) {
+            tc.deinit();
+            app.alloc.destroy(tc);
+            return;
+        }
+        app.raw_conns.append(app.alloc, tc) catch {
+            tc.deinit();
+            app.alloc.destroy(tc);
+            return;
+        };
+    }
+    const me_initiator = blk: {
+        app.lock();
+        defer app.unlock();
+        break :blk punchAmInitiatorLocked(app, cid);
+    };
+    if (kind == .lan_dial or me_initiator) {
+        // host-dial: инициатор по определению; punched: инициатор по bundle
+        establishSessionOnConn(app, cid, tc, kind) catch {
+            // рукопожатие не сошлось: конн закрыт внутри, relay жив
+        };
+    } else {
+        handleAcceptedConn(app, tc, kind);
+    }
+}
+
 /// держим регистрацию слота marker-ом из ДОЛГОСРОЧНОГО контакт-секрета
 /// (identity.pairSecret -> relay.presenceMarker): пир появляется в релее —
 /// спариваемся и поднимаем сессию БЕЗ нового инвайта. Инициатор
@@ -2739,8 +3079,11 @@ fn relayPresenceLoop(app: *App, cid: i64, from_server: bool) void {
             }
         }
         const dial_addr: []const u8 = if (from_server) sb[0..sb_len] else addr_copy;
-        // dial блокируется в релее до прихода пира (наш marker — слот)
-        const tc = stille_messenger.net.relay.dialMarker(app.alloc, dial_addr, marker) catch {
+        // dial блокируется в релее до прихода пира (наш marker — слот);
+        // echo-запрос заодно: relay вернёт наш рефлексивный адрес
+        // (NAT-punch, 2.9.0)
+        var refl = relay_mod.Reflexive{ .ip = .{ 0, 0, 0, 0 }, .port = 0 };
+        const tc = relay_mod.dialMarkerEcho(app.alloc, dial_addr, marker, &refl) catch {
             sysfd.sleepMs(2000);
             continue;
         };
@@ -2752,12 +3095,13 @@ fn relayPresenceLoop(app: *App, cid: i64, from_server: bool) void {
                 sysfd.sleepMs(2000);
                 continue;
             };
+            rememberRelayEchoLocked(app, tc, refl);
         }
         if (me_initiator) {
-            establishSessionOnConn(app, cid, tc) catch {};
+            establishSessionOnConn(app, cid, tc, .relay) catch {};
         } else {
             // ждём m1 от пира: как TCP-accept
-            handleAcceptedConn(app, tc);
+            handleAcceptedConn(app, tc, .relay);
         }
         // сессия поднята или упала — цикл проверит и повторит регистрацию
         sysfd.sleepMs(1000);
@@ -2813,7 +3157,8 @@ fn relayLinkerLoop(app: *App, secret: [16]u8, addr: []const u8) void {
             }
             if (!alive) return;
         }
-        const tc = stille_messenger.net.relay.dial(app.alloc, addr_copy, secret_copy) catch {
+        var refl = relay_mod.Reflexive{ .ip = .{ 0, 0, 0, 0 }, .port = 0 };
+        const tc = relay_mod.dialEcho(app.alloc, addr_copy, secret_copy, &refl) catch {
             sysfd.sleepMs(2000);
             continue;
         };
@@ -2825,9 +3170,10 @@ fn relayLinkerLoop(app: *App, secret: [16]u8, addr: []const u8) void {
                 sysfd.sleepMs(2000);
                 continue;
             };
+            rememberRelayEchoLocked(app, tc, refl);
         }
         // спарено: входящий пир (m1+JOIN) — как TCP-accept
-        handleAcceptedConn(app, tc);
+        handleAcceptedConn(app, tc, .relay);
         // соединение отработало/оборвалось: инвайт ещё жив -> повтор
     }
 }
@@ -2844,7 +3190,8 @@ fn profileRelayLoop(app: *App, addr_copy: []u8) void {
         // протухнет по таймауту регистрации)
         var secret = profileSecret(app.id, app.profile_epoch);
         defer std.crypto.secureZero(u8, &secret);
-        const tc = stille_messenger.net.relay.dial(app.alloc, addr_copy, secret) catch {
+        var refl = relay_mod.Reflexive{ .ip = .{ 0, 0, 0, 0 }, .port = 0 };
+        const tc = relay_mod.dialEcho(app.alloc, addr_copy, secret, &refl) catch {
             sysfd.sleepMs(2000);
             continue;
         };
@@ -2856,8 +3203,9 @@ fn profileRelayLoop(app: *App, addr_copy: []u8) void {
                 sysfd.sleepMs(2000);
                 continue;
             };
+            rememberRelayEchoLocked(app, tc, refl);
         }
-        handleAcceptedConn(app, tc);
+        handleAcceptedConn(app, tc, .relay);
     }
 }
 
@@ -3266,8 +3614,9 @@ fn establishToRelay(app: *App, addr: []const u8, opts: EstablishOpts) !void {
             tor_len = ta.len;
         }
     }
+    var relay_refl = relay_mod.Reflexive{ .ip = .{ 0, 0, 0, 0 }, .port = 0 };
     const tc = if (opts.relay_secret) |sec|
-        stille_messenger.net.relay.dial(app.alloc, addr, sec) catch return error.NoRelay
+        relay_mod.dialEcho(app.alloc, addr, sec, &relay_refl) catch return error.NoRelay
     else if (opts.dial_timeout_ms > 0)
         try dialDeadline(app, addr, opts.dial_timeout_ms)
     else if (tor_len > 0)
@@ -3281,27 +3630,34 @@ fn establishToRelay(app: *App, addr: []const u8, opts: EstablishOpts) !void {
         app.lock();
         defer app.unlock();
         try app.raw_conns.append(app.alloc, tc);
+        if (opts.relay_secret != null) rememberRelayEchoLocked(app, tc, relay_refl);
         // транспорт поднят: стадия handshaking (метка поколения попытки)
         if (opts.gen) |g| connSetLocked(app, opts.cid, .handshaking, .none, g);
     }
     if (opts.role != .initiator) {
         // responder через релей: ждём m1 как accept
-        handleAcceptedConn(app, tc);
+        handleAcceptedConn(app, tc, if (opts.relay_secret != null) .relay else .direct);
         return;
     }
-    try establishSessionOnConn(app, opts.cid, tc);
+    try establishSessionOnConn(app, opts.cid, tc, if (opts.relay_secret != null) .relay else .direct);
 }
 
 /// Поднять сессию ИНИЦИАТОРОМ на уже подключённом конне (relay-присутствие
 /// и establishToRelay): fake-TLS client (настраивается), рукопожатие, bind.
-fn establishSessionOnConn(app: *App, cid: i64, tc: *tcp.TcpConn) !void {
+fn establishSessionOnConn(app: *App, cid: i64, tc: *tcp.TcpConn, route: RouteKind) !void {
     const idx: usize = @intCast(cid - 1);
     if (idx >= app.eng.contacts.items.len) return error.NoContact;
     const bundle = app.eng.contacts.items[idx].bundle;
     var eph: [32]u8 = undefined;
     app.io.random(&eph);
     const sc = try app.alloc.create(SessCtx);
-    sc.* = .{ .app = app, .cid = cid };
+    sc.* = .{
+        .app = app,
+        .cid = cid,
+        .relay_tc = if (route == .relay) tc else null,
+        .punched = route == .punched,
+        .lan_dial = route == .lan_dial,
+    };
     // транспортная маскировка под TLS (dialer = client-роль fake-TLS);
     // выключена — сырой TCP поверх tc (обфускация и AEAD остаются)
     var fake_tls: bool = false;
@@ -5928,6 +6284,10 @@ pub fn main(start: std.process.Init) !void {
         app.client_recs.deinit(app.alloc);
         app.client_macs.deinit(app.alloc);
         app.server_runs.deinit(app.alloc);
+        // NAT-punch (2.9.0)
+        app.relay_echo.deinit(app.alloc);
+        app.punch_routes.deinit(app.alloc);
+        app.punch_runs.deinit(app.alloc);
         // планировщик подключений (2.7.0): очередь/состояния/ожидания эха
         app.conn_work.deinit(app.alloc);
         app.conn_inflight.deinit(app.alloc);
@@ -7010,4 +7370,110 @@ test "profile code: REGENERATE — слитый код умирает, данн�
     // кривой payload → BAD_FRAME
     const bad_payload = [_]u8{1};
     try t.expectEqual(api.Status.BAD_FRAME, apiRegenerateProfileCode(&rig.app, &bad_payload, &w));
+}
+
+// ------------------------------------------------------- NAT-punch (2.9.0)
+
+/// Мини-приложение без сети (no_network): карта punch-маршрутов,
+/// правило инициатора, приём PUNCH_CANDIDATES. Транспортный уровень
+/// (dialMarkerEcho, simultaneous open, вторая сессия поверх пробитого
+/// конна) покрыт интеграционным тестом tests/integration.zig.
+const PunchRig = struct {
+    app: App,
+    id: identity.Identity,
+    eng: engine_mod.Engine,
+
+    fn init(alloc: std.mem.Allocator, io: std.Io) !*PunchRig {
+        const rig = try alloc.create(PunchRig);
+        errdefer alloc.destroy(rig);
+        const seed: [32]u8 = @splat(0x6B);
+        rig.* = .{ .app = undefined, .id = undefined, .eng = undefined };
+        rig.id = try identity.Identity.fromSeed(seed);
+        errdefer rig.id.deinit();
+        rig.eng = engine_mod.Engine.init(alloc, io, rig.id, .{ .ctx = undefined });
+        errdefer rig.eng.deinit();
+        rig.app = .{
+            .alloc = alloc,
+            .io = io,
+            .id = &rig.id,
+            .eng = &rig.eng,
+            .hb = std.AutoHashMap(i64, hb.State).init(alloc),
+            .sess_ctx = std.AutoHashMap(i64, *SessCtx).init(alloc),
+            .no_network = true,
+        };
+        return rig;
+    }
+
+    fn deinit(self: *PunchRig, alloc: std.mem.Allocator) void {
+        self.app.hb.deinit();
+        self.app.sess_ctx.deinit();
+        self.app.punch_routes.deinit(alloc);
+        self.app.punch_runs.deinit(alloc);
+        self.eng.deinit();
+        self.id.deinit();
+        alloc.destroy(self);
+    }
+};
+
+test "NAT-punch: PUNCH_CANDIDATES пира пишутся в маршрут, воркер не стартует (no_network)" {
+    const t = std.testing;
+    const alloc = t.allocator;
+    const rig = try PunchRig.init(alloc, t.io);
+    defer rig.deinit(alloc);
+    const app = &rig.app;
+    var id_b = try identity.Identity.fromSeed(@splat(0x6C));
+    defer id_b.deinit();
+    _ = try rig.eng.addContact("b", id_b.bundle());
+    // маршрут relay-сессии (как его пишет sendPunchCandidatesLocked)
+    try app.punch_routes.put(alloc, 1, .{
+        .local_ip = .{ 127, 0, 0, 1 },
+        .local_port = 40001,
+        .reflexive = .{ .ip = .{ 203, 0, 113, 7 }, .port = 40123 },
+        .peer = .{ .count = 0, .types = @splat(0), .ips = @splat(@splat(0)), .ports = @splat(0) },
+    });
+    // кадр пира: reflexive + host
+    var p: envelope.Punch = .{
+        .count = 2,
+        .types = .{ envelope.punch_reflexive, envelope.punch_host, 0, 0, 0, 0, 0, 0 },
+        .ips = .{ .{ 198, 51, 100, 9 }, .{ 192, 168, 1, 42 }, .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 } },
+        .ports = .{ 51234, 7777, 0, 0, 0, 0, 0, 0 },
+    };
+    handlePunchInLocked(app, 1, p);
+    const route = app.punch_routes.get(1) orelse return error.NoRoute;
+    try t.expectEqual(@as(u8, 2), route.peer.count);
+    try t.expectEqual(envelope.punch_reflexive, route.peer.types[0]);
+    try t.expectEqualSlices(u8, &p.ips[0], &route.peer.ips[0]);
+    try t.expectEqual(@as(u16, 51234), route.peer.ports[0]);
+    // наши поля маршрута не тронуты кадром пира
+    try t.expectEqual(@as(u16, 40001), route.local_port);
+    try t.expectEqual(@as(u16, 40123), route.reflexive.port);
+    // no_network: воркер не стартует (запуск — только сетевому демону)
+    try t.expect(!app.punch_runs.contains(1));
+    // без маршрута (прямой путь) кадр игнорируется молча
+    handlePunchInLocked(app, 2, p);
+    try t.expect(!app.punch_routes.contains(2));
+}
+
+test "NAT-punch: правило инициатора — меньший bundle, устройство-линк — держатель" {
+    const t = std.testing;
+    const alloc = t.allocator;
+    const rig = try PunchRig.init(alloc, t.io);
+    defer rig.deinit(alloc);
+    const app = &rig.app;
+    // bundle меньше нашего — мы инициатор; больше — респондер
+    const smaller: [64]u8 = @splat(0x01);
+    const bigger: [64]u8 = @splat(0xFE);
+    _ = try rig.eng.addContact("small", smaller);
+    _ = try rig.eng.addContact("big", bigger);
+    try t.expect(!punchAmInitiatorLocked(app, 1)); // bundle пира меньше нашего
+    try t.expect(punchAmInitiatorLocked(app, 2)); // bundle пира больше нашего
+    // устройство-линк (bundle равны нашему): инициатор — держатель кода
+    const my_bundle = rig.id.bundle();
+    _ = try rig.eng.addContact("twin", my_bundle);
+    rig.eng.contacts.items[2].dev_role = dev_role_holder;
+    try t.expect(punchAmInitiatorLocked(app, 3));
+    rig.eng.contacts.items[2].dev_role = 1; // не держатель — ждём
+    try t.expect(!punchAmInitiatorLocked(app, 3));
+    // контакт не существует: false, не падаем
+    try t.expect(!punchAmInitiatorLocked(app, 99));
 }
