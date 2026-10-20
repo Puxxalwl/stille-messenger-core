@@ -23,6 +23,10 @@
 //!   CONTACT_CARD  0x43: name: u8 + байты (≤ 32), bundle: [64]u8,
 //!                       addr: u16 + байты (≤ 64, пусто = неизвестен)
 //!   RATCHET_KEY   0x44: epoch: u16, dh_pub: [32]u8 (PCS-ротация рэтчета)
+//!   PUNCH_CANDIDATES 0x47: count u8 (1..8), записи × {type u8 (0 host /
+//!                       1 reflexive), ip 4 октета, port u16} — кандидаты
+//!                       прямого пути отправителя (NAT-punch; обмен внутри
+//!                       аутентифицированной сессии, старые ядра пропускают)
 //!   AVATAR        0x50: avatar_id: [16]u8, data: u16 + байты (≤ 16000)
 //!   AVATAR_ACK   0x51: avatar_id: [16]u8
 //!   AVATAR_REQ   0x52: avatar_id: [16]u8
@@ -78,6 +82,13 @@ pub const Tag = enum(u8) {
     sync = 0x45,
     /// SYNC_ACK: партия применена (или осознанно пропущена) получателем.
     sync_ack = 0x46,
+    /// PUNCH_CANDIDATES: кандидаты прямого пути отправителя (NAT-punch,
+    /// 2.9.0). Обмен идёт внутри аутентифицированной AEAD-сессии —
+    /// подмена/подсовывание кандидатов извне невозможно, replay
+    /// отсечён счётчиками сессии. Старые ядра кадр отбрасывают
+    /// (неизвестный тег), новый прямой путь у них не поднимается —
+    /// соединение остаётся на relay.
+    punch = 0x47,
     file_meta = 0x60,
     file_data = 0x61,
     /// FILE_ACK: сколько чанков файла уже принято (докачка с этой позиции).
@@ -554,6 +565,8 @@ pub const Envelope = union(enum) {
     sync: Sync,
     /// SYNC_ACK (0x46).
     sync_ack: SyncAck,
+    /// PUNCH_CANDIDATES (0x47).
+    punch: Punch,
     /// AVATAR (0x50).
     avatar: Avatar,
     /// AVATAR_ACK (0x51).
@@ -566,9 +579,31 @@ pub const Envelope = union(enum) {
     file_ack: FileAck,
 };
 
-/// Ошибки кодирования: мал буфер, payload превышает максимум протокола
-/// либо хвост entities не проходит валидацию.
-pub const EncodeError = codec.Writer.Error || error{ TooBig, BadEntities };
+/// Максимум кандидатов в PUNCH_CANDIDATES (бюджет кадра и движка).
+pub const max_punch_candidates: usize = 8;
+/// Тип записи кандидата: host — LAN ip:port листенера отправителя.
+pub const punch_host: u8 = 0;
+/// Тип записи кандидата: reflexive — публичный ip:port, каким relay
+/// видит подключение отправителя (маппинг его NAT).
+pub const punch_reflexive: u8 = 1;
+
+/// PUNCH_CANDIDATES: фиксированный массив кандидатов + счётчик
+/// (безаллокационный decode: срезов нет, значения копируются).
+pub const Punch = struct {
+    /// Число заполненных записей (1..max_punch_candidates).
+    count: u8,
+    /// Тип каждой записи: punch_host / punch_reflexive.
+    types: [max_punch_candidates]u8,
+    /// IPv4-октеты (сетевой порядок в памяти).
+    ips: [max_punch_candidates][4]u8,
+    /// Порты в host-порядке.
+    ports: [max_punch_candidates]u16,
+};
+
+/// Ошибки кодирования: мал буфер, payload превышает максимум протокола,
+/// хвост entities не проходит валидацию либо поля кадра вне лимитов
+/// (PUNCH count).
+pub const EncodeError = codec.Writer.Error || error{ TooBig, BadEntities, BadLen };
 
 /// Точная длина закодированного кадра `e` в байтах — для подбора буфера.
 pub fn encodedLen(e: Envelope) usize {
@@ -586,6 +621,7 @@ pub fn encodedLen(e: Envelope) usize {
         .ratchet_key => 1 + 2 + 32,
         .sync => |m| 1 + 4 + 1 + m.recs.len,
         .sync_ack => 1 + 4,
+        .punch => |m| 1 + 1 + @as(usize, m.count) * (1 + 4 + 2),
         .avatar => |m| 1 + id_len + 2 + m.data.len,
         .file_meta => |m| 1 + id_len + 1 + m.name.len + 4 + 32,
         .file_data => |m| 1 + id_len + 4 + 2 + m.data.len,
@@ -713,6 +749,16 @@ pub fn encode(buf: []u8, e: Envelope) EncodeError![]const u8 {
         .sync_ack => |m| {
             try w.put(@backingInt(Tag.sync_ack));
             try w.putInt(u32, m.batch_id);
+        },
+        .punch => |m| {
+            if (m.count == 0 or m.count > max_punch_candidates) return error.BadLen;
+            try w.put(@backingInt(Tag.punch));
+            try w.put(m.count);
+            for (0..m.count) |i| {
+                try w.put(m.types[i]);
+                try w.putFixed(&m.ips[i]);
+                try w.putInt(u16, m.ports[i]);
+            }
         },
         .avatar => |m| {
             if (m.data.len > max_avatar_data) return error.TooBig;
@@ -896,6 +942,20 @@ pub fn decode(bytes: []const u8) DecodeError!Envelope {
         @backingInt(Tag.sync_ack) => .{ .sync_ack = .{
             .batch_id = try r.getInt(u32),
         } },
+        @backingInt(Tag.punch) => blk: {
+            var p: Punch = .{ .count = 0, .types = @splat(0), .ips = @splat(@splat(0)), .ports = @splat(0) };
+            const count = try r.getU8();
+            if (count == 0 or count > max_punch_candidates) return error.BadLen;
+            p.count = count;
+            for (0..count) |i| {
+                const ty = try r.getU8();
+                if (ty != punch_host and ty != punch_reflexive) return error.BadLen;
+                p.types[i] = ty;
+                p.ips[i] = (try r.getFixed(4))[0..4].*;
+                p.ports[i] = try r.getInt(u16);
+            }
+            break :blk .{ .punch = p };
+        },
         @backingInt(Tag.avatar) => .{ .avatar = .{
             .avatar_id = (try r.getFixed(id_len))[0..id_len].*,
             .data = blk: {
@@ -1277,6 +1337,47 @@ test "decode: неизвестный тег 0x7F -> UnknownTag" {
     try testing.expectError(error.UnknownTag, decode(&bytes));
     try testing.expectError(error.UnknownTag, decode(&[_]u8{0x7F}));
     try testing.expectError(error.UnknownTag, decode(&[_]u8{0x12})); // дырка между тегами
+}
+
+test "punch: roundtrip кандидатов + encodedLen" {
+    var p: Punch = .{
+        .count = 3,
+        .types = .{ punch_reflexive, punch_host, punch_reflexive, 0, 0, 0, 0, 0 },
+        .ips = .{ .{ 203, 0, 113, 7 }, .{ 192, 168, 1, 42 }, .{ 198, 51, 100, 9 }, .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 }, .{ 0, 0, 0, 0 } },
+        .ports = .{ 40123, 7777, 51234, 0, 0, 0, 0, 0 },
+    };
+    const want_len = 1 + 1 + 3 * (1 + 4 + 2);
+    try testing.expectEqual(want_len, encodedLen(.{ .punch = p }));
+    var buf: [max_encoded_len]u8 = undefined;
+    const wire = try encode(&buf, .{ .punch = p });
+    try testing.expectEqual(want_len, wire.len);
+    const back = try decode(wire);
+    const q = back.punch;
+    try testing.expectEqual(@as(u8, 3), q.count);
+    for (0..3) |i| {
+        try testing.expectEqual(p.types[i], q.types[i]);
+        try testing.expectEqualSlices(u8, &p.ips[i], &q.ips[i]);
+        try testing.expectEqual(p.ports[i], q.ports[i]);
+    }
+}
+
+test "punch: битые кадры -> BadLen/Truncated" {
+    // count = 0
+    try testing.expectError(error.BadLen, decode(&[_]u8{ 0x47, 0 }));
+    // count = 9 (лимит 8)
+    try testing.expectError(error.BadLen, decode(&[_]u8{ 0x47, 9 }));
+    // неизвестный тип записи (2)
+    try testing.expectError(error.BadLen, decode(&[_]u8{ 0x47, 1, 2, 10, 0, 0, 1, 0, 0 }));
+    // усечённая запись (нет порта)
+    try testing.expectError(error.Truncated, decode(&[_]u8{ 0x47, 1, 1, 10, 0, 0, 1 }));
+    // лишний байт хвоста
+    try testing.expectError(error.BadLen, decode(&[_]u8{ 0x47, 1, 1, 10, 0, 0, 1, 0, 0, 0 }));
+    // encode: count вне лимита
+    var bad: Punch = .{ .count = 9, .types = @splat(0), .ips = @splat(@splat(0)), .ports = @splat(0) };
+    var buf: [max_encoded_len]u8 = undefined;
+    try testing.expectError(error.BadLen, encode(&buf, .{ .punch = bad }));
+    bad.count = 0;
+    try testing.expectError(error.BadLen, encode(&buf, .{ .punch = bad }));
 }
 
 test "decode: любой обрезанный кадр -> Truncated" {

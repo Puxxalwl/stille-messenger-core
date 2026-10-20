@@ -662,6 +662,10 @@ pub const Engine = struct {
             // RATCHET_KEY до движка не доходит: сессия съедает его сама
             // (крипто-состояние рэтчета), но exhaustiveness требует ветку
             .ratchet_key => {},
+            // PUNCH_CANDIDATES тоже не для движка: кандидаты прямого
+            // пути обрабатывает приложение (envIn в app/main.zig, до
+            // dispatch) — движку достаточно пустой ветки
+            .punch => {},
             .text => |t| {
                 if (self.seenHas(contact_id, t.msg_id)) {
                     // повтор после реконнекта — уже доставлено; зеркальный ACK
