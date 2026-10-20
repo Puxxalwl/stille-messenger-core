@@ -44,7 +44,7 @@ pub const header_len = 16;
 /// события CONTACT_STATE_CHANGED (15), CONTACTS_CHANGED (16),
 /// CONTACT_UPSERTED (17) и статус RESYNC_REQUIRED (21). Все добавления
 /// аддитивны: старые методы/события/форматы не менялись.
-pub const api_version = [3]u16{ 2, 7, 0 };
+pub const api_version = [3]u16{ 2, 8, 0 };
 
 /// Тип кадра.
 pub const Kind = enum(u8) {
@@ -213,6 +213,17 @@ pub const Method = enum(u16) {
     /// эксклюзивный, записи старые → новые, next_* = самое старое выданное
     /// (нули = конец истории).
     GET_HISTORY_PAGE = 51,
+    /// Короткий код личности (диплинки stille.im/invite/{code}):
+    /// [cid u32 (0 = я)] → [cid u32][code str16]. Код — 9 знаков,
+    /// детерминированных из публичного bundle (без хранения), идентификатор
+    /// без секретов: сам код не даёт прав и не раскрывает bundle.
+    GENERATE_SHORT_CODE = 52,
+    /// Локальный резолв короткого кода: [code str16] →
+    /// [cid u32 (0 = я)][full_code str16] или NOT_FOUND. Код необратим
+    /// (45 бит): резолвится только то, чей bundle известен локально —
+    /// своя личность и сохранённые контакты. Для незнакомцев полный код
+    /// берёт сайт-рендеву, ядро принимает его через ACCEPT_INVITE/EX.
+    DECODE_SHORT_CODE = 53,
 };
 
 /// Коды статуса ответа (u16 на проводе, имена SCREAMING_SNAKE — контракт;
@@ -656,6 +667,9 @@ test "method ids стабильны (контракт провода)" {
     try std.testing.expectEqual(@as(u16, 49), @backingInt(Method.CREATE_INVITE_EX));
     try std.testing.expectEqual(@as(u16, 50), @backingInt(Method.GET_INVITE_STATE));
     try std.testing.expectEqual(@as(u16, 51), @backingInt(Method.GET_HISTORY_PAGE));
+    // короткие коды личности — 2.8.0
+    try std.testing.expectEqual(@as(u16, 52), @backingInt(Method.GENERATE_SHORT_CODE));
+    try std.testing.expectEqual(@as(u16, 53), @backingInt(Method.DECODE_SHORT_CODE));
     try std.testing.expectEqual(@as(u16, 15), @backingInt(Event.CONTACT_STATE_CHANGED));
     try std.testing.expectEqual(@as(u16, 16), @backingInt(Event.CONTACTS_CHANGED));
     try std.testing.expectEqual(@as(u16, 17), @backingInt(Event.CONTACT_UPSERTED));
@@ -671,7 +685,7 @@ test "method ids стабильны (контракт провода)" {
     try std.testing.expectEqual(@as(u8, 4), @backingInt(InviteState.failed));
     try std.testing.expectEqual(@as(u8, 1), @backingInt(DeltaChange.removed));
     try std.testing.expectEqual(@as(u16, 2), api_version[0]);
-    try std.testing.expectEqual(@as(u16, 7), api_version[1]);
+    try std.testing.expectEqual(@as(u16, 8), api_version[1]);
 }
 
 test "reader/writer round-trip" {

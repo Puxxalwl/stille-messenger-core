@@ -9,7 +9,10 @@ renders. The protocol is **binary**: no strings-as-protocol, no JSON, no
 human-readable text on the wire — only typed byte frames and machine-readable
 codes (methods, statuses, events).
 
-- API version: **2.7.0** (returned by `GET_VERSION`, semver).
+- API version: **2.8.0** (returned by `GET_VERSION`, semver).
+  2.8.0 adds short identity codes for deeplinks (§4.2:
+  `GENERATE_SHORT_CODE`/`DECODE_SHORT_CODE`) — pure local computation,
+  no wire or storage change.
   2.7.0 adds one-key friend-request invites, observable connection state,
   contact snapshots/deltas, endpoint discovery, hybrid invite codes and
   paged history (§4.2, §4.11), without peer wire or storage migration.
@@ -196,6 +199,33 @@ and returns `[has_more u8][next_ts u64][next_msg_id 16][count u32] × history
 entry`, newest to oldest. The next cursor is exclusive; limit 0 defaults to 30,
 maximum 200. `next_*` identifies the oldest entry in the returned page and is
 zeroed when there is no page.
+
+#### Short identity codes (API 2.8.0)
+
+`GENERATE_SHORT_CODE` (52) takes `[cid u32 (0 = my identity)]` and returns
+`[cid u32][code str16]`. The code is 9 Crockford-base32 characters
+(ambiguous I/L/O/U excluded): 8 data characters carrying the first 40 bits
+of SHA-256(bundle) plus 1 positional checksum character. It is fully
+deterministic — the same bundle always yields the same code — and requires
+no storage. The code is an **identifier, not a secret**: it grants no
+rights, does not reveal the bundle, and anyone who knows the public bundle
+can compute it. `DECODE_SHORT_CODE` normalizes input case and common
+Crockford typos (I/l→1, O→0, U→V).
+
+`DECODE_SHORT_CODE` (53) takes `[code str16]` and returns
+`[cid u32 (0 = my identity)][full_code str16]`, or `NOT_FOUND`. The full
+code is the v1 format (`shopot1.<base64url(bundle|name)>`, with `@host:port`
+when the contact has a last known address). The 9-character code is
+information-theoretically irreversible (45 bits < the 512-bit bundle):
+resolution works only for bundles the core already knows — the local
+identity and stored contacts. For strangers the deeplink site (for example
+`stille.im/invite/{code}`) holds the mapping from the short code to the
+inviter's full invite code (`CREATE_INVITE`/`CREATE_INVITE_EX`) and hands
+the full code to the client, which feeds it to `ACCEPT_INVITE`/`ACCEPT_INVITE_EX`.
+Blocked contacts resolve normally (blocking is a rendering decision).
+A 40-bit hash collision between two contacts resolves deterministically to
+the lower cid. Errors: `BAD_ARGS` (malformed code), `NO_CONTACT` (unknown
+cid in generate), `BAD_FRAME`.
 
 #### `LIST_CONTACTS` (6)
 Payload: ∅. Response:

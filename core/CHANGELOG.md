@@ -1,5 +1,40 @@
 # Changelog — stille-messenger
 
+## [Unreleased / неизданное] — короткие коды личности (API 2.8.0)
+
+- Added `GENERATE_SHORT_CODE` (52) and `DECODE_SHORT_CODE` (53) for
+  deeplinks like `stille.im/invite/{code}`: a 9-character Crockford-base32
+  code (8 data chars = first 40 bits of SHA-256(bundle) + 1 positional
+  checksum char), derived deterministically from the public bundle with no
+  storage. It is an identifier, not a secret: it grants no rights and does
+  not reveal the bundle. Input normalization accepts lower case and common
+  typos (I/l→1, O→0, U→V); the checksum rejects single substitutions and
+  adjacent transpositions.
+- `DECODE_SHORT_CODE` resolves a code against locally known bundles only
+  (own identity + stored contacts, blocked included) and returns the
+  v1-format full code with the last known address. The code is
+  information-theoretically irreversible (45 bits < 512-bit bundle): for
+  strangers the deeplink site holds the short→full mapping and the client
+  feeds the full code to `ACCEPT_INVITE`/`ACCEPT_INVITE_EX`. API version
+  bumped to 2.8.0 (additive; wire, crypto and storage unchanged; new
+  method ids pinned in the stability test).
+- Добавлены `GENERATE_SHORT_CODE` (52) и `DECODE_SHORT_CODE` (53) для
+  диплинков вида `stille.im/invite/{code}`: 9 знаков Crockford-base32
+  (8 знаков данных — первые 40 бит SHA-256(bundle) + 1 позиционный
+  контрольный знак), детерминированных из публичного bundle, без хранения.
+  Это идентификатор, а не секрет: прав не даёт и bundle не раскрывает.
+  Нормализация ввода принимает нижний регистр и частые опечатки (I/l→1,
+  O→0, U→V); контрольный знак ловит одиночные замены и перестановки
+  соседних знаков.
+- `DECODE_SHORT_CODE` резолвит код только по локально известным bundle
+  (своя личность + контакты, включая заблокированных) и возвращает полный
+  код v1-формата с последним известным адресом. Код информационно
+  необратим (45 бит < 512 бит bundle): для незнакомцев сайт диплинка
+  хранит соответствие короткий→полный код, а клиент передаёт полный код в
+  `ACCEPT_INVITE`/`ACCEPT_INVITE_EX`. Версия API поднята до 2.8.0
+  (аддитивно; провод, крипто и хранилище не менялись; новые id методов
+  закреплены в тесте стабильности).
+
 ## [Unreleased / неизданное] — LAN discovery fix (мерж fix/mcast-membership-byteorder)
 
 - Fixed LAN discovery reception: the IPv4 multicast group address in

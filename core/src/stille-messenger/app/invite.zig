@@ -553,3 +553,106 @@ test "invite: v2 decode отвергает v3-код" {
     const code = try encode3(&buf, bundle, @splat(1), "mom", "10.0.0.5:7777", null);
     try testing.expectError(Error.BadCode, decode(code));
 }
+
+// ---------------------------------------------------------------- short
+// Короткий код личности для диплинков stille.im/invite/{code}: 9 знаков,
+// детерминированных из ПУБЛИЧНОГО bundle, без хранения. Это ИДЕНТИФИКАТОР,
+// не секрет: код = base32(SHA-256(bundle)[0..40 бит]) + контрольный знак.
+// Код необратим информационно (45 бит < 512 бит bundle): из него нельзя
+// восстановить bundle — резолв short -> полный код обязан знать bundle
+// заранее (локальные контакты/своё имя; для незнакомцев сайт-рендеву
+// хранит полный код и отдаёт его диплинком, ядро принимает его через
+// ACCEPT_INVITE/EX). Код не даёт никаких прав и не скрывает bundle.
+
+/// Длина короткого кода: 8 знаков данных + 1 контрольный.
+pub const short_code_len = 9;
+/// Crockford base32: без I, L, O, U (неоднозначные при вводе человеком).
+const short_alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+const short_data_len = short_code_len - 1; // 8 знаков = 40 бит
+
+/// Контрольный знак: взвешенная позициями сумма значений знаков ловит
+/// одиночные замены и перестановки соседних знаков (равные знаки
+/// перестановкой не ловятся — как у любой позиционной контрольной суммы).
+fn shortCheck(chars: *const [short_data_len]u8) u8 {
+    var acc: usize = 0;
+    for (chars, 0..) |c, i| acc +%= (i + 1) *% (std.mem.indexOfScalar(u8, short_alphabet, c) orelse 0);
+    return @intCast(acc & 31);
+}
+
+/// Короткий код из bundle: детерминированный, один и тот же всегда.
+pub fn shortCodeFromBundle(bundle: [64]u8) [short_code_len]u8 {
+    var d: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&bundle, &d, .{});
+    var v: u64 = 0;
+    for (d[0..5]) |b| v = (v << 8) | b;
+    var out: [short_code_len]u8 = undefined;
+    var i: usize = short_data_len;
+    while (i > 0) {
+        i -= 1;
+        out[i] = short_alphabet[@intCast(v & 31)];
+        v >>= 5;
+    }
+    out[short_data_len] = short_alphabet[shortCheck(out[0..short_data_len])];
+    return out;
+}
+
+/// Нормализация пользовательского ввода кода: регистр + частые опечатки
+/// по Крокфорду (I/i/l/L -> 1, O/o -> 0, U/u -> V), затем проверка
+/// контрольного знака. null — длина не 9, знак вне алфавита или
+/// контрольный знак не сходится.
+pub fn shortCodeNormalize(code: []const u8) ?[short_code_len]u8 {
+    if (code.len != short_code_len) return null;
+    var out: [short_code_len]u8 = undefined;
+    for (code, 0..) |c, i| {
+        const n: u8 = switch (c) {
+            '0'...'9', 'A'...'H', 'J'...'K', 'M'...'N', 'P'...'T', 'V'...'Z' => c,
+            'a'...'h', 'j'...'k', 'm'...'n', 'p'...'t', 'v'...'z' => c - 32,
+            'I', 'i', 'L', 'l' => '1',
+            'O', 'o' => '0',
+            'U', 'u' => 'V',
+            else => return null,
+        };
+        out[i] = n;
+    }
+    const want = shortCheck(out[0..short_data_len]);
+    if (out[short_data_len] != short_alphabet[want]) return null;
+    return out;
+}
+
+test "invite: короткий код — детерминизм, формат, опечатки" {
+    const testing = std.testing;
+    const bundle: [64]u8 = @splat(9);
+    // один и тот же bundle -> один и тот же код
+    const a = shortCodeFromBundle(bundle);
+    const b = shortCodeFromBundle(bundle);
+    try testing.expectEqualSlices(u8, &a, &b);
+    // другой bundle -> другой код (на фиксированных векторах)
+    const c = shortCodeFromBundle(@splat(10));
+    try testing.expect(!std.mem.eql(u8, &a, &c));
+    // формат: только алфавит Crockford
+    for (a) |ch| try testing.expect(std.mem.indexOfScalar(u8, short_alphabet, ch) != null);
+    // нормализация: регистр и опечатки Крокфорда принимаются
+    var lower: [short_code_len]u8 = undefined;
+    for (a, 0..) |ch, i| {
+        lower[i] = if (ch >= 'A' and ch <= 'Z') ch + 32 else ch;
+        if (ch == '1') lower[i] = 'I'; // частая опечатка
+    }
+    const norm = shortCodeNormalize(&lower) orelse return error.TestUnexpectedResult;
+    try testing.expectEqualSlices(u8, &a, &norm);
+    // контрольный знак обязателен: подмена последнего знака отвергается
+    var bad = a;
+    bad[short_data_len] = short_alphabet[(shortCheck(bad[0..short_data_len]) +% 1) & 31];
+    try testing.expect(shortCodeNormalize(&bad) == null);
+    // длина не 9 и знак вне алфавита отвергаются
+    try testing.expect(shortCodeNormalize(a[0..8]) == null);
+    bad[0] = '?';
+    try testing.expect(shortCodeNormalize(&bad) == null);
+}
+
+test "invite: короткий код — золотой вектор формата" {
+    // Формат фиксируется золотым вектором: случайный рефактор кодирования
+    // не должен молча сменить коды у живых пользователей (ссылки умрут).
+    const bundle: [64]u8 = @splat(9);
+    const code = shortCodeFromBundle(bundle);
+    try std.testing.expectEqualStrings("N9S5WMD9D", &code);
+}

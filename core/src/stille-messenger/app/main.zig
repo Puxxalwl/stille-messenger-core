@@ -4609,6 +4609,71 @@ fn apiGetInviteState(app: *App, payload: []const u8, w: *api.Writer) api.Status 
     return .NOT_FOUND;
 }
 
+/// GENERATE_SHORT_CODE (52): [cid u32 (0 = я)] → [cid u32][code str16].
+/// Код детерминирован из публичного bundle, хранения нет. Идентификатор
+/// для диплинков stille.im/invite/{code}: без секретов, не раскрывает
+/// bundle, не даёт прав. Контакт — его код (удалённые исключаются).
+fn apiGenerateShortCode(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    if (payload.len != 4) return .BAD_FRAME;
+    const cid = std.mem.readInt(u32, payload[0..4], .little);
+    app.lock();
+    defer app.unlock();
+    if (!app.provisioned) return .NOT_INITIALIZED;
+    var bundle: [64]u8 = undefined;
+    if (cid == 0) {
+        bundle = app.id.bundle();
+    } else {
+        if (cid < 1 or cid > app.eng.contacts.items.len) return .NO_CONTACT;
+        const c = &app.eng.contacts.items[cid - 1];
+        if (c.deleted) return .NO_CONTACT;
+        bundle = c.bundle;
+    }
+    const code = invite_mod.shortCodeFromBundle(bundle);
+    w.putU32(cid) catch return .INTERNAL;
+    w.putStr16(&code) catch return .INTERNAL;
+    return .OK;
+}
+
+/// DECODE_SHORT_CODE (53): [code str16] → [cid u32 (0 = я)]
+/// [full_code str16] или NOT_FOUND. Код информационно необратим
+/// (45 бит < 512 бит bundle): резолвятся только локально известные
+/// bundle — своя личность и контакты (заблокированные включены:
+/// блокировка — рендер-решение GUI, не «неизвестность»). Полный код —
+/// v1-формат (bundle|имя[|адрес]): тот же формат, что генерит v1-инвайт,
+/// GUI может показать его или передать дальше. При коллизии хешей двух
+/// контактов (2^-40) резолв детерминирован по младшему cid.
+fn apiDecodeShortCode(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    var r = api.Reader.init(payload);
+    const code_in = r.readStr16() catch return .BAD_FRAME;
+    if (r.hasMore()) return .BAD_FRAME;
+    const code = invite_mod.shortCodeNormalize(code_in) orelse return .BAD_ARGS;
+    app.lock();
+    defer app.unlock();
+    if (!app.provisioned) return .NOT_INITIALIZED;
+    var code_buf: [256]u8 = undefined;
+    // свой bundle: cid 0, имя — свой профиль (пустой профиль -> «друг»,
+    // v1-код требует непустое имя), адрес не подставляем (свой LAN-адрес
+    // в чужом коде бесполезен; добавление — через инвайт)
+    if (std.mem.eql(u8, &code, &(invite_mod.shortCodeFromBundle(app.id.bundle())))) {
+        const my_name: []const u8 = if (app.eng.myName().len == 0) "друг" else app.eng.myName();
+        const full = invite_mod.encode(&code_buf, app.id.bundle(), my_name, null) catch return .INTERNAL;
+        w.putU32(0) catch return .INTERNAL;
+        w.putStr16(full) catch return .INTERNAL;
+        return .OK;
+    }
+    for (app.eng.contacts.items, 0..) |*c, i| {
+        if (c.deleted) continue;
+        if (!std.mem.eql(u8, &code, &(invite_mod.shortCodeFromBundle(c.bundle)))) continue;
+        var ab: [72]u8 = undefined;
+        const addr: ?[]const u8 = if (c.addr(&ab)) |a| a else null;
+        const full = invite_mod.encode(&code_buf, c.bundle, c.getName(), addr) catch return .INTERNAL;
+        w.putU32(@intCast(i + 1)) catch return .INTERNAL;
+        w.putStr16(full) catch return .INTERNAL;
+        return .OK;
+    }
+    return .NOT_FOUND;
+}
+
 /// GET_HISTORY_PAGE (51): [cid u32][has_cursor u8][before_ts u64]
 /// [before_msg_id 16][limit u16] → [has_more u8][next_ts u64]
 /// [next_msg_id 16][count u32] × records (формат записей — как
@@ -5392,6 +5457,8 @@ pub fn dispatchApi(app: *App, conn: *api_srv.Conn, req: ApiRequest) bool {
         .GET_REACHABLE_ENDPOINTS => respond(conn, req, apiGetReachableEndpoints(app, req.payload, &w), w.items()),
         .CREATE_INVITE_EX => respond(conn, req, apiCreateInviteEx(app, req.payload, &w), w.items()),
         .GET_INVITE_STATE => respond(conn, req, apiGetInviteState(app, req.payload, &w), w.items()),
+        .GENERATE_SHORT_CODE => respond(conn, req, apiGenerateShortCode(app, req.payload, &w), w.items()),
+        .DECODE_SHORT_CODE => respond(conn, req, apiDecodeShortCode(app, req.payload, &w), w.items()),
         .GET_HISTORY_PAGE => respond(conn, req, apiGetHistoryPage(app, req.payload, &w), w.items()),
         .SEND_CONTACT => respond(conn, req, apiSendContact(app, req.payload, &w), w.items()),
         .PIN_MESSAGE => respond(conn, req, apiPinMessage(app, req.payload, &w), w.items()),
@@ -6512,4 +6579,104 @@ test "kick: анонс пира сохраняет адрес и ставит di
     const tc = try rig.lsn.accept(alloc);
     tc.deinit();
     alloc.destroy(tc);
+}
+
+test "short code: генерация и резолв через API" {
+    const t = std.testing;
+    const alloc = t.allocator;
+    var rig = try lanRigInit(alloc, t.io, 39773);
+    defer lanRigTeardown(rig);
+    var w = api.Writer.init(alloc);
+    defer w.deinit();
+
+    // GENERATE_SHORT_CODE для себя (cid 0): детерминированный код
+    var pw = api.Writer.init(alloc);
+    defer pw.deinit();
+    try pw.putU32(0);
+    try t.expectEqual(api.Status.OK, apiGenerateShortCode(&rig.app, pw.items(), &w));
+    var r = api.Reader.init(w.items());
+    const cid0 = try r.readU32();
+    const self_code = try r.readStr16();
+    try t.expect(!r.hasMore());
+    try t.expectEqual(@as(u32, 0), cid0);
+    try t.expectEqualSlices(u8, &(invite_mod.shortCodeFromBundle(rig.id.bundle())), self_code);
+    // readStr16 — срез в буфер Writer: копируем, буфер переиспользуется
+    var self_code_buf: [invite_mod.short_code_len]u8 = undefined;
+    @memcpy(&self_code_buf, self_code);
+
+    // GENERATE_SHORT_CODE для контакта (cid 1): код из bundle пира
+    w.list.clearRetainingCapacity();
+    pw.list.clearRetainingCapacity();
+    try pw.putU32(1);
+    try t.expectEqual(api.Status.OK, apiGenerateShortCode(&rig.app, pw.items(), &w));
+    r = api.Reader.init(w.items());
+    const cid1 = try r.readU32();
+    const peer_code = try r.readStr16();
+    try t.expectEqual(@as(u32, 1), cid1);
+    try t.expect(!std.mem.eql(u8, &self_code_buf, peer_code));
+    var peer_code_buf: [invite_mod.short_code_len]u8 = undefined;
+    @memcpy(&peer_code_buf, peer_code);
+
+    // DECODE_SHORT_CODE кода пира: cid 1 + полный код с bundle/именем/адресом
+    w.list.clearRetainingCapacity();
+    pw.list.clearRetainingCapacity();
+    try pw.putStr16(&peer_code_buf);
+    try t.expectEqual(api.Status.OK, apiDecodeShortCode(&rig.app, pw.items(), &w));
+    r = api.Reader.init(w.items());
+    const d_cid = try r.readU32();
+    const full = try r.readStr16();
+    try t.expect(!r.hasMore());
+    try t.expectEqual(@as(u32, 1), d_cid);
+    const inv = try invite_mod.decode(full);
+    try t.expectEqualSlices(u8, &rig.peer_bundle, &inv.bundle);
+    try t.expectEqualStrings("peer", inv.name());
+    try t.expectEqualStrings("127.0.0.1", inv.addr().?);
+    try t.expectEqual(rig.listen_port, inv.port);
+
+    // DECODE_SHORT_CODE своего кода: cid 0 + v1-код со своим bundle
+    w.list.clearRetainingCapacity();
+    pw.list.clearRetainingCapacity();
+    try pw.putStr16(&self_code_buf);
+    try t.expectEqual(api.Status.OK, apiDecodeShortCode(&rig.app, pw.items(), &w));
+    r = api.Reader.init(w.items());
+    const s_cid = try r.readU32();
+    const s_full = try r.readStr16();
+    try t.expectEqual(@as(u32, 0), s_cid);
+    const s_inv = try invite_mod.decode(s_full);
+    try t.expectEqualSlices(u8, &(rig.id.bundle()), &s_inv.bundle);
+
+    // нормализация: нижний регистр и опечатка I/1 принимаются
+    w.list.clearRetainingCapacity();
+    pw.list.clearRetainingCapacity();
+    var mixed: [invite_mod.short_code_len]u8 = undefined;
+    @memcpy(&mixed, &peer_code_buf);
+    for (&mixed) |*ch| {
+        if (ch.* >= 'A' and ch.* <= 'Z') ch.* += 32;
+        if (ch.* == '1') ch.* = 'I';
+    }
+    try pw.putStr16(&mixed);
+    try t.expectEqual(api.Status.OK, apiDecodeShortCode(&rig.app, pw.items(), &w));
+
+    // незнакомец: код корректного формата из чужого bundle -> NOT_FOUND
+    w.list.clearRetainingCapacity();
+    pw.list.clearRetainingCapacity();
+    const stranger = invite_mod.shortCodeFromBundle(@splat(0x77));
+    try pw.putStr16(&stranger);
+    try t.expectEqual(api.Status.NOT_FOUND, apiDecodeShortCode(&rig.app, pw.items(), &w));
+
+    // сломанный контрольный знак -> BAD_ARGS; кривой payload -> BAD_FRAME
+    w.list.clearRetainingCapacity();
+    pw.list.clearRetainingCapacity();
+    var bad_check: [invite_mod.short_code_len]u8 = undefined;
+    @memcpy(&bad_check, &peer_code_buf);
+    bad_check[invite_mod.short_code_len - 1] = if (bad_check[invite_mod.short_code_len - 1] == '0') '1' else '0';
+    try pw.putStr16(&bad_check);
+    try t.expectEqual(api.Status.BAD_ARGS, apiDecodeShortCode(&rig.app, pw.items(), &w));
+    try t.expectEqual(api.Status.BAD_FRAME, apiDecodeShortCode(&rig.app, "\x00\x01", &w));
+    try t.expectEqual(api.Status.BAD_FRAME, apiGenerateShortCode(&rig.app, "\x01\x02\x03", &w));
+    // несуществующий контакт -> NO_CONTACT
+    w.list.clearRetainingCapacity();
+    pw.list.clearRetainingCapacity();
+    try pw.putU32(999);
+    try t.expectEqual(api.Status.NO_CONTACT, apiGenerateShortCode(&rig.app, pw.items(), &w));
 }
