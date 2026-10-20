@@ -173,7 +173,7 @@ seed (HKDF), so the code never burns — every valid JOIN is accepted,
 forever, and the invite registry is not involved (no `TOO_MANY_INVITES`
 limit, validation is stateless). Any endpoint combination is allowed
 (direct, relay, hybrid, or none); a relay endpoint is recommended for
-site deeplinks because it works across networks. Repeating the call with
+shared profile codes because it works across networks. Repeating the call with
 the same arguments returns the same code. `invite_id` for mode 4 is the
 deterministic non-secret marker BLAKE2s-256(bundle)[0..16] (the
 `GET_IDENTITY` fingerprint prefix); `GET_INVITE_STATE` on it always
@@ -248,12 +248,12 @@ code is the v1 format (`shopot1.<base64url(bundle|name)>`, with `@host:port`
 when the contact has a last known address). The 9-character code is
 information-theoretically irreversible (45 bits < the 512-bit bundle):
 resolution works only for bundles the core already knows — the local
-identity and stored contacts. For strangers the deeplink site (for example
-`stille.im/invite/{code}`) holds the mapping from the short code to the
-inviter's full code — the persistent profile code (`CREATE_INVITE_EX` mode 4)
-is designed exactly for this: it never burns, so one site link serves
-everyone — and hands the full code to the client, which feeds it to
-`ACCEPT_INVITE`/`ACCEPT_INVITE_EX`.
+identity and stored contacts. `stille.im` invite links therefore carry the
+full code itself, with the `stille://` scheme stripped
+(`stille.im/invite/i/…`, `stille.im/invite/i3/…`): the site is a redirector
+only and holds no mapping; the client re-attaches the scheme and feeds the
+code to `ACCEPT_INVITE`/`ACCEPT_INVITE_EX` directly. Short codes remain a
+local identifier for known contacts, not a link payload.
 Blocked contacts resolve normally (blocking is a rendering decision).
 A 40-bit hash collision between two contacts resolves deterministically to
 the lower cid. Errors: `BAD_ARGS` (malformed code), `NO_CONTACT` (unknown

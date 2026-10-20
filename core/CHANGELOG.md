@@ -1,5 +1,22 @@
 # Changelog — stille-messenger
 
+## [Unreleased / неизданное] — инвайт-ссылка несёт полный код
+
+- Doc clarification (no code/wire change): a `stille.im/invite/…` link
+  carries the **full invite code itself**, with the `stille://` scheme
+  stripped (`stille.im/invite/i/…`, `stille.im/invite/i3/…`). The site is a
+  redirector only and holds no mapping — the client re-attaches the scheme
+  and feeds the code to `ACCEPT_INVITE`/`ACCEPT_INVITE_EX`. Short codes
+  remain a local identifier for known contacts, not a link payload.
+  CORE-API EN/RU updated accordingly.
+- Уточнение документации (без изменений кода и протокола): ссылка
+  `stille.im/invite/…` несёт **полный инвайт-код сама**, без схемы
+  `stille://` (`stille.im/invite/i/…`, `stille.im/invite/i3/…`). Сайт —
+  только редиректор и не хранит маппинг: клиент снова приставляет схему и
+  передаёт код в `ACCEPT_INVITE`/`ACCEPT_INVITE_EX`. Короткие коды остаются
+  локальным идентификатором известных контактов, а не полезной нагрузкой
+  ссылки. CORE-API EN/RU обновлены соответственно.
+
 ## [Unreleased / неизданное] — короткие коды личности (API 2.8.0)
 
 - Added `GENERATE_SHORT_CODE` (52) and `DECODE_SHORT_CODE` (53) for
