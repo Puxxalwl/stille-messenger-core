@@ -246,6 +246,12 @@ pub const App = struct {
     pending_sessions: u32 = 0,
     /// JOIN-данные по cid: отправить первым конвертом после рукопожатия.
     join_map: std.AutoHashMapUnmanaged(i64, JoinInfo) = .empty,
+    /// Эпоха персистентного кода профиля (REGENERATE_PROFILE_CODE):
+    /// входит в HKDF-вывод секрета. Ротация = bump + запись .set(8) в
+    /// шифрованный лог; слитый код прошлой эпохи умирает немедленно
+    /// (валидация JOIN принимает только текущую эпоху). Существующие
+    /// контакты не зависят: их сессии живут по handshake, не по коду.
+    profile_epoch: u32 = 0,
     /// Кэш аватаров: avatar_id -> байты (из лога kind AVATAR).
     avatars: std.AutoHashMapUnmanaged([16]u8, []u8) = .empty,
     /// Живые fake-TLS обёртки (для deinit по завершении).
@@ -1453,7 +1459,7 @@ fn handleJoinEnvelope(sc: *SessCtx, env: envelope.Envelope) void {
             }
         }
         if (matched == null) {
-            var psec = profileSecret(app.id);
+            var psec = profileSecret(app.id, app.profile_epoch);
             var mac: [32]u8 = undefined;
             std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, &transcript, &psec);
             std.crypto.secureZero(u8, &psec);
@@ -2760,14 +2766,19 @@ fn relayPresenceLoop(app: *App, cid: i64, from_server: bool) void {
 
 /// Статический секрет персистентного кода профиля (InviteExMode.profile):
 /// HKDF-SHA256 из приватного enc-секрета личности (того же, что держит
-/// relay-маркеры). Не хранится нигде: выводится на лету при создании кода
-/// и при проверке JOIN. Свойства: знающий код может добавить нас (как
-/// t.me-ссылку — intend-ed, от злоупотреблений BLOCK_CONTACT); подделать
-/// ДРУГОЙ валидный код нельзя — секрет не выводится из публичного bundle.
+/// relay-маркеры), с эпохой в info. Не хранится нигде: выводится на лету
+/// при создании кода и при проверке JOIN. Свойства: знающий код может
+/// добавить нас (как t.me-ссылку; от злоупотреблений BLOCK_CONTACT и
+/// REGENERATE_PROFILE_CODE); подделать ДРУГОЙ валидный код нельзя —
+/// секрет не выводится из публичного bundle; смена эпохи меняет секрет —
+/// слитый код прошлой эпохи перестаёт проходить проверку JOIN.
 const profile_secret_domain = "shopot-profile-code-v1";
-fn profileSecret(id: *const identity.Identity) [16]u8 {
+fn profileSecret(id: *const identity.Identity, epoch: u32) [16]u8 {
+    var info: [profile_secret_domain.len + 4]u8 = undefined;
+    @memcpy(info[0..profile_secret_domain.len], profile_secret_domain);
+    std.mem.writeInt(u32, info[profile_secret_domain.len..][0..4], epoch, .little);
     var okm: [16]u8 = undefined;
-    std.crypto.kdf.hkdf.HkdfSha256.expand(&okm, profile_secret_domain, id.enc_secret);
+    std.crypto.kdf.hkdf.HkdfSha256.expand(&okm, &info, id.enc_secret);
     return okm;
 }
 
@@ -2828,7 +2839,10 @@ fn relayLinkerLoop(app: *App, secret: [16]u8, addr: []const u8) void {
 fn profileRelayLoop(app: *App, addr_copy: []u8) void {
     defer app.alloc.free(addr_copy);
     while (app.running) {
-        var secret = profileSecret(app.id);
+        // эпоха выводится на каждой итерации: после REGENERATE_PROFILE_CODE
+        // поток сам переходит на новый секрет (старый marker на релее
+        // протухнет по таймауту регистрации)
+        var secret = profileSecret(app.id, app.profile_epoch);
         defer std.crypto.secureZero(u8, &secret);
         const tc = stille_messenger.net.relay.dial(app.alloc, addr_copy, secret) catch {
             sysfd.sleepMs(2000);
@@ -4623,7 +4637,7 @@ fn apiCreateInviteEx(app: *App, payload: []const u8, w: *api.Writer) api.Status 
             // персистентный код: секрет и invite_id детерминированы из
             // личности; реестр не занимается (валидация stateless),
             // лимита TOO_MANY_INVITES нет
-            secret = profileSecret(app.id);
+            secret = profileSecret(app.id, app.profile_epoch);
             invite_id = profileInviteId(app.id);
         } else {
             app.io.random(&secret);
@@ -4799,6 +4813,38 @@ fn apiDecodeShortCode(app: *App, payload: []const u8, w: *api.Writer) api.Status
         return .OK;
     }
     return .NOT_FOUND;
+}
+
+/// REGENERATE_PROFILE_CODE (54): ∅ → [epoch u32][persisted u8].
+/// Ротация секрета персистентного кода: эпоха входит в HKDF-вывод, bump
+/// эпохи меняет секрет — слитый код прошлой эпохи перестаёт проходить
+/// JOIN немедленно (валидация принимает только текущую эпоху). Новый код
+/// GUI получает повторным CREATE_INVITE_EX mode 4. Порядок: сначала
+/// запись .set(8) в шифрованный лог, затем bump в памяти (провал записи —
+/// INTERNAL, эпоха НЕ меняется: слитый код остаётся мёртвым/живым
+/// консистентно с диском). Лога нет (продолжение без хранения) —
+/// persisted=0, эпоха живёт до рестарта. Существующие контакты не
+/// зависят от кода: их сессии живут по handshake, не по инвайту.
+fn apiRegenerateProfileCode(app: *App, payload: []const u8, w: *api.Writer) api.Status {
+    if (payload.len != 0) return .BAD_FRAME;
+    app.lock();
+    defer app.unlock();
+    if (!app.provisioned) return .NOT_INITIALIZED;
+    const new_epoch = app.profile_epoch +% 1;
+    var persisted: u8 = 1;
+    if (app.log) |log| {
+        // [8][epoch u32 LE] — kind .set, подтип 8; реплей восстанавливает
+        var rec: [5]u8 = undefined;
+        rec[0] = 8;
+        std.mem.writeInt(u32, rec[1..5], new_epoch, .little);
+        _ = log.append(.set, &rec) catch return .INTERNAL;
+    } else {
+        persisted = 0;
+    }
+    app.profile_epoch = new_epoch;
+    w.putU32(new_epoch) catch return .INTERNAL;
+    w.putU8(persisted) catch return .INTERNAL;
+    return .OK;
 }
 
 /// GET_HISTORY_PAGE (51): [cid u32][has_cursor u8][before_ts u64]
@@ -5211,6 +5257,9 @@ pub fn loadContacts(app: *App) void {
                 app.eng.contacts.items[cid - 1].online = false;
             }
         }
+        // эпоха персистентного кода профиля (REGENERATE_PROFILE_CODE):
+        // реплей применяет ПОСЛЕДНЮЮ записанную (лог append-only)
+        if (rec.len == 5 and rec[0] == 8) app.profile_epoch = std.mem.readInt(u32, rec[1..5], .little);
     }
     // история: кэш записей kind msg в памяти (GET_HISTORY/GET_MESSAGE/SEARCH
     // больше не читают лог); чаты-надгробия в кэш не попадают
@@ -5586,6 +5635,7 @@ pub fn dispatchApi(app: *App, conn: *api_srv.Conn, req: ApiRequest) bool {
         .GET_INVITE_STATE => respond(conn, req, apiGetInviteState(app, req.payload, &w), w.items()),
         .GENERATE_SHORT_CODE => respond(conn, req, apiGenerateShortCode(app, req.payload, &w), w.items()),
         .DECODE_SHORT_CODE => respond(conn, req, apiDecodeShortCode(app, req.payload, &w), w.items()),
+        .REGENERATE_PROFILE_CODE => respond(conn, req, apiRegenerateProfileCode(app, req.payload, &w), w.items()),
         .GET_HISTORY_PAGE => respond(conn, req, apiGetHistoryPage(app, req.payload, &w), w.items()),
         .SEND_CONTACT => respond(conn, req, apiSendContact(app, req.payload, &w), w.items()),
         .PIN_MESSAGE => respond(conn, req, apiPinMessage(app, req.payload, &w), w.items()),
@@ -6852,14 +6902,14 @@ test "profile code: детерминизм, stateless-валидация, рее
     try t.expect(inv.v2);
     try t.expectEqualSlices(u8, &(rig.id.bundle()), &inv.bundle);
     try t.expectEqualStrings("профиль", inv.name());
-    try t.expectEqualSlices(u8, &(profileSecret(&rig.id)), &inv.secret);
+    try t.expectEqualSlices(u8, &(profileSecret(&rig.id, rig.app.profile_epoch)), &inv.secret);
 
     // stateless-валидация JOIN: HMAC по транскрипту с секретом из кода
     // совпадает с HMAC по секрету, выведенному из сида; чужой секрет — нет
     var transcript: [32]u8 = undefined;
     for (&transcript, 0..) |*b, i| b.* = @truncate(i *% 7);
     var mac_want: [32]u8 = undefined;
-    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac_want, &transcript, &(profileSecret(&rig.id)));
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac_want, &transcript, &(profileSecret(&rig.id, rig.app.profile_epoch)));
     var mac_code: [32]u8 = undefined;
     std.crypto.auth.hmac.sha2.HmacSha256.create(&mac_code, &transcript, &inv.secret);
     try t.expectEqualSlices(u8, &mac_want, &mac_code);
@@ -6899,4 +6949,65 @@ test "profile code: детерминизм, stateless-валидация, рее
     try t.expectEqual(@as(u8, 0), try r.readU8()); // active
     try t.expectEqual(@as(u32, 0), try r.readU32());
     try t.expectEqual(@as(i64, 0), try r.readI64());
+}
+
+test "profile code: REGENERATE — слитый код умирает, данные живут" {
+    const t = std.testing;
+    const alloc = t.allocator;
+    var rig = try lanRigInit(alloc, t.io, 39775);
+    defer lanRigTeardown(rig);
+    var w = api.Writer.init(alloc);
+    defer w.deinit();
+    var pw = api.Writer.init(alloc);
+    defer pw.deinit();
+
+    // код эпохи 0: секрет = эпоха 0 в HKDF
+    try pw.putU8(@backingInt(api.InviteExMode.profile));
+    try pw.putStr16("профиль");
+    try pw.putStr16("");
+    try pw.putStr16("");
+    try t.expectEqual(api.Status.OK, apiCreateInviteEx(&rig.app, pw.items(), &w));
+    var r = api.Reader.init(w.items());
+    const code0 = try r.readStr16();
+    const inv0 = try invite_mod.decode(code0);
+    try t.expectEqualSlices(u8, &(profileSecret(&rig.id, 0)), &inv0.secret);
+
+    // REGENERATE: эпоха 1; persisted=0 (в rig нет лога — режим «продолжаю
+    // без хранения», честно отражён в ответе)
+    w.list.clearRetainingCapacity();
+    try t.expectEqual(api.Status.OK, apiRegenerateProfileCode(&rig.app, &.{}, &w));
+    r = api.Reader.init(w.items());
+    try t.expectEqual(@as(u32, 1), try r.readU32());
+    try t.expectEqual(@as(u8, 0), try r.readU8());
+    try t.expect(!r.hasMore());
+    try t.expectEqual(@as(u32, 1), rig.app.profile_epoch);
+
+    // новый код = ДРУГОЙ секрет (эпоха в HKDF), bundle тот же
+    w.list.clearRetainingCapacity();
+    pw.list.clearRetainingCapacity();
+    try pw.putU8(@backingInt(api.InviteExMode.profile));
+    try pw.putStr16("профиль");
+    try pw.putStr16("");
+    try pw.putStr16("");
+    try t.expectEqual(api.Status.OK, apiCreateInviteEx(&rig.app, pw.items(), &w));
+    r = api.Reader.init(w.items());
+    const code1 = try r.readStr16();
+    const inv1 = try invite_mod.decode(code1);
+    try t.expectEqualSlices(u8, &(profileSecret(&rig.id, 1)), &inv1.secret);
+    try t.expectEqualSlices(u8, &(rig.id.bundle()), &inv1.bundle);
+    try t.expect(!std.mem.eql(u8, &(profileSecret(&rig.id, 0)), &inv1.secret));
+
+    // слитый код эпохи 0 больше НЕ проходит JOIN-проверку: HMAC по его
+    // секрету не совпадает с HMAC текущей эпохи
+    var transcript: [32]u8 = undefined;
+    for (&transcript, 0..) |*b, i| b.* = @truncate(i *% 13);
+    var mac_cur: [32]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac_cur, &transcript, &(profileSecret(&rig.id, rig.app.profile_epoch)));
+    var mac_leaked: [32]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac_leaked, &transcript, &(profileSecret(&rig.id, 0)));
+    try t.expect(!std.mem.eql(u8, &mac_cur, &mac_leaked));
+
+    // кривой payload → BAD_FRAME
+    const bad_payload = [_]u8{1};
+    try t.expectEqual(api.Status.BAD_FRAME, apiRegenerateProfileCode(&rig.app, &bad_payload, &w));
 }

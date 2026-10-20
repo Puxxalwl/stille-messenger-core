@@ -224,6 +224,12 @@ pub const Method = enum(u16) {
     /// своя личность и сохранённые контакты. Для незнакомцев полный код
     /// берёт сайт-рендеву, ядро принимает его через ACCEPT_INVITE/EX.
     DECODE_SHORT_CODE = 53,
+    /// Ротация персистентного кода профиля (эпоха в HKDF-выводе секрета):
+    /// ∅ → [epoch u32][persisted u8]. Слитый код прошлой эпохи умирает
+    /// немедленно; новый код — повторным CREATE_INVITE_EX mode 4.
+    /// persisted=0 — лога нет (продолжение без хранения): эпоха живёт
+    /// до рестарта. Существующие контакты и сессии не затрагиваются.
+    REGENERATE_PROFILE_CODE = 54,
 };
 
 /// Коды статуса ответа (u16 на проводе, имена SCREAMING_SNAKE — контракт;
@@ -676,6 +682,7 @@ test "method ids стабильны (контракт провода)" {
     // короткие коды личности — 2.8.0
     try std.testing.expectEqual(@as(u16, 52), @backingInt(Method.GENERATE_SHORT_CODE));
     try std.testing.expectEqual(@as(u16, 53), @backingInt(Method.DECODE_SHORT_CODE));
+    try std.testing.expectEqual(@as(u16, 54), @backingInt(Method.REGENERATE_PROFILE_CODE));
     try std.testing.expectEqual(@as(u16, 15), @backingInt(Event.CONTACT_STATE_CHANGED));
     try std.testing.expectEqual(@as(u16, 16), @backingInt(Event.CONTACTS_CHANGED));
     try std.testing.expectEqual(@as(u16, 17), @backingInt(Event.CONTACT_UPSERTED));

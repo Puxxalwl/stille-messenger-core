@@ -179,10 +179,23 @@ deterministic non-secret marker BLAKE2s-256(bundle)[0..16] (the
 `GET_IDENTITY` fingerprint prefix); `GET_INVITE_STATE` on it always
 answers active/never-expires. Security posture: the code is a capability
 — anyone who obtains it can add the owner (like a public profile link);
-abuse is handled with `BLOCK_CONTACT`, and rotation requires rotating the
-identity seed (a separate future change). Relay presence for a mode-4
-relay code is held while the daemon runs; after a restart the GUI re-issues
-the same call to restore it (the code itself is unchanged).
+abuse is handled with `BLOCK_CONTACT` and `REGENERATE_PROFILE_CODE` (54).
+Relay presence for a mode-4 relay code is held while the daemon runs;
+after a restart the GUI re-issues the same call to restore it (the code
+itself is unchanged).
+
+`REGENERATE_PROFILE_CODE` (54, API 2.8.0) takes an empty payload and
+returns `[epoch u32][persisted u8]`. The profile secret is
+HKDF(seed, domain‖epoch): bumping the epoch changes the secret, so a
+leaked code stops passing JOIN validation immediately (only the current
+epoch is accepted — no grace window). The new code is obtained by
+re-issuing `CREATE_INVITE_EX` mode 4. The epoch is persisted BEFORE the
+bump as an encrypted `.set`(subtype 8) log record; a failed write returns
+`INTERNAL` without changing the epoch (state stays consistent with disk).
+`persisted=0` means no log (run-without-storage mode): the rotation lives
+only until restart. Existing contacts and sessions are unaffected — they
+authenticate via the handshake, not the code. A mode-4 relay loop
+re-derives the secret per cycle and picks up the new epoch by itself.
 
 `GET_INVITE_STATE` (50) takes `[invite_id 16]` and returns
 `[state u8][accepted_cid u32][expires_at_ms i64]`. States: 0 active, 1 joining,

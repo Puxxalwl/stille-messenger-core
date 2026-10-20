@@ -31,6 +31,14 @@
   `BLOCK_CONTACT`; rotation requires a seed-rotation change). JOIN
   validation now also accepts the profile secret after the one-time
   registry scan — additive, no wire format, crypto or storage change.
+- Added `REGENERATE_PROFILE_CODE` (54): profile-code rotation when the
+  code leaks. The profile secret is now HKDF(seed, domain||epoch); the
+  method bumps the epoch (persisted first as an encrypted `.set`(8)
+  record — a failed write returns `INTERNAL` without changing the epoch)
+  and returns `[epoch u32][persisted u8]`. Only the current epoch passes
+  JOIN validation — the leaked code dies immediately, no grace window;
+  existing contacts and sessions are unaffected (handshake, not code). A
+  mode-4 relay loop picks up the new epoch on its next cycle by itself.
 - Добавлены `GENERATE_SHORT_CODE` (52) и `DECODE_SHORT_CODE` (53) для
   диплинков вида `stille.im/invite/{code}`: 9 знаков Crockford-base32
   (8 знаков данных — первые 40 бит SHA-256(bundle) + 1 позиционный
@@ -59,6 +67,14 @@
   `BLOCK_CONTACT`; ротация требует смены сида). Валидация JOIN теперь
   после реестра одноразовых принимает и секрет профиля — аддитивно, без
   изменений формата провода, крипто и хранилища.
+- Добавлен `REGENERATE_PROFILE_CODE` (54): ротация кода профиля при
+  сливе. Секрет теперь HKDF(сид, домен‖эпоха); метод поднимает эпоху
+  (сначала персистенция записью `.set`(8) в шифрованный лог — провал
+  записи = `INTERNAL` без смены эпохи) и возвращает
+  `[epoch u32][persisted u8]`. Проверку JOIN проходит только текущая
+  эпоха — слитый код умирает немедленно, без грейс-периода; существующие
+  контакты и сессии не затрагиваются (рукопожатие, не код). Relay-поток
+  режима 4 подхватывает новую эпоху на следующем цикле сам.
 
 ## [Unreleased / неизданное] — LAN discovery fix (мерж fix/mcast-membership-byteorder)
 
