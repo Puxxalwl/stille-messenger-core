@@ -278,6 +278,24 @@ pub fn setRcvTimeout1s(fd: fd_t) void {
     setSockOptRaw(fd, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &std.mem.toBytes(tv));
 }
 
+/// SO_BROADCAST: отправка на 255.255.255.255 (limited broadcast) —
+/// fallback-канал обнаружения в сетях, где мультикаст фильтруется.
+pub fn setBroadcast(fd: fd_t) void {
+    if (is_linux) {
+        _ = std.os.linux.setsockopt(fd, posix.SOL.SOCKET, posix.SO.BROADCAST, &std.mem.toBytes(@as(c_int, 1)), 4);
+        return;
+    }
+    _ = cabi.setsockopt(@intCast(fd), posix.SOL.SOCKET, posix.SO.BROADCAST, &std.mem.toBytes(@as(c_int, 1)), 4);
+}
+
+/// IP_MULTICAST_TTL: 1 — анонс не покидает локальный сегмент (LAN-only).
+/// Значение опции 10 совпадает на Linux и Darwin (BSD-наследие).
+const ip_multicast_ttl: u32 = 10;
+pub fn setMulticastTtl(fd: fd_t) void {
+    const ttl: c_int = 1;
+    setSockOptRaw(fd, posix.IPPROTO.IP, ip_multicast_ttl, &std.mem.toBytes(ttl));
+}
+
 /// Вступить в IPv4-мультикаст-группу (INADDR_ANY — интерфейс по умолчанию).
 pub fn joinMulticastGroup(fd: fd_t, group_ip: [4]u8) void {
     var mreq: [8]u8 = undefined;

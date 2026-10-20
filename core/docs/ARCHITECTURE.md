@@ -94,6 +94,17 @@ persist* (app, under app.mu)
   Direct-to-relay fallback is permitted only during transport dial, never
   after handshake or JOIN authentication begins. Unknown incoming invite
   sessions are capped at 16 and have a 3-second pending-JOIN deadline.
+- LAN discovery is one event-driven loop: a single UDP socket (multicast
+  group 239.77.77.77 + limited broadcast, bound to INADDR_ANY) is polled
+  together with a wake pipe, so peer announcements are heard the moment
+  they are sent (no listen windows, no blind sleeps). The loop announces
+  on a cadence — 500 ms base, 100 ms while an outbox entry or JOIN is
+  pending — and immediately on API events (a send to an offline peer, a
+  session drop). Hearing a peer triggers a unicast reply announcement
+  (the peer learns about us within one RTT) and enqueues a dial job into
+  the scheduler; the discovery loop itself never blocks on TCP, and every
+  direct dial carries a 3-second deadline so a dead address cannot stall
+  a worker.
 
 ## 5. Error and memory model
 

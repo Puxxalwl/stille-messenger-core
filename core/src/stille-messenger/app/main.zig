@@ -17,6 +17,7 @@ const interfaces = stille_messenger.core.interfaces;
 const invite_mod = @import("invite.zig");
 const endpoints_mod = @import("endpoints.zig");
 const discover_mod = @import("discover.zig");
+const wake = @import("wake.zig");
 const audio_mod = @import("audio.zig");
 const adpcm_mod = @import("adpcm.zig");
 const api_srv = @import("api_server.zig");
@@ -48,6 +49,8 @@ test {
     _ = @import("recovery.zig");
     _ = @import("invite.zig");
     _ = @import("endpoints.zig");
+    _ = @import("wake.zig");
+    _ = @import("discover.zig");
 }
 
 /// $HOME копия App.home_buf.
@@ -259,6 +262,10 @@ pub const App = struct {
     /// Слушатель автолистенера поднят (startNetworking): без него
     /// GET_REACHABLE_ENDPOINTS честно возвращает пустой список.
     listening: bool = false,
+    /// Будилка цикла обнаружения (linkerLoop): событийные кики из
+    /// потоков API (kickConnect) — анонс немедленно, без ожидания
+    /// каденса. null — init не удался (цикл работает по каденсу).
+    link_wake: ?wake.Waker = null,
 
     /// Профиль провижен: сид на диске, личность своя, лог открыт.
     /// false — режим восстановления (serve без сида): эфемерная личность,
@@ -648,6 +655,38 @@ fn connBeginAttemptLocked(app: *App, cid: i64) u32 {
 /// ВЫЗЫВАТЬ ПОД app.mu.
 fn connDiscoveringLocked(app: *App, cid: i64) void {
     connSetLocked(app, cid, .discovering, .none, null);
+}
+
+/// Событийный кик подключения: отправка офлайн-контакту / потеря сессии
+/// НЕ ждут слепых циклов автодозвона. Известен адрес — работа в очередь
+/// немедленно (single-flight гасит дубли), адреса нет — DISCOVERING и
+/// burst-анонс линкера через будилку (link_wake). ВЫЗЫВАТЬ ПОД app.mu
+/// (connq_mu берётся поверх — вкладывание app.mu -> connq_mu допустимо).
+fn kickConnectLocked(app: *App, cid: i64) void {
+    if (cid < 1) return;
+    const idx: usize = @intCast(cid - 1);
+    if (idx >= app.eng.contacts.items.len) return;
+    const c = &app.eng.contacts.items[idx];
+    if (c.deleted or c.blocked) return;
+    if (app.eng.sessions.get(cid) != null) return;
+    var ab: [72]u8 = undefined;
+    if (c.addr(&ab)) |a| {
+        if (a.len <= 72) {
+            var work = ConnWork{ .cid = cid };
+            @memcpy(work.addr_buf[0..a.len], a);
+            work.addr_len = @intCast(a.len);
+            // Busy (уже в полёте/очередь переполнена) — не ошибка:
+            // фоновые циклы дозвонятся сами
+            connEnqueue(app, work) catch {};
+            // и разбудить линкер: адрес может быть устаревшим (пир сменил
+            // IP) — dial и burst-анонс идут параллельно, кто первый
+            if (app.link_wake) |*w| w.wake();
+            return;
+        }
+    }
+    // адреса нет — ждём анонс пира; разбудить линкер (burst-каденс)
+    connDiscoveringLocked(app, cid);
+    if (app.link_wake) |*w| w.wake();
 }
 
 /// Осталось мс до повтора (насыщение до u32; 0 — повтора нет).
@@ -1453,6 +1492,9 @@ fn onClosed(ctx: *anyopaque) void {
     _ = app.conn_await.remove(sc.cid);
     connSetLocked(app, sc.cid, .offline, .none, null);
     bumpContactLocked(app, sc.cid);
+    // разрыв — немедленная попытка переподключения (а не backoff-ожидание):
+    // короткие моргания сети/пира переживаются незаметно для пользователя
+    kickConnectLocked(app, sc.cid);
 }
 
 /// Индекс контакта по указателю (события движка отдают *const Contact).
@@ -1946,6 +1988,8 @@ fn tickerLoop(app: *App) void {
                         // автодозвон/linker поднимут соединение заново; сам
                         // указатель уйдёт в retired и будет закрыт drain-ом
                         app.eng.retireSession(cid, s);
+                        // и не ждать backoff: немедленная попытка дозвона
+                        kickConnectLocked(app, cid);
                     },
                 }
             }
@@ -2027,10 +2071,9 @@ fn apiEndCall(app: *App, payload: []const u8, w: *api.Writer) api.Status {
 }
 
 // ------------------------------------------------- автоподключение (LAN)
-/// Фоновый поток: раз в 2 секунды рассылает анонс (bundle + порт) в
-/// мультикаст-группу и слушает чужие. Видит анонс добавленного контакта —
-/// сам звонит по TCP. Кто чей bundle меньше — тот инициатор (без дублей).
-/// IPv4 в строку (без порта).
+/// Автодозвон офлайн-контактов по сохранённым адресам: backoff 1с -> 60с
+/// с джиттером (фоновая страховка; мгновенный путь — kickConnect из
+/// отправки сообщения и событийный linkerLoop). IPv4 в строку (без порта).
 fn fmtIpBuf(buf: *[16]u8, ip: [4]u8) []const u8 {
     return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ ip[0], ip[1], ip[2], ip[3] }) catch "?";
 }
@@ -2114,79 +2157,132 @@ fn autodialLoop(app: *App) void {
     }
 }
 
+/// Каденции анонса, мс: base — фоновое присутствие; burst — пока есть
+/// кому доставлять (pending outbox/JOIN), пир с ждущими данными находит
+/// нас за интервал burst. 74-байтный датаграмм, один сокет — трафик
+/// фонового каденса ~150 Б/с, burst ~750 Б/с.
+const announce_base_ms: i64 = 500;
+const announce_burst_ms: i64 = 100;
+/// Анонсов за одно пробуждение poll (бюджет цикла на пачку событий).
+const announce_batch: usize = 8;
+
+/// Есть ли кому доставлять: pending outbox или ждущий JOIN. Под app.mu.
+fn burstPending(app: *App) bool {
+    return app.eng.outbox.items.len > 0 or app.join_map.count() > 0;
+}
+
+/// Фоновый поток обнаружения: событийный цикл на poll [сокет обнаружения
+/// + будилка]. Слушает сеть ПОСТОЯННО (не окнами): анонс пира слышится в
+/// момент его отправки. Анонсирует по каденсу (base/burst), событие от
+/// API (kickConnect) — анонс немедленно. Услышав анонс, отвечает своим
+/// unicast-ом напрямую (пир узнаёт о нас за ~RTT) и ставит работу
+/// подключения в планировщик: НИКОГДА не блокируется на TCP сам.
 fn linkerLoop(app: *App) void {
     var disc = discover_mod.Discovery.init() catch return;
     defer disc.deinit();
     const my_bundle = app.id.bundle();
+    // 0 = анонсировать немедленно: старт демона — пир узнает за ~RTT
+    var next_announce_ms: i64 = 0;
     while (app.running) {
-        // LAN-поиск управляется конфигурацией: выключен — не анонсим и
-        // не слушаем мультикаст (флаг читается под локом на каждой итерации)
+        // LAN-поиск управляется конфигурацией (флаг читается под локом);
+        // выключен — не анонсим и не читаем сокет (POLL.IN не копится),
+        // ждём только будилку/каденс: включат — анонс сразу
+        var lan = false;
         {
             app.lock();
-            const lan = app.cfg.lan_discovery;
+            lan = app.cfg.lan_discovery;
             app.unlock();
-            if (!lan) {
-                sysfd.sleepMs(2000);
-                continue;
+        }
+        const now = app.nowMs();
+        var timeout: i32 = 2000;
+        if (lan) {
+            // таймаут poll = до следующего анонса (насыщение секундой)
+            timeout = 0;
+            if (next_announce_ms > now) {
+                const d: u64 = @intCast(next_announce_ms - now);
+                timeout = if (d > 1000) 1000 else @intCast(d);
+            }
+        } else {
+            next_announce_ms = 0;
+        }
+        var pfd: [2]posix.pollfd = .{
+            if (lan) disc.pollfd() else .{ .fd = -1, .events = 0, .revents = 0 },
+            .{ .fd = -1, .events = 0, .revents = 0 },
+        };
+        var waker: ?*wake.Waker = null;
+        if (app.link_wake) |*w| {
+            waker = w;
+            pfd[1] = w.pollfd();
+        }
+        _ = posix.poll(&pfd, timeout) catch {};
+        if (waker != null and pfd[1].revents & posix.POLL.IN != 0) {
+            waker.?.drain();
+            // событие (отправка офлайн/разрыв сессии): анонс немедленно
+            next_announce_ms = 0;
+        }
+        if (lan and pfd[0].revents & posix.POLL.IN != 0) {
+            var heard: usize = 0;
+            while (heard < announce_batch) : (heard += 1) {
+                const a = disc.recvAnnounce() orelse break;
+                handleAnnounce(app, &my_bundle, a, &disc);
             }
         }
-        // анонс ПЕРВЫМ делом итерации: старт демона = immediate-анонс,
-        // пир с pending-outbox узнаёт о нас за ~RTT, а не через цикл сна
-        disc.announce(my_bundle, app.listen_port);
-        var heard: usize = 0;
-        while (heard < 8) : (heard += 1) {
-            const a = disc.waitAnnounce(300) orelse break;
-            // анонс НАШЕГО bundle: другое устройство того же пользователя
-            // (device_sync). MACи синхронизации не пустят постороннего, а
-            // сюда он и не дойдёт — bundle уникален только у своих.
-            if (std.mem.eql(u8, &a.bundle, &my_bundle)) {
-                handleDeviceAnnounce(app, a.ip, a.port);
-                continue;
-            }
-            const cid = contactIdByBundle(app, a.bundle) orelse continue;
-            // адрес анонса — сохранить для автодозвона (последний известный);
-            // мутация контактов — строго под app.mu (ticker и рендер итерируют)
-            var ab_ip: [16]u8 = undefined;
-            const ip_str = fmtIpBuf(&ab_ip, a.ip);
-            {
+        // анонс по каденсу (или немедленно после события/включения)
+        if (lan and next_announce_ms <= app.nowMs()) {
+            disc.announce(my_bundle, app.listen_port);
+            const burst = blk: {
                 app.lock();
                 defer app.unlock();
-                const c = &app.eng.contacts.items[@intCast(cid - 1)];
-                if (c.deleted) continue;
-                c.setAddr(ip_str, a.port);
-            }
-            app.lock();
-            const linked = app.eng.sessions.get(cid) != null;
-            const blocked = app.eng.contacts.items[@intCast(cid - 1)].blocked;
-            const join_due = app.join_map.contains(cid);
-            app.unlock();
-            if (linked or blocked) continue;
-            // инициатор — сторона с меньшим bundle (детерминизм, без гонки);
-            // держатель инвайт-кода инициирует ВСЕГДА: приглашающий его не знает
-            const i_init = std.mem.order(u8, &my_bundle, &a.bundle) == .lt;
-            if (!i_init and !join_due) continue;
-            var ab: [32]u8 = undefined;
-            const addr = discover_mod.fmtAddr(&ab, a.ip, a.port);
-            // markSeen не нужен: establishTo -> bindSession сам метит онлайн.
-            // single-flight + метка попытки (2.7.0): dial по анонсу тоже
-            // учитывается в attempt/state (gen гасит отставшие рапорты)
-            connFlightBegin(app, cid) catch continue;
-            const gen: u32 = blk: {
-                app.lock();
-                defer app.unlock();
-                break :blk connBeginAttemptLocked(app, cid);
+                break :blk burstPending(app);
             };
-            establishTo(app, addr, cid, .initiator) catch |e| {
-                app.lock();
-                defer app.unlock();
-                connSetLocked(app, cid, .failed, connErrOf(e), gen);
-                connFlightEnd(app, cid);
-                continue;
-            };
-            connFlightEnd(app, cid);
+            next_announce_ms = app.nowMs() + if (burst) announce_burst_ms else announce_base_ms;
         }
-        sysfd.sleepMs(2000);
     }
+}
+
+/// Обработка услышанного анонса: обновить адрес контакта, поставить
+/// работу подключения в планировщик (single-flight/поколения — как у
+/// ручных путей), ответить своим анонсом напрямую. Инициатор — сторона
+/// с меньшим bundle (детерминизм, без гонки); держатель инвайт-кода
+/// инициирует ВСЕГДА: приглашающий его не знает.
+fn handleAnnounce(app: *App, my_bundle: *const [64]u8, a: discover_mod.Announce, disc: ?*discover_mod.Discovery) void {
+    // анонс НАШЕГО bundle: другое устройство того же пользователя
+    // (device_sync). MACи синхронизации не пустят постороннего, а
+    // сюда он и не дойдёт — bundle уникален только у своих.
+    if (std.mem.eql(u8, &a.bundle, my_bundle)) {
+        handleDeviceAnnounce(app, a.ip, a.port);
+        return;
+    }
+    const cid = contactIdByBundle(app, a.bundle) orelse return;
+    var ab_ip: [16]u8 = undefined;
+    const ip_str = fmtIpBuf(&ab_ip, a.ip);
+    var need_dial = false;
+    var join_due = false;
+    {
+        // адрес анонса — сохранить для автодозвона (последний известный);
+        // мутация контактов — строго под app.mu (ticker и рендер итерируют)
+        app.lock();
+        defer app.unlock();
+        const c = &app.eng.contacts.items[@intCast(cid - 1)];
+        if (c.deleted) return;
+        c.setAddr(ip_str, a.port);
+        const linked = app.eng.sessions.get(cid) != null;
+        join_due = app.join_map.contains(cid);
+        need_dial = !linked and !c.blocked and
+            (std.mem.order(u8, my_bundle, &a.bundle) == .lt or join_due);
+    }
+    if (!need_dial) return;
+    // markSeen не нужен: установление -> bindSession сам метит онлайн.
+    // dial — в планировщике (connWorker), не в потоке детекта: цикл
+    // обнаружения не блокируется на TCP вообще
+    var work = ConnWork{ .cid = cid };
+    const addr = discover_mod.fmtAddr(&work.addr_buf, a.ip, a.port);
+    work.addr_len = @intCast(addr.len);
+    connEnqueue(app, work) catch return;
+    // ответ пир-у: он анонснул — он слушает; свой анонс напрямую, чтобы
+    // он узнал о нас за ~RTT (не ждал нашего каденса). Не-инициатор
+    // всё равно сохранит наш адрес (автодозвон/contact_view)
+    if (disc) |d| d.announceTo(my_bundle.*, app.listen_port, a.ip, a.src_port);
 }
 
 /// Анонс нашего же bundle в LAN: другое устройство пользователя.
@@ -2213,21 +2309,13 @@ fn handleDeviceAnnounce(app: *App, ip: [4]u8, port: u16) void {
         }
     }
     if (dial_cid < 0) return;
-    var ab: [32]u8 = undefined;
-    const addr = discover_mod.fmtAddr(&ab, ip, port);
-    // single-flight + метка попытки (2.7.0): как и ручные пути
-    connFlightBegin(app, dial_cid) catch return;
-    const gen: u32 = blk: {
-        app.lock();
-        defer app.unlock();
-        break :blk connBeginAttemptLocked(app, dial_cid);
-    };
-    establishTo(app, addr, dial_cid, .initiator) catch |e| {
-        app.lock();
-        defer app.unlock();
-        connSetLocked(app, dial_cid, .failed, connErrOf(e), gen);
-    };
-    connFlightEnd(app, dial_cid);
+    // single-flight + метка попытки (2.7.0): как и ручные пути. dial —
+    // в планировщике (connWorker), не в потоке обнаружения: цикл детекта
+    // не блокируется на TCP (дедлайн dial — direct_dial_timeout_ms)
+    var work = ConnWork{ .cid = dial_cid };
+    const addr = discover_mod.fmtAddr(&work.addr_buf, ip, port);
+    work.addr_len = @intCast(addr.len);
+    connEnqueue(app, work) catch return;
 }
 
 /// Автолистенер: m1 несёт enc_pk звонящего — опознаём контакт и
@@ -3019,7 +3107,10 @@ fn establishToRelay(app: *App, addr: []const u8, opts: EstablishOpts) !void {
     else if (tor_len > 0)
         socks5.dial(app.alloc, tor_buf[0..tor_len], addr) catch return error.NoTor
     else
-        try tcp.dial(app.alloc, addr);
+        // прямой dial без явного окна — ВСЁ РАВНО с дедлайном: мёртвый
+        // адрес (файрвол дропает SYN) не блокирует поток автодозвона
+        // минутами (блокирующий connect висел бы до TCP-таймаута ядра)
+        try dialDeadline(app, addr, direct_dial_timeout_ms);
     {
         app.lock();
         defer app.unlock();
@@ -3241,7 +3332,12 @@ fn apiSendMessage(app: *App, payload: []const u8, w: *api.Writer) api.Status {
     // delivered в истории = подтверждено ACK (не «улетело в сокет»):
     // погашение пишет persistOutboxAck по событию MESSAGE_DELIVERED
     persistMsg(app, @intCast(cid), true, oc.msg_id, null, false, app.nowMs(), body, ents[0..n]);
-    if (oc.result == .queued) persistOutboxAdd(app);
+    if (oc.result == .queued) {
+        persistOutboxAdd(app);
+        // офлайн-получатель: dial НЕМЕДЛЕННО (в очередь планировщика),
+        // без ожидания циклов автодозвона/обнаружения
+        kickConnectLocked(app, @intCast(cid));
+    }
     w.putBytes(&oc.msg_id) catch return .INTERNAL;
     w.putU8(if (oc.result == .queued) 1 else 0) catch return .INTERNAL;
     return .OK;
@@ -3271,7 +3367,11 @@ fn apiSendReplyMessage(app: *App, payload: []const u8, w: *api.Writer) api.Statu
     if (std.mem.readInt(u16, target_rec[0..2], .little) != cid) return .NOT_FOUND;
     const oc = app.eng.sendReplyText(@intCast(cid), reply_to, body, ents[0..n]) catch |e| return statusOf(e);
     persistMsg(app, @intCast(cid), true, oc.msg_id, reply_to, false, app.nowMs(), body, ents[0..n]);
-    if (oc.result == .queued) persistOutboxAdd(app);
+    if (oc.result == .queued) {
+        persistOutboxAdd(app);
+        // офлайн-получатель: dial немедленно, как в SEND_MESSAGE
+        kickConnectLocked(app, @intCast(cid));
+    }
     w.putBytes(&oc.msg_id) catch return .INTERNAL;
     w.putU8(if (oc.result == .queued) 1 else 0) catch return .INTERNAL;
     return .OK;
@@ -5296,6 +5396,11 @@ fn startNetworking(app: *App) void {
         app.lock();
         app.listening = true;
         app.unlock();
+        // будилка линкера: событийные анонсы из kickConnect (до потоков;
+        // второй вызов startNetworking не переоткроет)
+        if (app.link_wake == null) {
+            if (wake.Waker.init() catch null) |wk| app.link_wake = wk;
+        }
         const lp = app.alloc.create(tcp.Listener) catch return;
         lp.* = l;
         const lt = std.Thread.spawn(.{}, autoAcceptLoop, .{ app, lp }) catch return;
@@ -5519,6 +5624,8 @@ pub fn main(start: std.process.Init) !void {
         app.conn_inflight.deinit(app.alloc);
         app.conn_st.deinit(app.alloc);
         app.conn_await.deinit(app.alloc);
+        // будилка цикла обнаружения
+        if (app.link_wake) |*wk| wk.deinit();
         var join_it = app.join_map.valueIterator();
         while (join_it.next()) |ji| std.crypto.secureZero(u8, &ji.secret);
         app.join_map.deinit(app.alloc);
@@ -6195,4 +6302,149 @@ test "2.7.0: GET_CONTACTS_DELTA окно и RESYNC за границей кол�
     var ds = api.Writer.init(alloc);
     defer ds.deinit();
     try t.expectEqual(api.Status.RESYNC_REQUIRED, apiGetContactsDelta(&app, dq.items(), &ds));
+}
+
+// ------------------------------- регрессии событийного подключения (LAN)
+/// Стенд: App + один контакт с адресом loopback-листенера. Пир-сторона
+/// не поднимается (рукопожатие оборвём закрытием конна) — проверяем, что
+/// dial стартует НЕМЕДЛЕННО (kickConnect/handleAnnounce), а не циклами.
+const LanTestRig = struct {
+    app: App,
+    id: identity.Identity,
+    eng: engine_mod.Engine,
+    lsn: tcp.Listener,
+    listen_port: u16,
+    peer_bundle: [64]u8,
+    alloc: std.mem.Allocator,
+};
+
+fn lanRigInit(alloc: std.mem.Allocator, io: std.Io, port: u16) !*LanTestRig {
+    const rig = try alloc.create(LanTestRig);
+    errdefer alloc.destroy(rig);
+    const seed: [32]u8 = @splat(0x5A);
+    rig.* = .{
+        .app = undefined,
+        .id = undefined,
+        .eng = undefined,
+        .lsn = undefined,
+        .listen_port = port,
+        .peer_bundle = @splat(0xAA),
+        .alloc = alloc,
+    };
+    rig.id = try identity.Identity.fromSeed(seed);
+    errdefer rig.id.deinit();
+    rig.eng = engine_mod.Engine.init(alloc, io, rig.id, .{ .ctx = undefined });
+    errdefer rig.eng.deinit();
+    var pbuf: [24]u8 = undefined;
+    const laddr = try std.fmt.bufPrint(&pbuf, "127.0.0.1:{d}", .{port});
+    rig.lsn = tcp.listen(laddr) catch {
+        rig.eng.deinit();
+        rig.id.deinit();
+        return error.SkipZigTest; // порт занят окружением
+    };
+    errdefer rig.lsn.deinit();
+    rig.app = .{
+        .alloc = alloc,
+        .io = io,
+        .id = &rig.id,
+        .eng = &rig.eng,
+        .hb = std.AutoHashMap(i64, hb.State).init(alloc),
+        .sess_ctx = std.AutoHashMap(i64, *SessCtx).init(alloc),
+    };
+    _ = try rig.eng.addContact("peer", rig.peer_bundle);
+    rig.eng.contacts.items[0].setAddr("127.0.0.1", port);
+    return rig;
+}
+
+/// Доработать connWorker (ждём снятия single-flight слота), собрать конны,
+/// освободить стенд. Вызывать в конце теста.
+fn lanRigTeardown(rig: *LanTestRig) void {
+    var waited: u32 = 0;
+    while (connInflight(&rig.app, 1) and waited < 500) : (waited += 1) {
+        sysfd.sleepMs(10);
+    }
+    for (rig.app.raw_conns.items) |tc| {
+        tc.deinit();
+        rig.alloc.destroy(tc);
+    }
+    rig.app.raw_conns.deinit(rig.alloc);
+    // воркер успевает поднять fake-TLS-обёртку до обрыва установления
+    for (rig.app.ftlss.items) |ftls| {
+        ftls.deinit();
+        rig.alloc.destroy(ftls);
+    }
+    rig.app.ftlss.deinit(rig.alloc);
+    for (rig.app.hist.items) |rec| rig.alloc.free(rec);
+    rig.app.hist.deinit(rig.alloc);
+    rig.app.hist_idx.deinit(rig.alloc);
+    rig.app.conn_work.deinit(rig.alloc);
+    rig.app.conn_inflight.deinit(rig.alloc);
+    rig.app.conn_st.deinit(rig.alloc);
+    rig.app.conn_await.deinit(rig.alloc);
+    rig.app.hb.deinit();
+    rig.app.sess_ctx.deinit();
+    rig.lsn.deinit();
+    rig.eng.deinit();
+    rig.id.deinit();
+    rig.alloc.destroy(rig);
+}
+
+/// Читаем ли листенер (пришёл SYN) в течение timeout_ms.
+fn lanListenerReadable(lsn: *const tcp.Listener, timeout_ms: i32) !bool {
+    var pfd = [1]posix.pollfd{.{ .fd = lsn.fd, .events = posix.POLL.IN, .revents = 0 }};
+    const n = try posix.poll(&pfd, timeout_ms);
+    return n == 1;
+}
+
+test "kick: отправка офлайн-сообщения стартует dial немедленно" {
+    const t = std.testing;
+    const alloc = t.allocator;
+    var rig = try lanRigInit(alloc, t.io, 39771);
+    defer lanRigTeardown(rig);
+    // SEND_MESSAGE офлайн-контакту: OK + queued-флаг в ответе
+    var pw = api.Writer.init(alloc);
+    defer pw.deinit();
+    try pw.putU32(1);
+    try pw.putStr16("привет");
+    try pw.putU8(0); // хвост entities: счётчик 0
+    var w = api.Writer.init(alloc);
+    defer w.deinit();
+    try t.expectEqual(api.Status.OK, apiSendMessage(&rig.app, pw.items(), &w));
+    try t.expectEqual(@as(usize, 17), w.items().len);
+    try t.expectEqual(@as(u8, 1), w.items()[16]); // queued
+    // сообщение в outbox, dial пошёл НЕ от цикла, а от отправки:
+    // листенер читаем (SYN дошёл) — до сетевых циклов дело не дошло бы
+    // (autodial спит 1с, linker слушает анонсы)
+    try t.expect(try lanListenerReadable(&rig.lsn, 2000));
+    // пир «принял и закрыл»: закрытие конна тестом гасит установление
+    const tc = try rig.lsn.accept(alloc);
+    tc.deinit();
+    alloc.destroy(tc);
+}
+
+test "kick: анонс пира сохраняет адрес и ставит dial в планировщик" {
+    const t = std.testing;
+    const alloc = t.allocator;
+    var rig = try lanRigInit(alloc, t.io, 39772);
+    defer lanRigTeardown(rig);
+    // наш bundle меньше пира — мы инициатор (детерминизм как в linkerLoop)
+    var my_bundle: [64]u8 = @splat(0);
+    const ann = discover_mod.Announce{
+        .bundle = rig.peer_bundle,
+        .port = rig.listen_port,
+        .ip = .{ 127, 0, 0, 1 },
+        .src_port = 45779,
+    };
+    handleAnnounce(&rig.app, &my_bundle, ann, null);
+    // адрес контакта обновлён из анонса
+    var ab: [80]u8 = undefined;
+    const got = rig.eng.contacts.items[0].addr(&ab) orelse return error.TestUnexpectedResult;
+    var eb: [24]u8 = undefined;
+    const want = try std.fmt.bufPrint(&eb, "127.0.0.1:{d}", .{rig.listen_port});
+    try t.expectEqualStrings(want, got);
+    // dial стартовал через планировщик (не в потоке детекта)
+    try t.expect(try lanListenerReadable(&rig.lsn, 2000));
+    const tc = try rig.lsn.accept(alloc);
+    tc.deinit();
+    alloc.destroy(tc);
 }

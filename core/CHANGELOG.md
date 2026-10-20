@@ -1,5 +1,60 @@
 # Changelog — stille-messenger
 
+## [Unreleased / неизданное] — событийный LAN-детект и мгновенный dial
+
+- LAN discovery is now event-driven instead of duty-cycled: the discovery
+  socket (bound to INADDR_ANY, multicast group + limited broadcast) is
+  polled continuously together with a wake pipe, so a peer’s announcement
+  is heard the moment it is sent. Previously the loop listened only 300 ms
+  out of every ~2.3 s and could miss a peer’s single announcement
+  indefinitely. Announcement cadence is 500 ms base / 100 ms while an
+  outbox entry or JOIN is pending; a send to an offline peer or a session
+  drop wakes the loop for an immediate announcement. Hearing a peer now
+  also sends a unicast reply announcement, so the peer learns about us
+  within one RTT instead of waiting for its own listen window.
+- `SEND_MESSAGE`/`SEND_REPLY_MESSAGE` to an offline peer no longer rely on
+  background cycles for delivery: the same API call enqueues an immediate
+  dial job to the last known address (single-flight, bounded queue) and
+  wakes the discovery loop for a burst announcement in parallel (the saved
+  address may be stale; with no address the contact switches to DISCOVERING
+  and waits for the burst). Session close and heartbeat-offline trigger an
+  immediate reconnect attempt instead of waiting for the autodial backoff.
+- Direct dials now always carry a 3000 ms deadline (previously the
+  autodial/linker paths used a blocking connect that could stall a thread
+  for minutes on a firewalled address). Relay-marker pairing and Tor SOCKS5
+  dials are unchanged. The discovery loop itself never performs TCP I/O:
+  announces it hears are converted into scheduler jobs.
+- Measured on loopback (ReleaseFast, single machine): announcement
+  detection (one UDP RTT) 45–96 µs; offline send → TCP dial started
+  0.5–2.1 ms. On a real LAN add the physical RTT of the medium. No wire,
+  storage or protocol change; the 74-byte announcement datagram is sent
+  to the multicast group and additionally as limited broadcast.
+- LAN-обнаружение стало событийным вместо циклов с «окнами слушания»:
+  сокет обнаружения (бинд на INADDR_ANY, мультикаст-группа + limited
+  broadcast) опрашивается непрерывно вместе с pipe-будилкой, поэтому анонс
+  пира слышится в момент отправки. Раньше цикл слушал лишь 300 мс из каждых
+  ~2.3 с и мог бесконечно пропускать одиночный анонс пира. Каденс анонсов —
+  500 мс базово / 100 мс, пока есть pending outbox или JOIN; отправка
+  офлайн-пиру или разрыв сессии будит цикл на немедленный анонс. Услышав
+  пира, ядро отвечает unicast-анонсом — пир узнаёт о нас за один RTT, а не
+  в своё следующее окно слушания.
+- `SEND_MESSAGE`/`SEND_REPLY_MESSAGE` офлайн-пиру больше не зависят от
+  фоновых циклов: тот же вызов API ставит немедленную работу dial по
+  последнему известному адресу (single-flight, ограниченная очередь) и
+  параллельно будит цикл обнаружения на burst-анонс (сохранённый адрес
+  мог устареть; если адреса нет — контакт переводится в DISCOVERING и
+  ждёт burst). Закрытие сессии и heartbeat-offline запускают немедленную
+  попытку переподключения вместо ожидания backoff автодозвона.
+- Прямые dial всегда несут дедлайн 3000 мс (раньше автодозвон/linker
+  использовали блокирующий connect, который мог подвесить поток на минуты
+  на адресе за «глухим» файрволом). Relay-marker-спаривание и Tor SOCKS5
+  без изменений. Сам цикл обнаружения не выполняет TCP I/O: услышанные
+  анонсы превращаются в работы планировщика.
+- Замер на loopback (ReleaseFast, одна машина): детект по анонсу (один
+  UDP RTT) 45–96 мкс; отправка офлайн → старт TCP dial 0.5–2.1 мс. На
+  реальной LAN добавляется физический RTT среды. Изменений провод-протокола
+  и хранилища нет; датаграмма анонса 74 байта теперь ходит и в
+  мультикаст-группу, и как limited broadcast.
 ## [Unreleased / неизданное] — исправление LAN-подключения device-link
 
 - Fixed `handleDeviceAnnounce`: selecting a known device-link contact no longer returns from the function while still in the selection block. The holder now proceeds to the existing single-flight authenticated dial path; waiter/blocked/deleted/already-online and `device_sync` guards remain unchanged. No wire or storage format change.

@@ -598,13 +598,17 @@ snapshot changes. They do not replace authenticated JOIN or `CONTACT_JOINED`.
 | contact card name / address | 32 / 64 bytes |
 | presence | PING after 4 s idle; 5 s interval; 3 misses → offline |
 | direct TCP port range | 7777–7786 (first free wins; all busy → LAN discovery off) |
-| LAN discovery | UDP multicast 239.77.77.77:57770, 74-byte announcements |
+| LAN discovery | UDP multicast 239.77.77.77:57770 + limited broadcast, 74-byte announcements; cadence 500 ms (100 ms burst while an outbox entry or JOIN is pending), immediate announce on a send to an offline peer; unicast reply on hearing a peer |
+| direct dial deadline | 3000 ms on every direct dial (relay-marker pairing and Tor SOCKS5 paths excluded) |
 | daemons per `$HOME` | 1 (single UDS path) |
 
 ## 7. Delivery model
 
 1. `SEND_MESSAGE` to an offline peer → response `queued=1`. The GUI shows
-   "will send later".
+   "will send later". The same call triggers the connect path immediately:
+   a dial job to the last known address (if any) plus a burst discovery
+   announcement in parallel (the address may be stale; address unknown —
+   discovery only) — delivery does not wait for background cycles.
 2. The peer appears (LAN/autodial) → the core flushes the queue itself.
 3. The receiver of every TEXT sends an ACK envelope → the sender gets
    `MESSAGE_DELIVERED`: the GUI shows the "delivered" check. This ACK —
