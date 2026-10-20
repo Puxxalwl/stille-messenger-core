@@ -18,6 +18,19 @@
   feeds the full code to `ACCEPT_INVITE`/`ACCEPT_INVITE_EX`. API version
   bumped to 2.8.0 (additive; wire, crypto and storage unchanged; new
   method ids pinned in the stability test).
+- Added `CREATE_INVITE_EX` mode 4 — the persistent profile code: the
+  secret is derived deterministically from the identity seed (HKDF over
+  the private enc-secret), so the code never burns, the invite registry
+  is not involved (no `TOO_MANY_INVITES` limit, stateless JOIN
+  validation), and repeating the call returns the same code. Designed for
+  permanent site deeplinks (`stille.im/invite/{short}` maps to this
+  code): any endpoint combination is allowed, relay recommended for
+  cross-network adds; relay presence is held while the daemon runs and is
+  restored by re-issuing the same call after restart. The code is a
+  capability: anyone holding it can add the owner (abuse via
+  `BLOCK_CONTACT`; rotation requires a seed-rotation change). JOIN
+  validation now also accepts the profile secret after the one-time
+  registry scan — additive, no wire format, crypto or storage change.
 - Добавлены `GENERATE_SHORT_CODE` (52) и `DECODE_SHORT_CODE` (53) для
   диплинков вида `stille.im/invite/{code}`: 9 знаков Crockford-base32
   (8 знаков данных — первые 40 бит SHA-256(bundle) + 1 позиционный
@@ -34,6 +47,18 @@
   `ACCEPT_INVITE`/`ACCEPT_INVITE_EX`. Версия API поднята до 2.8.0
   (аддитивно; провод, крипто и хранилище не менялись; новые id методов
   закреплены в тесте стабильности).
+- Добавлен режим 4 `CREATE_INVITE_EX` — персистентный код профиля:
+  секрет детерминированно выведен из сида личности (HKDF по приватному
+  enc-секрету), поэтому код не сгорает, реестр приглашений не занимается
+  (нет лимита `TOO_MANY_INVITES`, валидация JOIN stateless), повторный
+  вызов возвращает тот же код. Создан для постоянных диплинков сайта
+  (`stille.im/invite/{short}` маппится на этот код): комбинации адресов
+  любые, для добавления через сети рекомендован relay; релей-присутствие
+  держится, пока жив демон, после рестарта восстанавливается повторным
+  вызовом. Код — capability: получивший может добавить владельца (злое —
+  `BLOCK_CONTACT`; ротация требует смены сида). Валидация JOIN теперь
+  после реестра одноразовых принимает и секрет профиля — аддитивно, без
+  изменений формата провода, крипто и хранилища.
 
 ## [Unreleased / неизданное] — LAN discovery fix (мерж fix/mcast-membership-byteorder)
 

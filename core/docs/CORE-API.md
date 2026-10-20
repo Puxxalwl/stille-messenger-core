@@ -167,6 +167,23 @@ and responds `[code str16][invite_id 16]`. Modes: `0` discovery, `1` direct,
 Addresses are `host:port`; direct modes are rejected while Tor IP masking is
 enabled. `invite_id` is random and non-secret; it cannot recover the invite key.
 
+`CREATE_INVITE_EX` mode 4 (API 2.8.0) is the **persistent profile code**:
+the secret is not random but derived deterministically from the identity
+seed (HKDF), so the code never burns — every valid JOIN is accepted,
+forever, and the invite registry is not involved (no `TOO_MANY_INVITES`
+limit, validation is stateless). Any endpoint combination is allowed
+(direct, relay, hybrid, or none); a relay endpoint is recommended for
+site deeplinks because it works across networks. Repeating the call with
+the same arguments returns the same code. `invite_id` for mode 4 is the
+deterministic non-secret marker BLAKE2s-256(bundle)[0..16] (the
+`GET_IDENTITY` fingerprint prefix); `GET_INVITE_STATE` on it always
+answers active/never-expires. Security posture: the code is a capability
+— anyone who obtains it can add the owner (like a public profile link);
+abuse is handled with `BLOCK_CONTACT`, and rotation requires rotating the
+identity seed (a separate future change). Relay presence for a mode-4
+relay code is held while the daemon runs; after a restart the GUI re-issues
+the same call to restore it (the code itself is unchanged).
+
 `GET_INVITE_STATE` (50) takes `[invite_id 16]` and returns
 `[state u8][accepted_cid u32][expires_at_ms i64]`. States: 0 active, 1 joining,
 2 consumed, 3 expired (reserved), 4 failed. `joining` means a valid JOIN was
@@ -220,8 +237,10 @@ information-theoretically irreversible (45 bits < the 512-bit bundle):
 resolution works only for bundles the core already knows — the local
 identity and stored contacts. For strangers the deeplink site (for example
 `stille.im/invite/{code}`) holds the mapping from the short code to the
-inviter's full invite code (`CREATE_INVITE`/`CREATE_INVITE_EX`) and hands
-the full code to the client, which feeds it to `ACCEPT_INVITE`/`ACCEPT_INVITE_EX`.
+inviter's full code — the persistent profile code (`CREATE_INVITE_EX` mode 4)
+is designed exactly for this: it never burns, so one site link serves
+everyone — and hands the full code to the client, which feeds it to
+`ACCEPT_INVITE`/`ACCEPT_INVITE_EX`.
 Blocked contacts resolve normally (blocking is a rendering decision).
 A 40-bit hash collision between two contacts resolves deterministically to
 the lower cid. Errors: `BAD_ARGS` (malformed code), `NO_CONTACT` (unknown

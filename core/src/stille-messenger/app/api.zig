@@ -399,6 +399,12 @@ pub const InviteExMode = enum(u8) {
     relay_only = 2,
     /// Гибрид: v3-код stille://i3/ (direct, затем relay-fallback).
     direct_then_relay = 3,
+    /// Персистентный код профиля: секрет не случайный, а выведен из
+    /// сида (HKDF) — код НЕ сгорает после JOIN, реестр не занимается,
+    /// лимита приглашений нет. Адреса: любые комбинации (для сайта/
+    /// диплинков рекомендован relay — работает через сети). Повторный
+    /// вызов с теми же аргументами даёт ТОТ ЖЕ код (детерминизм).
+    profile = 4,
 };
 
 /// Состояние приглашения для GET_INVITE_STATE (u8 на проводе).
@@ -682,6 +688,7 @@ test "method ids стабильны (контракт провода)" {
     try std.testing.expectEqual(@as(u8, 0), @backingInt(AcceptDisposition.accepted));
     try std.testing.expectEqual(@as(u8, 2), @backingInt(AcceptDisposition.already_connected));
     try std.testing.expectEqual(@as(u8, 3), @backingInt(InviteExMode.direct_then_relay));
+    try std.testing.expectEqual(@as(u8, 4), @backingInt(InviteExMode.profile));
     try std.testing.expectEqual(@as(u8, 4), @backingInt(InviteState.failed));
     try std.testing.expectEqual(@as(u8, 1), @backingInt(DeltaChange.removed));
     try std.testing.expectEqual(@as(u16, 2), api_version[0]);

@@ -1439,7 +1439,10 @@ fn handleJoinEnvelope(sc: *SessCtx, env: envelope.Envelope) void {
         defer app.unlock();
         if (sc.cid != -1) return; // уже промоутнут (повторный кадр)
         // 2) HMAC: секрет одного из живых (не погашенных) приглашений
+        // ИЛИ статический секрет персистентного кода профиля (stateless:
+        // реестра нет, секрет выведен из сида, не сгорает никогда)
         var matched: ?usize = null;
+        var profile_matched = false;
         for (&app.invites, 0..) |*reg, i| {
             if (reg.used) continue;
             var mac: [32]u8 = undefined;
@@ -1450,7 +1453,41 @@ fn handleJoinEnvelope(sc: *SessCtx, env: envelope.Envelope) void {
             }
         }
         if (matched == null) {
+            var psec = profileSecret(app.id);
+            var mac: [32]u8 = undefined;
+            std.crypto.auth.hmac.sha2.HmacSha256.create(&mac, &transcript, &psec);
+            std.crypto.secureZero(u8, &psec);
+            if (std.crypto.timing_safe.eql([32]u8, mac, j.hmac)) profile_matched = true;
+        }
+        if (matched == null and !profile_matched) {
             failed = true;
+        } else if (profile_matched) {
+            // персистентный код: расходовать нечего, релей-присутствие
+            // держит profileRelayLoop демона; идём до бинда тем же путём
+            if (contactIdByBundle(app, j.bundle)) |existing| {
+                cid = existing; // переподключение (новое устройство и т.п.)
+            } else {
+                const ni = app.eng.addContact(j.name, j.bundle) catch {
+                    failed = true;
+                    return;
+                };
+                cid = @intCast(ni + 1);
+                app.hb.put(cid, .{}) catch {};
+                var role: u8 = 0;
+                if (std.mem.eql(u8, &j.bundle, &app.id.bundle())) {
+                    role = dev_role_waiter;
+                    app.eng.contacts.items[ni].dev_role = role;
+                    app.sync.addDevice(cid);
+                }
+                if (app.log) |log| logContact(app, log, j.name, j.bundle, null, null, role);
+            }
+            if (!failed) {
+                sc.cid = cid;
+                app.bindSessionLocked(cid, sess, sc) catch {
+                    failed = true;
+                    bind_failed = true;
+                };
+            }
         } else {
             // корректный HMAC: приглашение расходуется, идём до бинда —
             // состояние JOINING (GET_INVITE_STATE). Секрет в реестре
@@ -1495,8 +1532,10 @@ fn handleJoinEnvelope(sc: *SessCtx, env: envelope.Envelope) void {
     releasePendingLocked(sc);
     if (failed) {
         // bind не удался после корректного HMAC — приглашение FAILED
-        // (секрет уже погашен: повторный JOIN тем же кодом невозможен)
-        if (bind_failed) {
+        // (секрет уже погашен: повторный JOIN тем же кодом невозможен).
+        // Персистентный код (нулевой invite_done_id) в кольцо не пишется:
+        // он не «расходуется» — держатель может пробовать снова.
+        if (bind_failed and !std.mem.allEqual(u8, &invite_done_id, 0)) {
             app.lock();
             defer app.unlock();
             inviteDonePutLocked(app, invite_done_id, .failed, 0);
@@ -2719,6 +2758,28 @@ fn relayPresenceLoop(app: *App, cid: i64, from_server: bool) void {
     }
 }
 
+/// Статический секрет персистентного кода профиля (InviteExMode.profile):
+/// HKDF-SHA256 из приватного enc-секрета личности (того же, что держит
+/// relay-маркеры). Не хранится нигде: выводится на лету при создании кода
+/// и при проверке JOIN. Свойства: знающий код может добавить нас (как
+/// t.me-ссылку — intend-ed, от злоупотреблений BLOCK_CONTACT); подделать
+/// ДРУГОЙ валидный код нельзя — секрет не выводится из публичного bundle.
+const profile_secret_domain = "shopot-profile-code-v1";
+fn profileSecret(id: *const identity.Identity) [16]u8 {
+    var okm: [16]u8 = undefined;
+    std.crypto.kdf.hkdf.HkdfSha256.expand(&okm, profile_secret_domain, id.enc_secret);
+    return okm;
+}
+
+/// invite_id персистентного кода профиля: детерминированный НЕсекретный
+/// маркер (BLAKE2s-256(bundle)[0..16] — совпадает с отпечатком из
+/// GET_IDENTITY). GET_INVITE_STATE по нему отвечает active/бессрочно.
+fn profileInviteId(id: *const identity.Identity) [16]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.blake2.Blake2s256.hash(&(id.bundle()), &digest, .{});
+    return digest[0..16].*;
+}
+
 /// Поток A-стороны релея: держит регистрацию marker-ом, пока инвайт жив.
 /// Спаривание -> handleAcceptedConn (JOIN поднимет контакт). Обрыв ->
 /// переподключение (пир может дозваниваться долго).
@@ -2757,6 +2818,32 @@ fn relayLinkerLoop(app: *App, secret: [16]u8, addr: []const u8) void {
         // спарено: входящий пир (m1+JOIN) — как TCP-accept
         handleAcceptedConn(app, tc);
         // соединение отработало/оборвалось: инвайт ещё жив -> повтор
+    }
+}
+
+/// Поток релей-присутствия персистентного кода профиля: registration
+/// marker-ом, ПОКА ДЕМОН ЖИВ (секрет не сгорает — реестра нет). После
+/// рестарта присутствие восстанавливает GUI повторным CREATE_INVITE_EX
+/// mode=profile: код детерминирован и не меняется.
+fn profileRelayLoop(app: *App, addr_copy: []u8) void {
+    defer app.alloc.free(addr_copy);
+    while (app.running) {
+        var secret = profileSecret(app.id);
+        defer std.crypto.secureZero(u8, &secret);
+        const tc = stille_messenger.net.relay.dial(app.alloc, addr_copy, secret) catch {
+            sysfd.sleepMs(2000);
+            continue;
+        };
+        {
+            app.lock();
+            defer app.unlock();
+            app.raw_conns.append(app.alloc, tc) catch {
+                tc.deinit();
+                sysfd.sleepMs(2000);
+                continue;
+            };
+        }
+        handleAcceptedConn(app, tc);
     }
 }
 
@@ -4517,35 +4604,48 @@ fn apiCreateInviteEx(app: *App, payload: []const u8, w: *api.Writer) api.Status 
         .direct_then_relay => {
             if (d == null or rl == null) return .BAD_ARGS;
         },
+        // профиль: любые комбинации (∅ / direct / relay / гибрид);
+        // для диплинков сайта рекомендован relay (работает через сети)
+        .profile => {},
     }
     const name: []const u8 = if (name_in.len == 0) "stille-messenger" else name_in;
     var secret: [invite_mod.secret_len]u8 = undefined;
-    app.io.random(&secret);
     defer std.crypto.secureZero(u8, &secret);
     var invite_id: [16]u8 = undefined;
-    app.io.random(&invite_id);
+    const is_profile = mode == .profile;
     {
         app.lock();
         defer app.unlock();
-        if (mode == .direct or mode == .direct_then_relay) {
+        if (mode == .direct or mode == .direct_then_relay or (is_profile and d != null)) {
             if (app.cfg.use_tor_mask) return .BAD_ARGS; // прямой адрес не раскрываем
         }
-        var slot: ?usize = null;
-        for (&app.invites, 0..) |*reg, i| {
-            if (reg.used or reg.created_ms == 0) {
-                slot = i;
-                break;
+        if (is_profile) {
+            // персистентный код: секрет и invite_id детерминированы из
+            // личности; реестр не занимается (валидация stateless),
+            // лимита TOO_MANY_INVITES нет
+            secret = profileSecret(app.id);
+            invite_id = profileInviteId(app.id);
+        } else {
+            app.io.random(&secret);
+            app.io.random(&invite_id);
+            var slot: ?usize = null;
+            for (&app.invites, 0..) |*reg, i| {
+                if (reg.used or reg.created_ms == 0) {
+                    slot = i;
+                    break;
+                }
+            }
+            const i = slot orelse return .TOO_MANY_INVITES;
+            app.invites[i] = .{ .secret = secret, .created_ms = app.nowMs(), .used = false, .invite_id = invite_id };
+            if (rl) |ra| {
+                const n = @min(ra.len, relay_addr_max);
+                @memcpy(app.invites[i].relay_buf[0..n], ra[0..n]);
+                app.invites[i].relay_len = @intCast(n);
             }
         }
-        const i = slot orelse return .TOO_MANY_INVITES;
-        app.invites[i] = .{ .secret = secret, .created_ms = app.nowMs(), .used = false, .invite_id = invite_id };
-        if (rl) |ra| {
-            const n = @min(ra.len, relay_addr_max);
-            @memcpy(app.invites[i].relay_buf[0..n], ra[0..n]);
-            app.invites[i].relay_len = @intCast(n);
-        }
     }
-    // код: гибрид — v3 (i3), одиночные — v2 (обратная совместимость)
+    // код: гибрид — v3 (i3), одиночные — v2 (обратная совместимость);
+    // профиль с обоими адресами — v3-гибрид, иначе v2 (формат не меняется)
     var out: [512]u8 = undefined;
     var rbuf: [80]u8 = undefined;
     const code: []const u8 = blk: {
@@ -4557,13 +4657,32 @@ fn apiCreateInviteEx(app: *App, payload: []const u8, w: *api.Writer) api.Status 
             },
             .direct => break :blk invite_mod.encode2(&out, app.id.bundle(), secret, name, d) catch return .BAD_ARGS,
             .discovery => break :blk invite_mod.encode2(&out, app.id.bundle(), secret, name, null) catch return .BAD_ARGS,
+            .profile => {
+                if (d != null and rl != null) {
+                    break :blk invite_mod.encode3(&out, app.id.bundle(), secret, name, d, rl) catch return .BAD_ARGS;
+                } else if (rl != null) {
+                    const s = std.fmt.bufPrint(&rbuf, "r/{s}", .{rl.?}) catch return .BAD_ARGS;
+                    break :blk invite_mod.encode2(&out, app.id.bundle(), secret, name, s) catch return .BAD_ARGS;
+                } else if (d != null) {
+                    break :blk invite_mod.encode2(&out, app.id.bundle(), secret, name, d) catch return .BAD_ARGS;
+                } else {
+                    break :blk invite_mod.encode2(&out, app.id.bundle(), secret, name, null) catch return .BAD_ARGS;
+                }
+            },
         }
     };
     w.putStr16(code) catch return .INTERNAL;
     w.putBytes(&invite_id) catch return .INTERNAL;
     if (rl) |ra| {
         const addr_copy = app.alloc.dupe(u8, ra) catch return .INTERNAL;
-        if (std.Thread.spawn(.{}, relayLinkerLoop, .{ app, secret, addr_copy })) |t| {
+        if (is_profile) {
+            // присутствие на весь срок жизни демона (секрет не сгорает)
+            if (std.Thread.spawn(.{}, profileRelayLoop, .{ app, addr_copy })) |t| {
+                t.detach();
+            } else |_| {
+                app.alloc.free(addr_copy);
+            }
+        } else if (std.Thread.spawn(.{}, relayLinkerLoop, .{ app, secret, addr_copy })) |t| {
             t.detach();
         } else |_| {
             app.alloc.free(addr_copy);
@@ -4583,6 +4702,14 @@ fn apiGetInviteState(app: *App, payload: []const u8, w: *api.Writer) api.Status 
     if (r.hasMore()) return .BAD_FRAME;
     app.lock();
     defer app.unlock();
+    // персистентный код профиля: детерминированный маркер личности —
+    // всегда active, бессрочно, реестра нет (валидация stateless)
+    if (std.mem.eql(u8, invite_id, &profileInviteId(app.id))) {
+        w.putU8(@backingInt(api.InviteState.active)) catch return .INTERNAL;
+        w.putU32(0) catch return .INTERNAL;
+        w.putI64(0) catch return .INTERNAL;
+        return .OK;
+    }
     // живая регистрация
     for (&app.invites) |*reg| {
         if (reg.created_ms == 0) continue;
@@ -6679,4 +6806,97 @@ test "short code: генерация и резолв через API" {
     pw.list.clearRetainingCapacity();
     try pw.putU32(999);
     try t.expectEqual(api.Status.NO_CONTACT, apiGenerateShortCode(&rig.app, pw.items(), &w));
+}
+
+test "profile code: детерминизм, stateless-валидация, реестр не занимается" {
+    const t = std.testing;
+    const alloc = t.allocator;
+    var rig = try lanRigInit(alloc, t.io, 39774);
+    defer lanRigTeardown(rig);
+    var w = api.Writer.init(alloc);
+    defer w.deinit();
+    var pw = api.Writer.init(alloc);
+    defer pw.deinit();
+
+    // mode 4 (profile) дважды с теми же аргументами: ОДИН И ТОТ ЖЕ код
+    // (секрет выведен из сида, а не случайный) и один invite_id
+    const mkPayload = struct {
+        fn go(p: *api.Writer) !void {
+            try p.putU8(@backingInt(api.InviteExMode.profile));
+            try p.putStr16("профиль");
+            try p.putStr16("");
+            try p.putStr16("");
+        }
+    }.go;
+    try mkPayload(&pw);
+    try t.expectEqual(api.Status.OK, apiCreateInviteEx(&rig.app, pw.items(), &w));
+    var r = api.Reader.init(w.items());
+    const code1 = try r.readStr16();
+    const id1 = (try r.readBytes(16))[0..16].*;
+    try t.expect(!r.hasMore());
+    w.list.clearRetainingCapacity();
+    pw.list.clearRetainingCapacity();
+    try mkPayload(&pw);
+    try t.expectEqual(api.Status.OK, apiCreateInviteEx(&rig.app, pw.items(), &w));
+    r = api.Reader.init(w.items());
+    const code2 = try r.readStr16();
+    const id2 = (try r.readBytes(16))[0..16].*;
+    try t.expectEqualStrings(code1, code2);
+    try t.expectEqualSlices(u8, &id1, &id2);
+
+    // invite_id — детерминированный несекретный маркер личности
+    try t.expectEqualSlices(u8, &(profileInviteId(&rig.id)), &id1);
+
+    // код — обычный v2: bundle, имя; секрет == статический секрет профиля
+    const inv = try invite_mod.decode(code1);
+    try t.expect(inv.v2);
+    try t.expectEqualSlices(u8, &(rig.id.bundle()), &inv.bundle);
+    try t.expectEqualStrings("профиль", inv.name());
+    try t.expectEqualSlices(u8, &(profileSecret(&rig.id)), &inv.secret);
+
+    // stateless-валидация JOIN: HMAC по транскрипту с секретом из кода
+    // совпадает с HMAC по секрету, выведенному из сида; чужой секрет — нет
+    var transcript: [32]u8 = undefined;
+    for (&transcript, 0..) |*b, i| b.* = @truncate(i *% 7);
+    var mac_want: [32]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac_want, &transcript, &(profileSecret(&rig.id)));
+    var mac_code: [32]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac_code, &transcript, &inv.secret);
+    try t.expectEqualSlices(u8, &mac_want, &mac_code);
+    var mac_bad: [32]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&mac_bad, &transcript, &(@as([16]u8, @splat(1))));
+    try t.expect(!std.mem.eql(u8, &mac_want, &mac_bad));
+
+    // реестр не занимается: все 4 слота заняты живыми инвайтами —
+    // profile всё равно OK (нет TOO_MANY_INVITES), mode 0 — уже нет
+    for (0..4) |_| {
+        w.list.clearRetainingCapacity();
+        pw.list.clearRetainingCapacity();
+        try pw.putU8(@backingInt(api.InviteExMode.discovery));
+        try pw.putStr16("x");
+        try pw.putStr16("");
+        try pw.putStr16("");
+        try t.expectEqual(api.Status.OK, apiCreateInviteEx(&rig.app, pw.items(), &w));
+    }
+    w.list.clearRetainingCapacity();
+    pw.list.clearRetainingCapacity();
+    try pw.putU8(@backingInt(api.InviteExMode.discovery));
+    try pw.putStr16("y");
+    try pw.putStr16("");
+    try pw.putStr16("");
+    try t.expectEqual(api.Status.TOO_MANY_INVITES, apiCreateInviteEx(&rig.app, pw.items(), &w));
+    w.list.clearRetainingCapacity();
+    pw.list.clearRetainingCapacity();
+    try mkPayload(&pw);
+    try t.expectEqual(api.Status.OK, apiCreateInviteEx(&rig.app, pw.items(), &w));
+
+    // GET_INVITE_STATE по маркеру профиля: active, бессрочно
+    w.list.clearRetainingCapacity();
+    pw.list.clearRetainingCapacity();
+    try pw.putBytes(&id1);
+    try t.expectEqual(api.Status.OK, apiGetInviteState(&rig.app, pw.items(), &w));
+    r = api.Reader.init(w.items());
+    try t.expectEqual(@as(u8, 0), try r.readU8()); // active
+    try t.expectEqual(@as(u32, 0), try r.readU32());
+    try t.expectEqual(@as(i64, 0), try r.readI64());
 }
