@@ -441,6 +441,7 @@ fn enumerateLinux6(out_ip: *[max_endpoints6][16]u8) error{Network}!usize {
 fn enumerateDarwin6(out_ip: *[max_endpoints6][16]u8) error{Network}!usize {
     var ifap: ?*darwin_cabi.ifaddrs = null;
     if (darwin_cabi.getifaddrs(&ifap) != 0) return error.Network;
+    defer if (ifap) |head| darwinFreeIfAddrs(head);
     var count: usize = 0;
     var it = ifap;
     while (it) |ifa| : (it = ifa.next) {

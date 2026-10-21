@@ -42,7 +42,37 @@ pub const app = struct {
 };
 
 test {
-    std.testing.refAllDecls(@This());
+    // Сбор ко-located тестов всех файлов модуля: тесты файлов, импортированных
+    // только внутри вложенных контейнеров, компилятором не собираются —
+    // здесь импорт явный. Шаг test-unit (zig build test-unit).
+    _ = @import("stille-messenger/core/interfaces.zig");
+    _ = @import("stille-messenger/core/session.zig");
+    _ = @import("stille-messenger/core/engine.zig");
+    _ = @import("stille-messenger/crypto/kdf.zig");
+    _ = @import("stille-messenger/crypto/aead.zig");
+    _ = @import("stille-messenger/crypto/identity.zig");
+    _ = @import("stille-messenger/crypto/handshake.zig");
+    _ = @import("stille-messenger/crypto/ratchet.zig");
+    _ = @import("stille-messenger/crypto/call_keys.zig");
+    _ = @import("stille-messenger/crypto/pad.zig");
+    _ = @import("stille-messenger/crypto/recovery.zig");
+    _ = @import("stille-messenger/proto/codec.zig");
+    _ = @import("stille-messenger/proto/envelope.zig");
+    _ = @import("stille-messenger/net/framing.zig");
+    _ = @import("stille-messenger/net/obfuscate.zig");
+    _ = @import("stille-messenger/net/faketls.zig");
+    _ = @import("stille-messenger/net/relay.zig");
+    _ = @import("stille-messenger/net/heartbeat.zig");
+    _ = @import("stille-messenger/net/tcp.zig");
+    _ = @import("stille-messenger/net/socks5.zig");
+    _ = @import("stille-messenger/net/sysfd.zig");
+    _ = @import("stille-messenger/net/punch.zig");
+    _ = @import("stille-messenger/net/upnp.zig");
+    // app-слой: только экспортируемые из корня файлы; остальные
+    // (api/adpcm/...) тестируются корнем модуля демона (main.zig).
+    _ = @import("stille-messenger/app/config.zig");
+    _ = @import("stille-messenger/app/sync.zig");
+    _ = @import("stille-messenger/store/log.zig");
 }
 const std = @import("std");
 

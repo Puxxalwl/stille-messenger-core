@@ -1,5 +1,56 @@
 # Changelog — stille-messenger
 
+## [Unreleased / неизданное] — внутренний рефакторинг (без изменений провода)
+
+- Refactor (no wire, API, crypto, or persistence changes; byte-exact
+  compatibility preserved and verified by the full test suite — 252
+  tests, the count grew during the refactor: one new outbox-TTL
+  regression test plus root aggregation blocks of the new test groups):
+  the 7745-line daemon monolith `src/stille-messenger/app/main.zig` is
+  decomposed into single-concern modules (app.zig state root + paths,
+  events, connq, dial, receive, routes, sync_apply, persist, calls,
+  presence, lan, invites, profile_code, api_handlers, dispatch, and app
+  leaves). Layer-level dependency direction is one-way (nothing imports
+  main.zig; app.zig is the state root every module imports); two
+  inversions removed the former cycles through the monolith's root:
+  `App.session_bind/session_env_in/session_on_closed` function pointers
+  (dial→receive) and `api_server.Deps` injection (UDS transport no longer
+  imports app-layer code). Dead code removed: `autodialLoop`,
+  `establishTo`, `readRawAll`, `addrFastPresence` (zero live references
+  verified). `proto/envelope.zig` entities split into `proto/entities.zig`;
+  TEXT/REPLY_TEXT codec arms deduplicated (helpers `putBodyAndTail`/
+  `readBodyAndTail`; byte layout identical, roundtrip tests unchanged).
+- Testing: test roots and bodies physically separated under `tests/`
+  (`app.zig`, `proto.zig`, `crypto.zig`, `integration.zig` roots; new
+  build steps test-proto/test-crypto; `test-app` reuses `main.zig` as the
+  `app-main` module). Fixed a latent bug exposed by the new collection:
+  `app/audio.zig`'s frame test never compiled before (wrong pointer-to-
+  slice argument) — the test was dead since its file was never aggregated.
+- Fix (message loss): outbox TTL compared the message's RANDOM wire
+  `ts_ms` (deliberately random on the wire so timestamps do not leak the
+  local clock) against the real wall clock — an offline-queued message
+  whose random `ts_ms` landed below `now - 30d` (probability ≈ 1.7%)
+  was silently dropped from the outbox on session flush, never delivered.
+  `OutboxEntry` now carries `queued_ms` (real wall time, TTL domain);
+  the wire `ts_ms` is unchanged, the persisted log record layout is
+  unchanged (restored entries restart their TTL at load — conservative).
+  Regression test added (engine co-located); the previously ~2%-flaky
+  integration outbox scenario is now deterministic (verified by 200
+  consecutive runs of the built integration test binary).
+- Fix (test stability): two latent integration-test races — the ratchet
+  scenario asserted `prev_recv == null` after an exchange that could
+  itself trigger a fresh joint rotation landing on the receiver's rx
+  thread after the last frame (now waits for rotation quiescence and
+  delivers a final current-epoch frame); wait budgets 1 s → 5 s.
+  A leftover TEARDOWN debug print (which tripped the build runner's
+  flaky-retry reporting under `--listen` mode) was removed.
+- Fixes: `net/sysfd.zig` `localPort6` now uses the libc path on Darwin
+  (previously the Linux syscall wrapper unconditionally); `net/upnp.zig`
+  SSDP wait no longer polls twice (actual wait 2× the documented timeout);
+  `app/endpoints.zig` `enumerateDarwin6` now frees the `getifaddrs` list
+  (was leaked); `store/log.zig` stale "getrandom" comment removed and the
+  unused `EntropyUnavailable` error value dropped.
+
 ## [Unreleased / неизданное] — direct-first: IPv6 и UPnP, без релея (2.10.0)
 
 - Feature (wire-compatible, API 2.10.0): the relay becomes

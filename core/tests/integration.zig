@@ -276,7 +276,7 @@ fn filled(v: u8) [32]u8 {
 }
 
 fn waitTexts(h: *Harness, want: []const u8) !void {
-    for (0..100) |_| {
+    for (0..500) |_| {
         for (h.texts.items) |t| {
             if (std.mem.eql(u8, t, want)) return;
         }
@@ -286,7 +286,7 @@ fn waitTexts(h: *Harness, want: []const u8) !void {
 }
 
 fn waitReact(h: *Harness) !void {
-    for (0..100) |_| {
+    for (0..500) |_| {
         if (h.reacts.items.len > 0) return;
         std.Io.sleep(io_g.stored, .{ .nanoseconds = 10 * std.time.ns_per_ms }, .awake) catch {};
     }
@@ -294,7 +294,7 @@ fn waitReact(h: *Harness) !void {
 }
 
 fn waitPing(h: *Harness, seq: u32) !void {
-    for (0..100) |_| {
+    for (0..500) |_| {
         for (h.pings.items) |s| {
             if (s == seq) return;
         }
@@ -437,7 +437,6 @@ test "block: traffic from blocked peer is dropped engine-wide" {
     try std.testing.expect(!eng_a.contacts.items[idx_b].blocked);
 
     sb.close();
-    std.debug.print("TEARDOWN a_sessions={d} b_sessions={d}\n", .{ eng_a.sessions.count(), eng_b.sessions.count() });
     _ = eng_a.sessions.remove(cid_b);
     _ = eng_b.sessions.remove(1);
     eng_a.deinit();
@@ -532,11 +531,19 @@ test "ratchet: PCS-ротация по порогу отправки, все с�
     }
 
     // ротация реально случилась; завершение последнего обмена асинхронно
-    // (ответный паблик в полёте) — ждём синхронности эпох с таймаутом
+    // (ответный паблик в полёте). Ждём ПОЛНОЙ синхронности: равные эпохи
+    // И погашенные ротации у обеих сторон. Равенства эпох недостаточно:
+    // обе стороны могут стоять на эпохе N, ещё не съев последний
+    // RATCHET_KEY пира (rx-потоки) — совместный DH-шаг не состоялся, и
+    // финальные кадры уйдут по старой эпохе: получатель примет их в
+    // prev_recv-снимок, который гасится только кадром ТЕКУЩЕЙ эпохи
     try std.testing.expect(sa.ratchet.epoch > 1);
     var synced = false;
     for (0..200) |_| {
-        if (sa.ratchet.epoch == sb.ratchet.epoch) {
+        if (sa.ratchet.epoch == sb.ratchet.epoch and
+            sa.rot_own == null and sa.rot_peer == null and
+            sb.rot_own == null and sb.rot_peer == null)
+        {
             synced = true;
             break;
         }
@@ -561,7 +568,26 @@ test "ratchet: PCS-ротация по порогу отправки, все с�
     try waitTexts(&hb, long_buf[0..]);
     try sb.sendText(long_buf[0..]);
     try waitTexts(&ha, long_buf[0..]);
-    // кадр новой эпохи дошёл и погасил снапшот у B
+    // последний обмен мог сам запустить НОВУЮ ротацию (порог на отправке):
+    // совместный шаг приземлится в rx-потоке B уже ПОСЛЕ последнего
+    // кадра a->b, и prev_recv законно останется выставленным — протокол
+    // держит его сколько угодно долго. Гасим детерминированно: ждём
+    // гашения ротаций у обеих сторон и досылаем кадр ТЕКУЩЕЙ эпохи
+    var quiet = false;
+    for (0..200) |_| {
+        if (sa.rot_own == null and sa.rot_peer == null and
+            sb.rot_own == null and sb.rot_peer == null)
+        {
+            quiet = true;
+            break;
+        }
+        std.Io.sleep(io, .{ .nanoseconds = 10 * std.time.ns_per_ms }, .awake) catch {};
+    }
+    try std.testing.expect(quiet);
+    // один кадр (счётчик отправки A после ротации 0 -> 1 < порога 4):
+    // новой ротации не будет, кадр уйдёт текущей эпохой и погасит снимок
+    try sa.sendText("post-rotate-2");
+    try waitTexts(&hb, "post-rotate-2");
     try std.testing.expect(sb.prev_recv == null);
 
     sa.close();

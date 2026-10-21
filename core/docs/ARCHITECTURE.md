@@ -21,7 +21,7 @@ Layer and data-flow reference for the `stille-messenger` core. Russian version:
 
 | Layer | Directory | Responsibility |
 |---|---|---|
-| app | `src/stille-messenger/app/` | daemon: UDS API server, invites, LAN discovery, autodial, outbox flushing, call audio loop, file transfers, configuration (config.zig), device sync (sync.zig), account recovery (recovery.zig: build/apply the sealed profile package; unprovisioned serve mode), Tor SOCKS5 dialing |
+| app | `src/stille-messenger/app/` | daemon: UDS API server, invites, LAN discovery, outbox flushing, call audio loop, file transfers, configuration (config.zig), device sync (sync.zig), account recovery (recovery.zig: build/apply the sealed profile package; unprovisioned serve mode), Tor SOCKS5 dialing — decomposed into single-concern modules (§2.1) |
 | core | `src/stille-messenger/core/` | engine (contacts, locks, dispatch, outbox, file Tx state machines), session (handshake + sealed frames) |
 | proto | `src/stille-messenger/proto/` | binary envelopes, allocation-free codec |
 | crypto | `src/stille-messenger/crypto/` | identity, hybrid handshake (X25519 + ML-KEM-768), ratchet, call keys, AEAD, padding |
@@ -29,7 +29,52 @@ Layer and data-flow reference for the `stille-messenger` core. Russian version:
 | store | `src/stille-messenger/store/` | encrypted append-only log |
 
 Dependencies run one way (app → engine → session → proto/crypto →
-interfaces); nothing reaches upward. The app layer is the only place that
+interfaces); nothing reaches upward.
+
+### 2.1 App-layer module map
+
+The daemon is decomposed into single-concern modules. The dependency
+direction is one-way at the LAYER level: nothing imports `main.zig`,
+`app.zig` (state, types, limits) is a state sink every module imports,
+and nothing reaches below its own layer. Sibling modules within the app
+layer may import each other (e.g. connq ↔ dial) — local, single-layer
+collaborations that Zig resolves; the inversions below removed the
+cycles that used to pass through the monolith's root:
+
+| module | responsibility |
+|---|---|
+| `main.zig` | composition root: CLI (init/relay/serve), `App` assembly, hook wiring, `api_srv.start` Deps, networking bootstrap, teardown |
+| `app.zig` | `App` struct: all daemon state (contacts, sessions, invites, punch routes, call, config), shared types (`SessCtx`, `ConnWork`, `InviteReg`…), limits, `lock/unlock/nowMs` |
+| `paths.zig` | data-dir migration, persistent seed (0600), hex utils |
+| `events.zig` | ev* fanout to UDS clients, observable contact state, delta ring |
+| `connq.zig` | connection scheduler: bounded queue, single-flight, workers (`connWorker`, `punchRun`) |
+| `dial.zig` | deadline dial, fake-TLS wrap, handshake (both roles), JOIN window, accept loops |
+| `routes.zig` | direct-path state: PUNCH_CANDIDATES/V6_ADDR exchange, reflexive addresses, ROUTE_STATE events |
+| `receive.zig` | envelope dispatcher (`envIn`), JOIN/invite acceptance, engine callbacks (`on*Ev`), `bindSession` |
+| `sync_apply.zig` | device-sync record apply (MAC check, idempotent), ACK |
+| `persist.zig` | log record layouts, history/pins cache, sync enqueue/flush, full replay |
+| `calls.zig` | call state machine, mic/jitter loops, call API |
+| `presence.zig` | ticker, relay presence loops, server-mode presence, `applyConfigLocked` |
+| `lan.zig` | LAN linker loop: announce, peer/device announcements |
+| `invites.zig` | invite registry, accept flows, profile-code epoch, short codes, relay linkers |
+| `profile_code.zig` | profile-code secret/invite-id derivation (domain-separated) |
+| `api_handlers.zig` | UDS method handlers (messaging/history/contacts/system) |
+| `dispatch.zig` | `ApiRequest` → handler → exactly one response |
+| `api_server.zig` | UDS transport: framing, conn set, fanout — knows nothing of `App` (deps injected via `Deps`) |
+| leaf helpers | `invite.zig`, `endpoints.zig`, `discover.zig`, `wake.zig`, `audio.zig`, `adpcm.zig`, `search.zig`, `sync.zig`, `config.zig` |
+
+Two dependency inversions removed the former cycles through the
+composition root (same idiom as `sync.tr_fn`):
+
+- `App.session_bind / session_env_in / session_on_closed` — function
+  pointers set once in `main()` before threads start: `dial.zig` binds
+  sessions and feeds envelopes without importing the receive layer.
+- `api_srv.Deps` — the UDS server receives the app context, dispatch
+  function and lock/unlock as injected pointers; it imports no app-layer
+  module.
+
+`persist.zig` owns sync enqueue/flush, `sync_apply.zig` owns record
+application — the split is what keeps `persist → sync_apply` one-way. The app layer is the only place that
 dials: it creates a transport (TCP, fake-TLS, relay, SOCKS5), wraps the raw
 connection into an obfuscated `interfaces.Conn` and hands it to the engine —
 sessions never see a socket:
@@ -166,18 +211,34 @@ persist* (app, under app.mu)
 
 ## 6. Callbacks (engine → app)
 
-The engine reports everything through function pointers set by the app:
+The engine reports everything through function pointers set by the app
+(`receive.engineEvents` in the daemon; the app→receive direction is
+inverted through `App.session_bind` and friends, §2.1):
 `onText`, `onReact`, `onAck`, presence changes, `onProfile`, `onAvatar`,
 `onAvatarReq`, `onFileSent`, call state, `onSync`/`onSyncAck` (device-sync
 batches). The app layer turns them into UDS events and DB writes.
 
 ## 7. Testing
 
-- Unit tests (`test {}` blocks) live in each file and are owned by the
-  module owner.
-- Integration scenarios live in `tests/integration.zig`: full protocol
-  between two in-process parties over loopback/scripted connections
-  (handshake → messages → rotation → reconnect → resume).
-- `zig build test` green is the handoff condition; CI runs it on every
-  `zig-v*` tag together with release builds for x86_64-linux-musl and
-  aarch64-macos.
+Test **roots and test bodies live in `tests/`**, never in `src/` (Zig
+compiles `test` blocks only under test roots, so roots are explicit):
+
+| step | root | what runs |
+|---|---|---|
+| `zig build test-unit` | `src/stille-messenger.zig` (test-mode library module) | co-located invariant tests of library files, collected by the root's explicit import block |
+| `zig build test-proto` | `tests/proto.zig` | protocol conformance bodies in `tests/proto/` |
+| `zig build test-crypto` | `tests/crypto.zig` | crypto conformance bodies in `tests/crypto/` |
+| `zig build test-app` | `src/stille-messenger/app/main.zig` + `tests/app.zig` | co-located tests of app-tree files + daemon test bodies in `tests/app.zig` (import the app tree via the `app-main` module) |
+| `zig build test-integration` | `tests/integration.zig` | end-to-end scenarios over loopback/scripted connections (handshake → messages → rotation → reconnect → resume) |
+| `zig build test` | — | all of the above; `zig build bench` runs the transport benchmark (`tests/bench_transport.zig`) |
+
+Co-location policy: a file keeps its `test` blocks in `src/` only when
+they exercise **private** declarations (e.g. `core/session.zig`,
+`core/engine.zig`, `store/log.zig`, most `net/` files); the library
+root and `main.zig` also keep pure aggregation blocks
+(`test { _ = @import(…) }`). Everything else — bodies with public-API
+access only — moves to `tests/`. `tests/README.md` documents the policy.
+
+`zig build test` green is the handoff condition; CI runs it on every
+`zig-v*` tag together with release builds for x86_64-linux-musl and
+aarch64-macos.

@@ -59,6 +59,14 @@ pub const Kind = enum(u8) {
     event = 3,
 };
 
+/// Запрос API, собранный сервером из кадра. Принадлежит провод-контракту
+/// (api_server передаёт его в диспетчер приложения как есть).
+pub const ApiRequest = struct {
+    method: Method,
+    request_id: u32,
+    payload: []const u8,
+};
+
 /// Методы API (u16 на проводе, имена SCREAMING_SNAKE — контракт).
 pub const Method = enum(u16) {
     /// Закрыть соединение (не демон).

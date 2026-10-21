@@ -117,7 +117,13 @@ pub const Events = struct {
 pub const OutboxEntry = struct {
     cid: i64,
     msg_id: [16]u8,
+    /// ts на проводе (СЛУЧАЙНЫЙ: не раскрывает локальные часы) — только
+    /// для пира и дедупа; временем жизни записи он НЕ является.
     ts_ms: u64,
+    /// Реальное wall-время постановки в очередь (мс) — домен TTL-проверки
+    /// flushOutbox. Отдельно от ts_ms: смешение доменов молча теряло
+    /// ~1.7% офлайн-сообщений (случайный ts < now-30d).
+    queued_ms: u64,
     /// Reply target; null for ordinary TEXT.
     reply_to: ?[16]u8 = null,
     /// Копия тела (alloc); свободается при ACK/истечении.
@@ -127,6 +133,12 @@ pub const OutboxEntry = struct {
     /// флеше outbox. Свободается вместе с body.
     ents_tail: []u8 = &.{},
 };
+
+/// TTL-решение flushOutbox: домен РЕАЛЬНОГО времени постановки
+/// (queued_ms), не случайного wire-ts (см. OutboxEntry).
+fn outboxFresh(e: OutboxEntry, now_ms: u64) bool {
+    return e.queued_ms + outbox_ttl_ms > now_ms;
+}
 
 /// Передача файла в полёте (отправитель). Байты хранятся в движке до
 /// подтверждения всех чанков — как outbox для TEXT: реконнект сессии
@@ -361,7 +373,7 @@ pub const Engine = struct {
         }
         const copy = try self.alloc.dupe(u8, body);
         const tail_copy = if (ents_tail.len == 0) @as([]u8, &.{}) else try self.alloc.dupe(u8, ents_tail);
-        self.outbox.append(self.alloc, .{ .cid = cid, .msg_id = msg_id, .ts_ms = ts_ms, .reply_to = reply_to, .body = copy, .ents_tail = tail_copy }) catch {
+        self.outbox.append(self.alloc, .{ .cid = cid, .msg_id = msg_id, .ts_ms = ts_ms, .queued_ms = @intCast(self.nowMs()), .reply_to = reply_to, .body = copy, .ents_tail = tail_copy }) catch {
             self.alloc.free(copy);
             self.alloc.free(tail_copy);
             return error.OutOfMemory;
@@ -543,7 +555,7 @@ pub const Engine = struct {
         var i: usize = 0;
         while (i < self.outbox.items.len) {
             const e = self.outbox.items[i];
-            const fresh = e.ts_ms + outbox_ttl_ms > @as(u64, @intCast(self.nowMs()));
+            const fresh = outboxFresh(e, @intCast(self.nowMs()));
             if (e.cid != contact_id or !fresh) {
                 if (e.cid == contact_id and !fresh) {
                     const old = self.outbox.orderedRemove(i);
@@ -928,6 +940,32 @@ const TextProbe = struct {
         for (ents, 0..) |e, i| self.ents[i] = e;
     }
 };
+
+test "engine: outbox TTL — домен времени постановки, не случайного wire-ts" {
+    // регрессия: fresh-проверка flushOutbox сравнивала СЛУЧАЙНЫЙ wire-ts_ms
+    // (приватность: ts на проводе не раскрывает локальные часы) с реальными
+    // часами — запись с ts < now-30d (вероятность ~1.7%) молча выбрасывалась
+    // без отправки. TTL обязан считать от реального времени постановки.
+    const alloc = std.testing.allocator;
+    const id = try identity_mod.Identity.fromSeed(filled32(17));
+    const peer = try identity_mod.Identity.fromSeed(filled32(19));
+    var eng = Engine.init(alloc, std.testing.io, id, .{});
+    defer eng.deinit();
+    const idx = try eng.addContact("peer", peer.bundle());
+    const cid: i64 = @intCast(idx + 1);
+
+    _ = try eng.sendText(cid, "ttl-body", &.{});
+    // подменяем wire-ts на «доисторический»: TTL от него не зависит
+    eng.outbox.items[0].ts_ms = 0;
+    const e = &eng.outbox.items[0];
+    const now: u64 = @intCast(eng.nowMs());
+    try std.testing.expect(e.queued_ms <= now);
+    try std.testing.expect(outboxFresh(e.*, @intCast(eng.nowMs()))); // решение flushOutbox
+
+    // реально старая запись — решение ложно, флеш её выкинет
+    e.queued_ms = now -| (outbox_ttl_ms + 1);
+    try std.testing.expect(!outboxFresh(e.*, @intCast(eng.nowMs())));
+}
 
 test "engine: TEXT с entities — outbox хранит хвост, onText парсит" {
     const alloc = std.testing.allocator;

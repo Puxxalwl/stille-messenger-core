@@ -5,6 +5,10 @@
 //! ответ ядра с корреляцией по request_id; события ядра рассылаются всем
 //! подключённым клиентам. Строк на проводе нет.
 //!
+//! Модуль не знает про App: зависимости (аллокатор, io, флаг running,
+//! лок, диспетчер) инжектируются через Deps. Список коннов живёт под
+//! инжектированным локом (app.mu), как и поле subscribed.
+//!
 //! Потоки: по одному на соединение (команды исполняются последовательно
 //! под app.mu, как раньше). Запись в сокет сериализуется спин-локом wmu:
 //! ответы из потока команды и события из потоков сессий не перемешиваются.
@@ -12,7 +16,6 @@ const std = @import("std");
 const posix = std.posix;
 const stille_messenger = @import("stille-messenger");
 const sysfd = stille_messenger.net.sysfd;
-const main = @import("main.zig");
 const api = @import("api.zig");
 
 /// Размер буфера чтения сокета. 64 KiB снижает syscall overhead на больших
@@ -49,7 +52,7 @@ pub const Conn = struct {
     /// 2.7.0): CONTACT_STATE_CHANGED/CONTACTS_CHANGED/CONTACT_UPSERTED
     /// доставляются ТОЛЬКО подписанным соединениям — старые клиенты их
     /// не получают вовсе (обратная совместимость без клиентской фильтрации).
-    /// Читается/ставится под app.mu (как список conns).
+    /// Читается/ставится под инжектированным локом (как список conns).
     subscribed: bool = false,
 
     /// Записать кадр целиком (заголовок + payload) под wmu.
@@ -86,23 +89,35 @@ pub const Conn = struct {
     }
 };
 
+/// Зависимости сервера от приложения (инверсия: App передаётся как
+/// нетипизированный ctx). lock/unlock обязаны брать тот же лок, под
+/// которым живут conns и вызывается fanout (в демоне это app.mu).
+pub const Deps = struct {
+    ctx: *anyopaque,
+    /// Исполнить запрос; false — закрыть соединение (CLOSE).
+    dispatch: *const fn (ctx: *anyopaque, conn: *Conn, req: api.ApiRequest) bool,
+    lock: *const fn (ctx: *anyopaque) void,
+    unlock: *const fn (ctx: *anyopaque) void,
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    running: *bool,
+};
+
 pub const Server = struct {
-    app: *main.App,
-    /// Подключённые клиенты. Список — под app.mu.
+    deps: Deps,
+    /// Подключённые клиенты. Список — под deps.lock (app.mu демона).
     conns: std.ArrayListUnmanaged(*Conn) = .empty,
 
     fn addConn(self: *Server, c: *Conn) void {
-        const app = self.app;
-        app.lock();
-        defer app.unlock();
-        self.conns.append(app.alloc, c) catch {};
+        self.deps.lock(self.deps.ctx);
+        defer self.deps.unlock(self.deps.ctx);
+        self.conns.append(self.deps.alloc, c) catch {};
     }
 
     fn removeConn(self: *Server, c: *Conn) void {
-        const app = self.app;
         {
-            app.lock();
-            defer app.unlock();
+            self.deps.lock(self.deps.ctx);
+            defer self.deps.unlock(self.deps.ctx);
             for (self.conns.items, 0..) |it, i| {
                 if (it == c) {
                     _ = self.conns.swapRemove(i);
@@ -110,24 +125,24 @@ pub const Server = struct {
                 }
             }
         }
-        if (c.payload) |p| app.alloc.free(p);
+        if (c.payload) |p| self.deps.alloc.free(p);
         sysfd.close(c.fd);
-        app.alloc.destroy(c);
+        self.deps.alloc.destroy(c);
     }
 };
 
-/// Разослать событие всем клиентам (ВЫЗЫВАТЬ ПОД app.mu).
-pub fn fanoutEventLocked(app: *main.App, ev: api.Event, payload: []const u8) void {
-    const srv = app.cli orelse return;
-    for (srv.conns.items) |c| c.sendEvent(ev, payload);
+/// Разослать событие всем клиентам (ВЫЗЫВАТЬ ПОД локом conns, app.mu).
+pub fn fanoutEventLocked(srv: ?*Server, ev: api.Event, payload: []const u8) void {
+    const s = srv orelse return;
+    for (s.conns.items) |c| c.sendEvent(ev, payload);
 }
 
 /// Разослать событие ТОЛЬКО подписанным (SUBSCRIBE_CONTACT_UPDATES)
 /// клиентам (ВЫЗЫВАТЬ ПОД app.mu). Новые события контактов 2.7.0 не
 /// доставляются старым клиентам — их провод расширяется без их ведома.
-pub fn fanoutSubEventLocked(app: *main.App, ev: api.Event, payload: []const u8) void {
-    const srv = app.cli orelse return;
-    for (srv.conns.items) |c| {
+pub fn fanoutSubEventLocked(srv: ?*Server, ev: api.Event, payload: []const u8) void {
+    const s = srv orelse return;
+    for (s.conns.items) |c| {
         if (c.subscribed) c.sendEvent(ev, payload);
     }
 }
@@ -143,7 +158,7 @@ fn handleFrame(srv: *Server, conn: *Conn, hdr: api.Header, payload: []const u8) 
         conn.sendResponse(hdr.id, hdr.request_id, .UNKNOWN_METHOD, &.{});
         return true;
     };
-    return main.dispatchApi(srv.app, conn, .{
+    return srv.deps.dispatch(srv.deps.ctx, conn, .{
         .method = method,
         .request_id = hdr.request_id,
         .payload = payload,
@@ -171,7 +186,7 @@ fn feed(srv: *Server, conn: *Conn, data: []const u8) bool {
                 return false;
             }
             if (hdr.payload_len > 0) {
-                conn.payload = srv.app.alloc.alloc(u8, hdr.payload_len) catch {
+                conn.payload = srv.deps.alloc.alloc(u8, hdr.payload_len) catch {
                     conn.sendResponse(hdr.id, hdr.request_id, .INTERNAL, &.{});
                     return false;
                 };
@@ -195,7 +210,7 @@ fn feed(srv: *Server, conn: *Conn, data: []const u8) bool {
         conn.payload = null;
         conn.payload_have = 0;
         const ok = handleFrame(srv, conn, hdr, if (pbuf) |p| p else &.{});
-        if (pbuf) |p| srv.app.alloc.free(p);
+        if (pbuf) |p| srv.deps.alloc.free(p);
         if (!ok) return false;
     }
     return true;
@@ -203,9 +218,8 @@ fn feed(srv: *Server, conn: *Conn, data: []const u8) bool {
 
 /// Поток одного клиента: читает байты, собирает кадры, исполняет.
 fn connLoop(srv: *Server, conn: *Conn) void {
-    const app = srv.app;
     var rbuf: [read_chunk]u8 = undefined;
-    while (app.running) {
+    while (srv.deps.running.*) {
         const n = rawRead(conn.fd, &rbuf) orelse break;
         if (n == 0) break;
         if (!feed(srv, conn, rbuf[0..n])) break;
@@ -214,8 +228,7 @@ fn connLoop(srv: *Server, conn: *Conn) void {
 }
 
 fn spawnConn(srv: *Server, fd: posix.socket_t) void {
-    const app = srv.app;
-    const c = app.alloc.create(Conn) catch {
+    const c = srv.deps.alloc.create(Conn) catch {
         sysfd.close(fd);
         return;
     };
@@ -233,23 +246,25 @@ fn spawnConn(srv: *Server, fd: posix.socket_t) void {
 }
 
 fn udsAcceptLoop(srv: *Server, lfd: posix.socket_t) void {
-    while (srv.app.running) {
+    while (srv.deps.running.*) {
         const fd = sysfd.accept(lfd) catch continue;
         spawnConn(srv, fd);
     }
 }
 
-/// Поднять API-сервер: UDS-сокет $HOME/.stille-messenger/api.sock.
-/// Вызывается один раз при старте serve (до старта потоков фронт-енда).
-pub fn start(app: *main.App, home: []const u8) void {
+/// Поднять API-сервер: UDS-сокет <home>/<dir_name>/api.sock.
+/// cli_slot — слот, куда записать созданный Server (в демоне это
+/// App.cli; события рассылаются через него). Вызывается один раз при
+/// старте serve (до старта потоков фронт-енда).
+pub fn start(deps: Deps, cli_slot: *?*Server, home: []const u8, dir_name: []const u8) void {
     if (home.len == 0) return;
-    const srv = app.alloc.create(Server) catch return;
-    srv.* = .{ .app = app };
-    app.cli = srv;
+    const srv = deps.alloc.create(Server) catch return;
+    srv.* = .{ .deps = deps };
+    cli_slot.* = srv;
 
     var pb: [128]u8 = undefined;
-    const sock_path = std.fmt.bufPrint(&pb, "{s}/{s}/api.sock", .{ home, main.data_dir_name }) catch return;
-    std.Io.Dir.deleteFileAbsolute(app.io, sock_path) catch {};
+    const sock_path = std.fmt.bufPrint(&pb, "{s}/{s}/api.sock", .{ home, dir_name }) catch return;
+    std.Io.Dir.deleteFileAbsolute(deps.io, sock_path) catch {};
     const ufd = sysfd.socketUnix() catch {
         std.debug.print("api: uds-сокет не создан\n", .{});
         return;

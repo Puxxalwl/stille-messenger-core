@@ -203,8 +203,15 @@ pub fn setV6Only(fd: fd_t, on: bool) void {
 pub fn localPort6(fd: fd_t) ?u16 {
     var sa: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
     var sl: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-    const rc = std.os.linux.getsockname(fd, @ptrCast(&sa), &sl);
-    if (std.os.linux.errno(rc) != .SUCCESS) return null;
+    const rc = if (is_linux)
+        std.os.linux.getsockname(fd, @ptrCast(&sa), &sl)
+    else
+        cabi.getsockname(@intCast(fd), @ptrCast(&sa), &sl);
+    if (is_linux) {
+        if (std.os.linux.errno(rc) != .SUCCESS) return null;
+    } else if (rc < 0) {
+        return null;
+    }
     if (sa.family != posix.AF.INET6) return null;
     const sa6: *const posix.sockaddr.in6 = @ptrCast(@alignCast(&sa));
     return std.mem.bigToNative(u16, sa6.port);
