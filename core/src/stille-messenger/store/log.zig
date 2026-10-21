@@ -92,7 +92,6 @@ pub const Error = error{
     RecordTooLarge,
     SeqOverflow,
     EpochOverflow,
-    EntropyUnavailable,
     AccessDenied,
     BadPathName,
     Canceled,
@@ -551,7 +550,6 @@ fn writeHeader(buf: *[header_size]u8, epoch: u32, base_seq: u32) void {
     mem.writeInt(u32, buf[8..12], base_seq, .little);
 }
 
-/// Заполняет buf криптостойкой энтропией ОС (getrandom).
 /// Собирает зашифрованную запись в buf (buf.len >= max_record_disk).
 fn assembleRecord(buf: []u8, kind: Kind, seq: u32, payload: []const u8, epoch: u32, key: *const [32]u8) Error![]u8 {
     if (payload.len > max_payload) return error.RecordTooLarge;

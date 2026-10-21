@@ -161,7 +161,6 @@ pub fn ssdpDiscover(alloc: std.mem.Allocator) Error!?[]u8 {
     // sendto мультикастом; ответ может прийти unicast-ом на этот сокет
     sysfd.sendtoIn(fd, msearch, &sa);
     if (!sysfd.pollReadable(fd, ssdp_timeout_ms)) return null;
-    if (!sysfd.pollReadable(fd, ssdp_timeout_ms)) return null;
     var buf: [2048]u8 = undefined;
     var from: sysfd.SockaddrIn = undefined;
     const n = sysfd.recvfromIn(fd, &buf, &from) orelse return error.Network;

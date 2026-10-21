@@ -136,15 +136,15 @@ test "audio: кадр шифруется/расшифровывается, чу�
     try testing.expectEqual(box_bytes, sealed);
     // чужой seq не расшифрует
     var out: [frame_bytes]u8 = undefined;
-    try testing.expectError(error.Tampered, openFrame(&out, secret, cid, 43, &box_[0..sealed]));
+    try testing.expectError(error.Tampered, openFrame(&out, secret, cid, 43, box_[0..sealed]));
     // свой — расшифрует побайтово; короткий ADPCM-блок тоже валиден
-    try testing.expectEqual(frame_bytes, try openFrame(&out, secret, cid, 42, &box_[0..sealed]));
+    try testing.expectEqual(frame_bytes, try openFrame(&out, secret, cid, 42, box_[0..sealed]));
     try testing.expectEqualSlices(u8, &frame, &out);
     var ablock: [adpcm_block]u8 = undefined;
     @memset(&ablock, 0x33);
     var abox: [adpcm_block + aead.tag_length]u8 = undefined;
     const sealed2 = sealFrame(&abox, secret, cid, 7, &ablock);
     var out2: [adpcm_block]u8 = undefined;
-    try testing.expectEqual(adpcm_block, try openFrame(&out2, secret, cid, 7, &abox[0..sealed2]));
+    try testing.expectEqual(adpcm_block, try openFrame(&out2, secret, cid, 7, abox[0..sealed2]));
     try testing.expectEqualSlices(u8, &ablock, &out2);
 }
