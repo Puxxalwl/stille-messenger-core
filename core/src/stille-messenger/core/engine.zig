@@ -52,7 +52,13 @@ pub const Contact = struct {
     /// host:port в буфер (для dial), null — адреса нет.
     pub fn addr(self: *const Contact, buf: []u8) ?[]const u8 {
         if (self.addr_len == 0 or self.addr_port == 0) return null;
-        return std.fmt.bufPrint(buf, "{s}:{d}", .{ self.addr_buf[0..self.addr_len], self.addr_port }) catch null;
+        // 2.10.0: v6-хост содержит ':' — рендерим в скобках
+        // ("[2001:db8::1]:7777"), иначе tcp.dial неоднозначен
+        const host = self.addr_buf[0..self.addr_len];
+        if (std.mem.indexOfScalar(u8, host, ':') != null) {
+            return std.fmt.bufPrint(buf, "[{s}]:{d}", .{ host, self.addr_port }) catch null;
+        }
+        return std.fmt.bufPrint(buf, "{s}:{d}", .{ host, self.addr_port }) catch null;
     }
 
     pub fn setName(self: *Contact, name: []const u8) void {
@@ -666,6 +672,7 @@ pub const Engine = struct {
             // пути обрабатывает приложение (envIn в app/main.zig, до
             // dispatch) — движку достаточно пустой ветки
             .punch => {},
+            .v6addr => {},
             .text => |t| {
                 if (self.seenHas(contact_id, t.msg_id)) {
                     // повтор после реконнекта — уже доставлено; зеркальный ACK

@@ -89,6 +89,12 @@ pub const Tag = enum(u8) {
     /// (неизвестный тег), новый прямой путь у них не поднимается —
     /// соединение остаётся на relay.
     punch = 0x47,
+    /// V6_ADDR (2.10.0): глобальные IPv6-адреса отправителя + его
+    /// listen-порт — прямые адреса без NAT. Отправляется при бинде
+    /// relay-сессии: пир запоминает как контакт-адрес для прямого
+    /// автодозвона. Старые ядра тег не знают — пропускают, остаются
+    /// на релее. Только внутри аутентифицированной сессии.
+    v6addr = 0x48,
     file_meta = 0x60,
     file_data = 0x61,
     /// FILE_ACK: сколько чанков файла уже принято (докачка с этой позиции).
@@ -567,6 +573,7 @@ pub const Envelope = union(enum) {
     sync_ack: SyncAck,
     /// PUNCH_CANDIDATES (0x47).
     punch: Punch,
+    v6addr: V6Addr,
     /// AVATAR (0x50).
     avatar: Avatar,
     /// AVATAR_ACK (0x51).
@@ -600,6 +607,21 @@ pub const Punch = struct {
     ports: [max_punch_candidates]u16,
 };
 
+/// Максимум IPv6-адресов в V6_ADDR (все интерфейсы — редко больше двух:
+/// временный + постоянный).
+pub const max_v6_addrs: usize = 2;
+
+/// V6_ADDR: фиксированный массив IPv6 + общий порт листенера
+/// (безаллокационный decode).
+pub const V6Addr = struct {
+    /// Число заполненных записей (1..max_v6_addrs).
+    count: u8,
+    /// IPv6-байты (сетевой порядок в памяти).
+    ips: [max_v6_addrs][16]u8,
+    /// Порт листенера в host-порядке.
+    port: u16,
+};
+
 /// Ошибки кодирования: мал буфер, payload превышает максимум протокола,
 /// хвост entities не проходит валидацию либо поля кадра вне лимитов
 /// (PUNCH count).
@@ -622,6 +644,7 @@ pub fn encodedLen(e: Envelope) usize {
         .sync => |m| 1 + 4 + 1 + m.recs.len,
         .sync_ack => 1 + 4,
         .punch => |m| 1 + 1 + @as(usize, m.count) * (1 + 4 + 2),
+        .v6addr => |m| 1 + 1 + @as(usize, m.count) * 16 + 2,
         .avatar => |m| 1 + id_len + 2 + m.data.len,
         .file_meta => |m| 1 + id_len + 1 + m.name.len + 4 + 32,
         .file_data => |m| 1 + id_len + 4 + 2 + m.data.len,
@@ -759,6 +782,16 @@ pub fn encode(buf: []u8, e: Envelope) EncodeError![]const u8 {
                 try w.putFixed(&m.ips[i]);
                 try w.putInt(u16, m.ports[i]);
             }
+        },
+        .v6addr => |m| {
+            if (m.count == 0 or m.count > max_v6_addrs) return error.BadLen;
+            if (m.port == 0) return error.BadLen;
+            try w.put(@backingInt(Tag.v6addr));
+            try w.put(m.count);
+            for (0..m.count) |i| {
+                try w.putFixed(&m.ips[i]);
+            }
+            try w.putInt(u16, m.port);
         },
         .avatar => |m| {
             if (m.data.len > max_avatar_data) return error.TooBig;
@@ -955,6 +988,18 @@ pub fn decode(bytes: []const u8) DecodeError!Envelope {
                 p.ports[i] = try r.getInt(u16);
             }
             break :blk .{ .punch = p };
+        },
+        @backingInt(Tag.v6addr) => blk: {
+            var v: V6Addr = .{ .count = 0, .ips = @splat(@splat(0)), .port = 0 };
+            const count = try r.getU8();
+            if (count == 0 or count > max_v6_addrs) return error.BadLen;
+            v.count = count;
+            for (0..count) |i| {
+                v.ips[i] = (try r.getFixed(16))[0..16].*;
+            }
+            v.port = try r.getInt(u16);
+            if (v.port == 0) return error.BadLen;
+            break :blk .{ .v6addr = v };
         },
         @backingInt(Tag.avatar) => .{ .avatar = .{
             .avatar_id = (try r.getFixed(id_len))[0..id_len].*,
@@ -1696,4 +1741,45 @@ test "SYNC_ACK: roundtrip" {
     try testing.expectEqualSlices(u8, &.{ 0x46, 42, 0, 0, 0 }, enc);
     const back = try decode(enc);
     try testing.expectEqual(@as(u32, 42), back.sync_ack.batch_id);
+}
+test "v6addr: roundtrip + encodedLen" {
+    var v: V6Addr = .{
+        .count = 2,
+        .ips = .{
+            .{ 0x20, 0x01, 0x0d, 0xb8 } ++ @as([12]u8, @splat(1)),
+            .{ 0xfd, 0x00 } ++ @as([14]u8, @splat(2)),
+        },
+        .port = 7777,
+    };
+    const want_len = 1 + 1 + 2 * 16 + 2;
+    try testing.expectEqual(want_len, encodedLen(.{ .v6addr = v }));
+    var buf: [max_encoded_len]u8 = undefined;
+    const wire = try encode(&buf, .{ .v6addr = v });
+    try testing.expectEqual(want_len, wire.len);
+    const back = try decode(wire);
+    const q = back.v6addr;
+    try testing.expectEqual(@as(u8, 2), q.count);
+    try testing.expectEqualSlices(u8, &v.ips[0], &q.ips[0]);
+    try testing.expectEqualSlices(u8, &v.ips[1], &q.ips[1]);
+    try testing.expectEqual(@as(u16, 7777), q.port);
+}
+
+test "v6addr: битые кадры -> BadLen/Truncated" {
+    // count = 0
+    try testing.expectError(error.BadLen, decode(&[_]u8{ 0x48, 0 }));
+    // count = 3 (лимит 2)
+    try testing.expectError(error.BadLen, decode(&[_]u8{ 0x48, 3 }));
+    // порт 0
+    try testing.expectError(error.BadLen, decode(&[_]u8{ 0x48, 1 } ++ @as([16]u8, @splat(1)) ++ &[_]u8{ 0, 0 }));
+    // усечён (нет порта)
+    try testing.expectError(error.Truncated, decode(&[_]u8{ 0x48, 1 } ++ @as([16]u8, @splat(1))));
+    // лишний байт хвоста
+    try testing.expectError(error.BadLen, decode(&[_]u8{ 0x48, 1 } ++ @as([16]u8, @splat(1)) ++ &[_]u8{ 0x7f, 0x1e, 0 }));
+    // encode: count вне лимита / порт 0
+    var bad: V6Addr = .{ .count = 3, .ips = @splat(@splat(0)), .port = 7777 };
+    var buf: [max_encoded_len]u8 = undefined;
+    try testing.expectError(error.BadLen, encode(&buf, .{ .v6addr = bad }));
+    bad.count = 1;
+    bad.port = 0;
+    try testing.expectError(error.BadLen, encode(&buf, .{ .v6addr = bad }));
 }
