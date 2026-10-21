@@ -27,6 +27,7 @@ pub const net = struct {
     pub const socks5 = @import("stille-messenger/net/socks5.zig");
     pub const sysfd = @import("stille-messenger/net/sysfd.zig");
     pub const punch = @import("stille-messenger/net/punch.zig");
+    pub const upnp = @import("stille-messenger/net/upnp.zig");
 };
 
 pub const store = struct {

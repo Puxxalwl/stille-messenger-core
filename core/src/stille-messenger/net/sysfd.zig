@@ -15,6 +15,8 @@ const posix = std.posix;
 pub const fd_t = posix.socket_t;
 /// sockaddr.in целевой ОС (darwin-вариант несёт ведущий байт длины).
 pub const SockaddrIn = posix.sockaddr.in;
+/// sockaddr.in6 целевой ОС (IPv6-direct: глобальные адреса без NAT).
+pub const SockaddrIn6 = posix.sockaddr.in6;
 /// sockaddr.un целевой ОС (для UDS API-сервера).
 pub const SockaddrUn = posix.sockaddr.un;
 
@@ -163,6 +165,71 @@ pub fn socketUnix() error{Network}!fd_t {
     return socketOf(posix.AF.UNIX, posix.SOCK.STREAM);
 }
 
+/// IPv6-TCP-сокет (AF_INET6). Для dual-stack-листенера вызывающий
+/// сбрасывает V6ONLY отдельным вызовом setV6Only(fd,false).
+pub fn socketTcp6() error{Network}!fd_t {
+    return socketOf(posix.AF.INET6, posix.SOCK.STREAM);
+}
+
+/// sockaddr.in6 из 16 IPv6-байтов (сетевой порядок в памяти) и host-порта.
+/// flowinfo=0, scope_id=0: глобальные/ULA-адреса не требуют scope.
+pub fn sockaddrIn6(ip: [16]u8, port_host: u16) SockaddrIn6 {
+    const port = std.mem.nativeToBig(u16, port_host);
+    if (SockaddrIn6 == posix.sockaddr.in6 and @hasField(SockaddrIn6, "len")) {
+        // darwin: ведущий байт длины обязателен
+        return .{ .len = @sizeOf(SockaddrIn6), .family = posix.AF.INET6, .port = port, .flowinfo = 0, .addr = ip, .scope_id = 0 };
+    }
+    return .{ .family = posix.AF.INET6, .port = port, .flowinfo = 0, .addr = ip, .scope_id = 0 };
+}
+
+/// IPV6_V6ONLY: Linux 26, Darwin 27. true — только v6 (сосуществует с
+/// v4-листенером на том же порту); false — dual-stack (:: принимает и
+/// v4-mapped).
+pub fn setV6Only(fd: fd_t, on: bool) void {
+    const v6only: c_int = if (is_linux) 26 else 27;
+    const val: c_int = if (on) 1 else 0;
+    if (is_linux) {
+        const rc = std.os.linux.setsockopt(fd, posix.IPPROTO.IPV6, @intCast(v6only), @ptrCast(&val), @sizeOf(c_int));
+        // отказ немолчаливым не бывает: dual-stack не критичен, v6-only
+        // листенер продолжит работать и без опции (дефолт ОС)
+        _ = std.os.linux.errno(rc);
+        return;
+    }
+    _ = cabi.setsockopt(@intCast(fd), posix.IPPROTO.IPV6, v6only, @ptrCast(&val), @sizeOf(c_int));
+}
+
+/// Локальный порт IPv6-сокета (getsockname по семейству INET6).
+/// null — сокет не IPv6 или системный отказ.
+pub fn localPort6(fd: fd_t) ?u16 {
+    var sa: posix.sockaddr.storage = std.mem.zeroes(posix.sockaddr.storage);
+    var sl: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+    const rc = std.os.linux.getsockname(fd, @ptrCast(&sa), &sl);
+    if (std.os.linux.errno(rc) != .SUCCESS) return null;
+    if (sa.family != posix.AF.INET6) return null;
+    const sa6: *const posix.sockaddr.in6 = @ptrCast(@alignCast(&sa));
+    return std.mem.bigToNative(u16, sa6.port);
+}
+
+/// Блокирующий connect к IPv6-адресу (dial "[v6]:port").
+pub fn connectIn6(fd: fd_t, sa: *const SockaddrIn6) error{Network}!void {
+    if (is_linux) {
+        const rc = std.os.linux.connect(fd, @ptrCast(sa), @sizeOf(SockaddrIn6));
+        if (std.os.linux.errno(rc) != .SUCCESS) return error.Network;
+        return;
+    }
+    if (cabi.connect(@intCast(fd), @ptrCast(sa), @sizeOf(SockaddrIn6)) < 0) return error.Network;
+}
+
+/// Бинд IPv6-листенера.
+pub fn bindIn6(fd: fd_t, sa: *const SockaddrIn6) error{Network}!void {
+    if (is_linux) {
+        const rc = std.os.linux.bind(fd, @ptrCast(sa), @sizeOf(SockaddrIn6));
+        if (std.os.linux.errno(rc) != .SUCCESS) return error.Network;
+        return;
+    }
+    if (cabi.bind(@intCast(fd), @ptrCast(sa), @sizeOf(SockaddrIn6)) < 0) return error.Network;
+}
+
 pub fn connectIn(fd: fd_t, sa: *const SockaddrIn) error{Network}!void {
     if (is_linux) {
         const rc = std.os.linux.connect(fd, @ptrCast(sa), @sizeOf(SockaddrIn));
@@ -218,6 +285,13 @@ pub fn connectInNonblock(fd: fd_t, sa: *const SockaddrIn) error{Network}!void {
 
 /// Ждать доступности записи (завершение connect) до timeout_ms.
 /// true — сокет записываем (итог уточняет soError), false — таймаут.
+/// Готовность к чтению с дедлайном (false = таймаут/ошибка).
+pub fn pollReadable(fd: fd_t, timeout_ms: u32) bool {
+    var pfd = [1]posix.pollfd{.{ .fd = fd, .events = posix.POLL.IN | posix.POLL.ERR | posix.POLL.HUP, .revents = 0 }};
+    const n = posix.poll(&pfd, @intCast(timeout_ms)) catch return false;
+    return n != 0;
+}
+
 pub fn pollWritable(fd: fd_t, timeout_ms: u32) bool {
     var pfd = [1]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT | posix.POLL.ERR | posix.POLL.HUP, .revents = 0 }};
     const n = posix.poll(&pfd, @intCast(timeout_ms)) catch return false;
