@@ -1696,3 +1696,201 @@ test "punch: relay-сессия -> прямой путь (simultaneous open)" {
     alloc.destroy(wake);
     listener.deinit();
 }
+
+// ---- IPv6-direct (2.10.0): сессия поверх "[v6]:port" без релея --------
+
+/// Сторона v6-теста: инициатор диалит "[::1]:port" к листенеру
+/// респондента, поднимает сессию на настоящем TCP-конне и обменивается
+/// V6_ADDR (прямые адреса) + текстом.
+const V6Side = struct {
+    alloc: std.mem.Allocator,
+    id: *const identity.Identity,
+    peer_bundle: [64]u8,
+    eph: [32]u8,
+    role: session_mod.HandshakeRole,
+    addr: []const u8,
+    tc: ?*tcp.TcpConn = null,
+    sess: ?*session_mod.Session = null,
+    err: ?anyerror = null,
+    got_v6: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    texts: std.ArrayListUnmanaged([]u8) = .empty,
+
+    fn onEnvelope(ctx: *anyopaque, env: envelope.Envelope) void {
+        const self: *V6Side = @ptrCast(@alignCast(ctx));
+        switch (env) {
+            .v6addr => |v| {
+                // payload валиден и port слушателя записан
+                if (v.count >= 1 and v.port != 0) self.got_v6.store(true, .release);
+            },
+            .text => |t| {
+                const copy = self.alloc.dupe(u8, t.body) catch return;
+                self.texts.append(self.alloc, copy) catch {};
+            },
+            else => {},
+        }
+    }
+
+    fn onClosed(_: *anyopaque) void {}
+
+    fn run(self: *V6Side) void {
+        const alloc = self.alloc;
+        const tc = tcp.dial(alloc, self.addr) catch |e| {
+            self.err = e;
+            return;
+        };
+        self.tc = tc;
+        const s = session_mod.Session.establish(
+            alloc,
+            tc.conn(),
+            self.role,
+            self.id,
+            self.peer_bundle,
+            self.eph,
+            @ptrCast(&wrap_slot),
+            wrapConn,
+            .{ .ctx = self, .onEnvelope = onEnvelope, .onClosed = onClosed },
+            io_g.stored,
+        ) catch |e| {
+            self.err = e;
+            return;
+        };
+        self.sess = s;
+        // V6_ADDR: наш «глобальный» адрес (::1 стенда) + порт листенера
+        var v: envelope.V6Addr = .{ .count = 1, .ips = @splat(@splat(0)), .port = v6_listen_port };
+        v.ips[0] = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+        s.sendEnvelope(.{ .v6addr = v }) catch |e| {
+            self.err = e;
+        };
+    }
+};
+
+/// Порт листенера респондента (заполняет тест до старта сторон).
+var v6_listen_port: u16 = 0;
+
+/// Ждать v6-кадр/текст у стороны.
+fn waitV6(side: *V6Side, want_text: ?[]const u8) !void {
+    var tries: usize = 0;
+    while (tries < 250) : (tries += 1) {
+        if (want_text == null) {
+            if (side.got_v6.load(.acquire)) return;
+        } else {
+            for (side.texts.items) |t| {
+                if (std.mem.eql(u8, t, want_text.?)) return;
+            }
+        }
+        std.Io.sleep(io_g.stored, .{ .nanoseconds = 20 * std.time.ns_per_ms }, .awake) catch {};
+    }
+    return if (want_text == null) error.NoV6Frame else error.NoV6Text;
+}
+
+test "ipv6-direct: сессия поверх [::1]:port + обмен V6_ADDR" {
+    const alloc = std.testing.allocator;
+    io_g.stored = std.testing.io;
+    io_g.alloc = alloc;
+    obf_idx = 0;
+    obf_tracker = @splat(null);
+
+    // листенер респондента на v6-loopback (порт 0 — свободный)
+    var listener = tcp.listen("[::1]:0") catch return error.NoV6Listen;
+    defer listener.deinit();
+    v6_listen_port = sysfd.localPort6(listener.fd) orelse return error.NoV6Port;
+    var ab: [32]u8 = undefined;
+    const dial_addr = try std.fmt.bufPrint(&ab, "[::1]:{d}", .{v6_listen_port});
+
+    const id_a = try identity.Identity.fromSeed(filled(61));
+    const id_b = try identity.Identity.fromSeed(filled(62));
+    const a_init = std.mem.order(u8, &id_a.bundle(), &id_b.bundle()) == .lt;
+
+    var side_a = V6Side{
+        .alloc = alloc,
+        .id = &id_a,
+        .peer_bundle = id_b.bundle(),
+        .eph = filled(63),
+        .role = if (a_init) .initiator else .responder,
+        .addr = dial_addr,
+    };
+    // респондент: принимает коннект, поднимает сессию сам
+    const Responder = struct {
+        fn run(side: *V6Side, lsn: *tcp.Listener, id: *const identity.Identity, peer_bundle: [64]u8, role: session_mod.HandshakeRole) void {
+            const tc = lsn.accept(side.alloc) catch |e| {
+                side.err = e;
+                return;
+            };
+            side.tc = tc;
+            const s = session_mod.Session.establish(
+                side.alloc,
+                tc.conn(),
+                role,
+                id,
+                peer_bundle,
+                side.eph,
+                @ptrCast(&wrap_slot),
+                wrapConn,
+                .{ .ctx = side, .onEnvelope = V6Side.onEnvelope, .onClosed = V6Side.onClosed },
+                io_g.stored,
+            ) catch |e| {
+                side.err = e;
+                return;
+            };
+            side.sess = s;
+            var v: envelope.V6Addr = .{ .count = 1, .ips = @splat(@splat(0)), .port = v6_listen_port };
+            v.ips[0] = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+            s.sendEnvelope(.{ .v6addr = v }) catch |e| {
+                side.err = e;
+            };
+        }
+    };
+    var side_b = V6Side{
+        .alloc = alloc,
+        .id = &id_b,
+        .peer_bundle = id_a.bundle(),
+        .eph = filled(64),
+        .role = if (a_init) .responder else .initiator,
+        .addr = dial_addr,
+    };
+
+    // респондент ждёт входящий; инициатор диалит
+    const th_b = try std.Thread.spawn(.{}, Responder.run, .{ &side_b, &listener, &id_b, id_a.bundle(), side_b.role });
+    const th_a = try std.Thread.spawn(.{}, V6Side.run, .{&side_a});
+    th_a.join();
+    th_b.join();
+    try std.testing.expectEqual(@as(?anyerror, null), side_a.err);
+    try std.testing.expectEqual(@as(?anyerror, null), side_b.err);
+    try std.testing.expect(side_a.sess != null);
+    try std.testing.expect(side_b.sess != null);
+
+    // V6_ADDR обеих сторон доехал внутри AEAD-сессии
+    try waitV6(&side_a, null);
+    try waitV6(&side_b, null);
+
+    // текст по прямому v6-пути в обе стороны
+    var mid: [16]u8 = undefined;
+    io_g.stored.random(&mid);
+    side_a.sess.?.sendEnvelope(.{ .text = .{ .msg_id = mid, .ts_ms = 123, .body = "v6-direct-hello" } }) catch {};
+    var mid2: [16]u8 = undefined;
+    io_g.stored.random(&mid2);
+    side_b.sess.?.sendEnvelope(.{ .text = .{ .msg_id = mid2, .ts_ms = 124, .body = "v6-direct-reply" } }) catch {};
+    try waitV6(&side_a, "v6-direct-reply");
+    try waitV6(&side_b, "v6-direct-hello");
+
+    // teardown: сессии (close гасит транспорты), конн-структуры,
+    // обёртки obf; листенер — в defer теста
+    for ([_]*V6Side{ &side_a, &side_b }) |side| {
+        if (side.sess) |sx| {
+            sx.close();
+            alloc.destroy(sx);
+        }
+    }
+    std.Io.sleep(io_g.stored, .{ .nanoseconds = 200 * std.time.ns_per_ms }, .awake) catch {};
+    for ([_]*V6Side{ &side_a, &side_b }) |side| {
+        if (side.tc) |tc| alloc.destroy(tc);
+        for (side.texts.items) |t| alloc.free(t);
+        side.texts.deinit(alloc);
+    }
+    for (obf_tracker) |oc| {
+        if (oc) |o| {
+            o.deinit();
+            alloc.destroy(o);
+        }
+    }
+}

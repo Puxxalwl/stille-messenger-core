@@ -44,7 +44,10 @@ pub const header_len = 16;
 /// события CONTACT_STATE_CHANGED (15), CONTACTS_CHANGED (16),
 /// CONTACT_UPSERTED (17) и статус RESYNC_REQUIRED (21). Все добавления
 /// аддитивны: старые методы/события/форматы не менялись.
-pub const api_version = [3]u16{ 2, 8, 0 };
+/// 2.10.0: NAT-punch (2.9.0: relay echo, PUNCH_CANDIDATES, ROUTE_STATE,
+/// bit6 nat_punch — была задокументирована, но константа не была
+/// поднята) + direct-first: IPv6-direct, UPnP-маппинг, fast-presence.
+pub const api_version = [3]u16{ 2, 10, 0 };
 
 /// Тип кадра.
 pub const Kind = enum(u8) {
@@ -720,7 +723,7 @@ test "method ids стабильны (контракт провода)" {
     try std.testing.expectEqual(@as(u8, 4), @backingInt(InviteState.failed));
     try std.testing.expectEqual(@as(u8, 1), @backingInt(DeltaChange.removed));
     try std.testing.expectEqual(@as(u16, 2), api_version[0]);
-    try std.testing.expectEqual(@as(u16, 8), api_version[1]);
+    try std.testing.expectEqual(@as(u16, 10), api_version[1]);
 }
 
 test "reader/writer round-trip" {
