@@ -117,6 +117,14 @@ persist* (app, under app.mu)
 - Server-mode presence threads (one per contact when `server_mode` is on)
   re-read the configuration each iteration; turning the mode off stops
   them at the next cycle without teardown signalling.
+- Direct-first (2.10.0): a second accept loop serves the IPv6 listener
+  (`[::]:listen_port`, V6ONLY, separate fd — the v4 path is untouched),
+  and a one-shot UPnP thread (startup, gated on `autodial`) performs
+  SSDP discovery + AddPortMapping with 1.5/3 s deadlines; the public
+  endpoint lands in `app.upnp_ext` under the app lock. Address learning
+  (V6_ADDR frames, getpeername on incoming direct conns) happens on
+  session rx threads / the accept path; autodial's fast-presence
+  ceiling (3 s) is a pure parameter of its backoff.
 - NAT-punch workers (2.9.0, one per contact, deduplicated in
   `punch_runs`) start when a relay-backed session receives the peer's
   PUNCH_CANDIDATES. A worker snapshots the route under the app lock, then

@@ -9,8 +9,14 @@ renders. The protocol is **binary**: no strings-as-protocol, no JSON, no
 human-readable text on the wire — only typed byte frames and machine-readable
 codes (methods, statuses, events).
 
-- API version: **2.9.0** (returned by `GET_VERSION`, semver).
-  2.9.0 adds NAT traversal for relayed peers (config bit6 `nat_punch`,
+- API version: **2.10.0** (returned by `GET_VERSION`, semver).
+  2.10.0 adds direct-first: IPv6-direct sessions (`[v6]:port` addresses,
+  PROTOCOL.md §15.2), UPnP port mapping (public endpoint as a host
+  candidate), and fast presence (3 s autodial ceiling on direct
+  addresses). The `api_version` constant is raised 2.8.0 → 2.10.0 here
+  (2.9.0 was documented with NAT-punch but the constant bump was
+  missed; both changes land unreleased together).
+  2.9.0 added NAT traversal for relayed peers (config bit6 `nat_punch`,
   §4.9; the ROUTE_STATE event, §5) — the relay session upgrades to a
   direct punched connection (PROTOCOL.md §15.1), relay stays the fallback.
   2.8.0 added short identity codes for deeplinks (§4.2:
@@ -60,12 +66,16 @@ steps — the core has already handled them.
   (the encrypted log is local). The recovery package (§4.10) is the one
   deliberate exception in kind: a sealed, client-stored blob in the user's
   own cloud holding identity/profile (never message content).
-- NAT traversal is now built in for relayed pairs (2.9.0, §4.9 bit6):
+- NAT traversal is built in for relayed pairs (2.9.0, §4.9 bit6):
   both peers behind NAT upgrade their relay session to a direct punched
-  connection (PROTOCOL.md §15.1). The remaining honest gap: two NAT-ed
-  peers with **no** relay and no LAN channel cannot meet at all —
-  rendezvous itself needs the relay; symmetric NATs are not punched
-  (the pair silently stays relayed).
+  connection (PROTOCOL.md §15.1). Direct-first (2.10.0) removes the relay
+  for capable networks: IPv6 peers connect directly (no NAT in v6), a
+  UPnP-mapped public IPv4 endpoint is dialed directly, and direct
+  addresses redial at a 3 s cadence (fast presence). The remaining
+  honest gap: two peers behind IPv4 NAT with **no** UPnP, **no** relay
+  and no LAN channel cannot meet at all — rendezvous needs one of
+  them; symmetric NATs are not punched (the pair silently stays
+  relayed).
 - Parsing pictures/files: bytes are passed as-is.
 
 ## 2. Frame
@@ -228,8 +238,10 @@ are intentionally not exposed.
 [count u32] × {contact_view}`. `GET_CONTACTS_DELTA` (47) takes
 `[epoch 16][from_revision u64]`; it returns revisioned contact changes or
 `RESYNC_REQUIRED` when the epoch/window is stale. `GET_REACHABLE_ENDPOINTS` (48)
-takes an empty payload and returns `[count u8] × [address str16]` local IPv4
-`host:port` candidates (not a reachability guarantee). `GET_HISTORY_PAGE` (51)
+takes an empty payload and returns `[count u8] × [address str16]` direct
+address candidates (not a reachability guarantee): local IPv4 `host:port`,
+global IPv6 `[v6]:port` (2.10.0), and the UPnP-mapped public `host:port`
+(2.10.0, when the router mapping succeeded). `GET_HISTORY_PAGE` (51)
 takes `[cid u32][has_cursor u8][before_ts u64][before_msg_id 16][limit u16]`
 and returns `[has_more u8][next_ts u64][next_msg_id 16][count u32] × history
 entry`, newest to oldest. The next cursor is exclusive; limit 0 defaults to 30,
@@ -517,6 +529,10 @@ flags on except `server_mode` and `use_tor_mask`; `tor_addr` =
 - `device_sync` — replicate the database to a linked device (below).
 - `lan_discovery` — UDP multicast announcements/search in the LAN.
 - `autodial` — background redialing of offline contacts by saved address.
+  2.10.0: also gates the UPnP mapping attempt at daemon startup; with a
+  known **direct** address (IPv6 or public IPv4) the redial backoff
+  ceiling is 3 s instead of 60 s — a peer coming online is detected
+  within seconds without a relay slot (PROTOCOL.md §15.2).
 - `nat_punch` (2.9.0) — upgrade relayed sessions to a direct punched
   connection: the core exchanges direct-path candidates inside the
   authenticated session and runs a simultaneous TCP open from the same
@@ -682,6 +698,9 @@ session after the direct path died.
 | LAN discovery | UDP multicast 239.77.77.77:57770 + limited broadcast, 74-byte announcements; cadence 500 ms (100 ms burst while an outbox entry or JOIN is pending), immediate announce on a send to an offline peer; unicast reply on hearing a peer |
 | direct dial deadline | 3000 ms on every direct dial (relay-marker pairing and Tor SOCKS5 paths excluded) |
 | NAT punch (2.9.0) | ≤ 4 reflexive candidates per frame side, ≤ 8 candidates total; 3 rounds × 500 ms per attempt (50 ms retry slices), 5 s between attempts; 1 punch worker per contact; punch candidates only inside an authenticated session |
+| IPv6 addresses (2.10.0) | ≤ 2 per V6_ADDR frame, ≤ 16 enumerated; global 2000::/3 + ULA fd00::/8 only (no fe80::); address string `[v6]:port` |
+| UPnP mapping (2.10.0) | one attempt per daemon start (SSDP 1.5 s + IGD I/O 3 s timeouts); public endpoint announced as first host candidate |
+| fast presence (2.10.0) | autodial ceiling 3 s (v6 / public IPv4 addresses), 60 s otherwise |
 | daemons per `$HOME` | 1 (single UDS path) |
 
 ## 7. Delivery model
@@ -748,6 +767,17 @@ then: punch — ROUTE_STATE{cid, route=2 direct-punched}, session is direct
       (symmetric NAT / port-restricted filter: stays relay=1 silently)
 ```
 No third-party STUN; the relay is the rendezvous point (PROTOCOL.md §15.1).
+
+### Remote, direct-first (IPv6 or UPnP, 2.10.0)
+```
+both daemons: listen 0.0.0.0:P + [::]:P; autodial=1 (default) tries UPnP
+A: has global v6: CREATE_INVITE_EX{mode 1, direct "[2001:db8:…]:P"}
+   (or UPnP mapped: GET_REACHABLE_ENDPOINTS → "203.0.113.7:P")
+B: ACCEPT_INVITE → cid; B dials A directly — no relay at any point
+   online/offline: 3 s redial cadence (fast presence) both directions
+   existing relayed pair: V6_ADDR/UPnP candidate arrives inside the
+   session → contact address learned → next reconnects are direct
+```
 
 ### Remote (behind NAT, address known)
 A: `CREATE_INVITE{name, addr:"host:7777"}` → B: `ACCEPT_INVITE`.

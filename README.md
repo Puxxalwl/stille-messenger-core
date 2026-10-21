@@ -13,7 +13,7 @@
   <a href="https://ziglang.org/download/"><img src="https://img.shields.io/badge/Zig-0.17.0-f6a517" alt="Zig 0.17.0"></a>
   <img src="https://img.shields.io/badge/dependencies-std_only-3f6f8f" alt="std-only">
   <img src="https://img.shields.io/badge/wire_protocol-v5-3f6f8f" alt="wire protocol v5">
-  <img src="https://img.shields.io/badge/UDS_API-2.9.0-3f6f8f" alt="UDS API 2.9.0">
+  <img src="https://img.shields.io/badge/UDS_API-2.10.0-3f6f8f" alt="UDS API 2.10.0">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-3f6f8f" alt="MIT license"></a>
 </p>
 
@@ -28,7 +28,7 @@ dependencies. Source: [`core/`](core/).
 
 There is no CLI/TUI for chatting: the only client interface is a binary
 framed UDS protocol ([`core/docs/CORE-API.md`](core/docs/CORE-API.md), API
-2.9.0). The C++ version (v0.2.4, FTXUI/MQTT/WebRTC) is removed from master;
+2.10.0). The C++ version (v0.2.4, FTXUI/MQTT/WebRTC) is removed from master;
 the archive lives under the tag `cpp-archive`.
 
 > [!NOTE]
@@ -45,7 +45,7 @@ the archive lives under the tag `cpp-archive`.
 |---|---|
 | Identity | X25519 + Ed25519 keypairs derived from one 32-byte seed (`~/.stille-messenger/zig-seed`, 0600) |
 | Handshake | XX-like, hybrid post-quantum: X25519 + ephemeral ML-KEM-768 (FIPS 203), Ed25519 transcript signatures, remote-static verification |
-| Transport | Direct TCP (ports 7777–7786), self-hosted relay with persistent presence, NAT traversal (simultaneous open over relay-reflexive candidates; relay stays the fallback), LAN discovery over UDP multicast, Tor SOCKS5 dialing; wire disguised as TLS 1.3 |
+| Transport | Direct TCP (ports 7777–7786), self-hosted relay with persistent presence, NAT traversal (simultaneous open over relay-reflexive candidates; relay stays the fallback), IPv6-direct and UPnP-mapped public endpoints (direct-first: the relay is rendezvous-only), LAN discovery over UDP multicast, Tor SOCKS5 dialing; wire disguised as TLS 1.3 |
 | Messaging | Formatting entities (bold/italic/spoiler/code/link), replies, reactions, offline delivery (encrypted outbox, ACKs, dedup), resumable file transfer, 16 kHz E2EE voice calls (ADPCM, DTX) |
 | Storage | Append-only AEAD log — zero plaintext bytes on disk |
 | Interface | Binary framed UDS API (`~/.stille-messenger/api.sock`) — the only interface |
@@ -135,7 +135,7 @@ and re-pairs automatically — no new invite needed. Specification:
 
 | Document | Content |
 |---|---|
-| [`core/docs/CORE-API.md`](core/docs/CORE-API.md) / [ru](core/docs/ru/CORE-API.md) | binary UDS interface for GUI clients (API 2.9.0) |
+| [`core/docs/CORE-API.md`](core/docs/CORE-API.md) / [ru](core/docs/ru/CORE-API.md) | binary UDS interface for GUI clients (API 2.10.0) |
 | [`CLIENT_RULES.md`](CLIENT_RULES.md) / [ru](docs/ru/CLIENT_RULES.md) | binding contract for GUI clients: bootstrap, events, account recovery UX |
 | [`core/docs/PROTOCOL.md`](core/docs/PROTOCOL.md) / [ru](core/docs/ru/PROTOCOL.md) | byte-level wire protocol v5 |
 | [`core/docs/ARCHITECTURE.md`](core/docs/ARCHITECTURE.md) / [ru](core/docs/ru/ARCHITECTURE.md) | layers, data flow, threading |

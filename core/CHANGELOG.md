@@ -1,5 +1,57 @@
 # Changelog — stille-messenger
 
+## [Unreleased / неизданное] — direct-first: IPv6 и UPnP, без релея (2.10.0)
+
+- Feature (wire-compatible, API 2.10.0): the relay becomes
+  rendezvous-only for capable networks — direct paths without any relay
+  bytes. **IPv6-direct**: the daemon listens on `[::]:listen_port`
+  (V6ONLY, separate socket; the v4 path unchanged), address strings
+  accept `[v6]:port` everywhere (invite/contact/CONNECT), global
+  2000::/3 + ULA fd00::/8 addresses are enumerated and announced to
+  peers inside the authenticated session via the new V6_ADDR envelope
+  (0x48: `[count u8 ≤ 2][ip 16 × count][port u16]`; old cores skip the
+  unknown tag), and the receiving core stores them as the contact's
+  direct address. Incoming direct connections also teach the peer's
+  address via getpeername. **UPnP IGD**: a one-shot startup thread
+  (gated on `autodial`) does SSDP discovery + AddPortMapping +
+  GetExternalIPAddress (std-only raw sockets, bounded buffers,
+  1.5/3 s deadlines); the public IPv4 endpoint is announced as the
+  first host candidate of PUNCH_CANDIDATES and returned by
+  GET_REACHABLE_ENDPOINTS. **Fast presence**: with a known direct
+  address (v6 or public IPv4) the autodial backoff ceiling drops from
+  60 s to 3 s — a peer appearing online is detected within seconds,
+  no relay slot needed. Also: `api_version` constant finally raised to
+  match the documented 2.9.0 (the NAT-punch branch documented 2.9.0
+  but missed the constant bump; both changes are unreleased, so the
+  constant jumps 2.8.0 → 2.10.0). Honest limits: router firewalls may
+  still drop v6/mapped traffic; two IPv4-NAT peers without UPnP and
+  without a relay still have no rendezvous (unchanged).
+- Фича (совместима на проводе, API 2.10.0): релей становится
+  рандеву-точкой для способных сетей — прямые пути без единого
+  relay-байта. **IPv6-direct**: демон слушает `[::]:listen_port`
+  (V6ONLY, отдельный сокет; v4-путь не меняется), строки адресов
+  принимают `[v6]:port` везде (инвайт/контакт/CONNECT), глобальные
+  2000::/3 + ULA fd00::/8 перечисляются и объявляются пирам внутри
+  аутентифицированной сессии новым конвертом V6_ADDR (0x48:
+  `[count u8 ≤ 2][ip 16 × count][port u16]`; старые ядра пропускают
+  неизвестный тег), приёмник запоминает их как прямой адрес контакта.
+  Входящие прямые подключения тоже научают адресу пира через
+  getpeername. **UPnP IGD**: однопроходный поток на старте (под
+  флагом `autodial`) делает SSDP-поиск + AddPortMapping +
+  GetExternalIPAddress (только std, bounded-буферы, дедлайны 1.5/3 с);
+  публичный IPv4-endpoint объявляется первым host-кандидатом
+  PUNCH_CANDIDATES и возвращается GET_REACHABLE_ENDPOINTS.
+  **Fast presence**: с известным прямым адресом (v6 или публичный v4)
+  потолок бэкоффа автодозвона падает с 60 с до 3 с — появление пира
+  замечается за секунды без relay-слота. Также: константа
+  `api_version` наконец поднята под задокументированную 2.9.0
+  (ветка NAT-punch задокументировала 2.9.0, но бамп константы
+  пропустила; оба изменения неизданы — константа прыгает 2.8.0 →
+  2.10.0). Честные ограничения: firewall роутера может резать
+  v6/замапленный трафик; два пира за IPv4 NAT без UPnP и без релея
+  по-прежнему без рандеву (без изменений).
+
+
 ## [Unreleased / неизданное] — NAT-обход: прямой путь поверх релея (2.9.0)
 
 - Feature (wire-compatible, API 2.9.0): relayed peers behind NAT now

@@ -13,7 +13,7 @@
   <a href="https://ziglang.org/download/"><img src="https://img.shields.io/badge/Zig-0.17.0-f6a517" alt="Zig 0.17.0"></a>
   <img src="https://img.shields.io/badge/dependencies-std_only-3f6f8f" alt="std-only">
   <img src="https://img.shields.io/badge/wire_protocol-v5-3f6f8f" alt="протокол v5">
-  <img src="https://img.shields.io/badge/UDS_API-2.9.0-3f6f8f" alt="UDS API 2.9.0">
+  <img src="https://img.shields.io/badge/UDS_API-2.10.0-3f6f8f" alt="UDS API 2.10.0">
   <a href="../../LICENSE"><img src="https://img.shields.io/badge/license-MIT-3f6f8f" alt="лицензия MIT"></a>
 </p>
 
@@ -28,7 +28,7 @@
 
 CLI/TUI для переписки нет: единственный клиентский интерфейс — бинарный
 кадровый протокол UDS ([`core/docs/ru/CORE-API.md`](../../core/docs/ru/CORE-API.md),
-API 2.9.0). C++-версия (v0.2.4, FTXUI/MQTT/WebRTC) удалена из master; архив —
+API 2.10.0). C++-версия (v0.2.4, FTXUI/MQTT/WebRTC) удалена из master; архив —
 тег `cpp-archive`.
 
 > [!NOTE]
@@ -45,7 +45,7 @@ API 2.9.0). C++-версия (v0.2.4, FTXUI/MQTT/WebRTC) удалена из mas
 |---|---|
 | Идентичность | пары X25519 + Ed25519, выведенные из одного сида 32 байта (`~/.stille-messenger/zig-seed`, 0600) |
 | Рукопожатие | XX-подобное, гибридное постквантовое: X25519 + эфемерный ML-KEM-768 (FIPS 203), подписи транскрипта Ed25519, сверка remote static |
-| Транспорт | прямой TCP (порты 7777–7786), само-хостнутый релей с постоянным присутствием, NAT-обход (одновременный open по рефлексивным кандидатам релея; релей остаётся фолбэком), LAN-обнаружение через UDP-мультикаст, dial через Tor SOCKS5; провод замаскирован под TLS 1.3 |
+| Транспорт | прямой TCP (порты 7777–7786), само-хостнутый релей с постоянным присутствием, NAT-обход (одновременный open по рефлексивным кандидатам релея; релей остаётся фолбэком), IPv6-прямые и UPnP-замапленные публичные endpoints (direct-first: релей — только рандеву), LAN-обнаружение через UDP-мультикаст, dial через Tor SOCKS5; провод замаскирован под TLS 1.3 |
 | Сообщения | форматирование (bold/italic/spoiler/code/link), ответы, реакции, доставка офлайн (шифрованный outbox, ACK, дедуп), файлы с докачкой, звонки 16 кГц E2EE (ADPCM, DTX) |
 | Хранилище | append-only AEAD-лог — ноль байт открытого текста на диске |
 | Интерфейс | бинарный кадровый протокол UDS (`~/.stille-messenger/api.sock`) — единственный интерфейс |
@@ -135,7 +135,7 @@ mode 2 через UDS-апи); держатель кода подключает�
 
 | Документ | Содержание |
 |---|---|
-| [`core/docs/ru/CORE-API.md`](../../core/docs/ru/CORE-API.md) / [en](../../core/docs/CORE-API.md) | бинарный UDS-интерфейс для GUI-клиентов (API 2.9.0) |
+| [`core/docs/ru/CORE-API.md`](../../core/docs/ru/CORE-API.md) / [en](../../core/docs/CORE-API.md) | бинарный UDS-интерфейс для GUI-клиентов (API 2.10.0) |
 | [`docs/ru/CLIENT_RULES.md`](CLIENT_RULES.md) / [en](../../CLIENT_RULES.md) | обязательный контракт GUI-клиентов: бутстрап, события, UX восстановления |
 | [`core/docs/ru/PROTOCOL.md`](../../core/docs/ru/PROTOCOL.md) / [en](../../core/docs/PROTOCOL.md) | байтовая спецификация провода v5 |
 | [`core/docs/ru/ARCHITECTURE.md`](../../core/docs/ru/ARCHITECTURE.md) / [en](../../core/docs/ARCHITECTURE.md) | слои, потоки данных, трединг |
