@@ -22,9 +22,13 @@ test {
     _ = @import("stille-messenger/net/heartbeat.zig");
     _ = @import("stille-messenger/net/tcp.zig");
     _ = @import("stille-messenger/net/socks5.zig");
+    _ = @import("stille-messenger/net/sysfd.zig");
+    _ = @import("stille-messenger/net/punch.zig");
+    _ = @import("stille-messenger/net/upnp.zig");
     _ = @import("stille-messenger/app/adpcm.zig");
     _ = @import("stille-messenger/app/api.zig");
     _ = @import("stille-messenger/app/config.zig");
+    _ = @import("stille-messenger/app/endpoints.zig");
     _ = @import("stille-messenger/app/sync.zig");
     _ = @import("stille-messenger/app/search.zig");
     _ = @import("stille-messenger/store/log.zig");

@@ -10,6 +10,8 @@ on:
 permissions:
   contents: read
 
+# macOS builds moved out of this workflow: a separate macOS sub-core
+# repository owns the aarch64-macos target.
 jobs:
   build:
     strategy:
@@ -19,9 +21,6 @@ jobs:
           - os: ubuntu-22.04
             target: x86_64-linux
             zig_target: x86_64-linux-musl
-          - os: macos-14
-            target: aarch64-macos
-            zig_target: native
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

@@ -24,9 +24,38 @@
 | app | `src/stille-messenger/app/` | демон: UDS-апи-сервер, инвайты, LAN-поиск, автодозвон, выгрузка outbox, аудиоконтур звонка, передача файлов, конфигурация (config.zig), синхронизация устройств (sync.zig), восстановление доступа (recovery.zig: сборка/применение запечатанного пакета профиля; непровижненный режим serve), dial через Tor SOCKS5 |
 | core | `src/stille-messenger/core/` | engine (контакты, блокировки, dispatch, outbox, стейт-машины file Tx), session (рукопожатие + sealed-кадры) |
 | proto | `src/stille-messenger/proto/` | бинарные конверты, кодек без аллокаций |
-| crypto | `src/stille-messenger/crypto/` | identity, handshake, рэтчет, ключи звонка, AEAD, паддинг |
+| crypto | `src/stille-messenger/crypto/` | identity, гибридное рукопожатие (X25519 + ML-KEM-768), рэтчет, ключи звонка, AEAD, паддинг |
 | net | `src/stille-messenger/net/` | TCP-транспорт, обфускация потока (fake-TLS кадрирование), релей, heartbeat, SOCKS5 (Tor) |
 | store | `src/stille-messenger/store/` | шифрованный append-only лог |
+
+Зависимости однонаправленные (app → engine → session → proto/crypto →
+interfaces), вверх никто не тянет. Диалит только слой app: он создаёт
+транспорт (TCP, fake-TLS, релей, SOCKS5), оборачивает сырое соединение в
+обфусцированный `interfaces.Conn` и передаёт его движку — сессия сокета
+не видит вообще:
+
+```mermaid
+graph TD
+    GUI["GUI-клиент"] -- "бинарное UDS-апи" --> APP
+    subgraph daemon ["stille-messenger-core serve"]
+        APP["app<br>инвайты · обнаружение · восстановление · UDS-сервер"]
+        ENG["core/engine<br>dispatch · outbox · передача файлов"]
+        SES["core/session<br>рукопожатие · sealed-кадры"]
+        PROTO["proto<br>конверты · кодек без аллокаций"]
+        CRYPTO["crypto<br>identity · рэтчет · AEAD"]
+        NET["net<br>TCP · fake-TLS · релей · SOCKS5"]
+        STORE["store<br>AEAD append-only лог"]
+        IF["core/interfaces<br>Conn · Transport · Clock"]
+    end
+    APP --> ENG
+    APP --> STORE
+    APP -- "dial + обёртка Conn" --> NET
+    ENG --> SES
+    SES --> PROTO
+    SES --> CRYPTO
+    NET -. реализует .-> IF
+    SES -. читает/пишет через .-> IF
+```
 
 ## 3. Поток данных сообщения
 
@@ -88,6 +117,24 @@ persist* (app, под app.mu)
 - Потоки присутствия своего сервера (по одному на контакт при включённом
   `server_mode`) перечитывают конфигурацию каждую итерацию: выключение
   режима останавливает их на следующем цикле, без сигнального teardown.
+- Direct-first (2.10.0): второй accept-цикл обслуживает IPv6-листенер
+  (`[::]:listen_port`, V6ONLY, отдельный fd — v4-путь не тронут), и
+  однопроходный UPnP-поток (старт, под флагом `autodial`) делает
+  SSDP-поиск + AddPortMapping с дедлайнами 1.5/3 с; публичный endpoint
+  попадает в `app.upnp_ext` под локом приложения. Изучение адресов
+  (кадры V6_ADDR, getpeername входящих прямых коннов) идёт в rx-потоках
+  сессий / на accept-пути; потолок fast-presence автодозвона (3 с) —
+  чистый параметр его бэкоффа.
+- Punch-воркеры NAT-обхода (2.9.0, по одному на контакт, дедуп в
+  `punch_runs`) стартуют, когда relay-сессия получила PUNCH_CANDIDATES
+  пира. Воркер снимает маршрут под локом приложения, дальше работает без
+  лока: dial по host-кандидатам (только сторона-инициатор) и
+  одновременный open из того же локального адреса, что relay-подключение
+  (`net/punch.zig`; бюджеты — PROTOCOL.md §15.1). Успешный пробитый/LAN-
+  конн идёт штатными путями `establishSessionOnConn`/`handleAcceptedConn`
+  — новая сессия замещает relay-сессию в `bindSessionLocked`; неудача
+  просто спит и повторяет, пока маршрут — живая сессия. Даунгрейда на
+  релей нет: пробитый путь принимается только после полного рукопожатия.
 - Планировщик подключений инвайтов ограничен и асинхронен: листовой лок
   `connq_mu` защищает только метаданные очереди, максимум 64 ожидающие работы
   и 4 активных dial-потока; на контакт допускается одна работа одновременно.

@@ -61,13 +61,14 @@ Design rules enforced in review:
 
 ## Hardening notes for client developers
 
-- The seed file is the identity: keep `~/.shopot/zig-seed` (0600) out of any
+- The seed file is the identity: keep `~/.stille-messenger/zig-seed` (0600) out
+  of any
   backup/sync that is not itself E2EE. Whoever has the seed has the history.
 - Prompt users to compare fingerprints when adding contacts (protection
   against MITM on first contact).
 - Store the seed on shared devices only with additional protection
   (passphrase-on-top is a client concern; the core derives everything from
   the raw seed).
-- Panic/delete flows: destroying `~/.shopot` (seed, log, files) erases
-  history, outbox, files, and contacts. The identity (the seed) survives by
-  design — delete `zig-seed` too if the identity itself must die.
+- Panic/delete flows: destroying `~/.stille-messenger` (seed, log, files)
+  erases history, outbox, files, and contacts. The identity (the seed)
+  survives by design — delete `zig-seed` too if the identity itself must die.

@@ -263,6 +263,8 @@ stille://i/<base64url(bundle[64] || secret[16] || name_len u8 || name ≤32)>
 | 0x62 | FILE_ACK | `file_id[16], got u32` |
 | 0x45 | SYNC | `batch_id u32, count u8 ≤ 64, recs = count × record (§7.2)` — a device-sync batch; the tail must parse into exactly `count` records |
 | 0x46 | SYNC_ACK | `batch_id u32` — the batch was applied (or deliberately skipped); the sender frees the queue records |
+| 0x47 | PUNCH_CANDIDATES | `count u8 (1..8)` × {`type u8 (0 host / 1 reflexive), ip[4], port u16`} — the sender's direct-path candidates for NAT traversal (§15.1). Sent only inside an authenticated session: an outsider cannot forge, inject or replay candidates (session counters and AEAD). An older core skips the frame (unknown tag) and the pair stays on the relay |
+| 0x48 | V6_ADDR | `count u8 (1..2), ip[16] × count, port u16` — the sender's global/ULA IPv6 addresses + listen port (§15.2 direct-first). Sent inside an authenticated session when a relay-backed session binds; the receiver stores it as the contact's direct address for redialing without a relay. Old cores skip the unknown tag |
 
 All envelope structs live in `proto/envelope.zig`; the codec performs zero
 allocations (encode/decode into caller buffers).
@@ -496,6 +498,16 @@ then:          transparent byte split (fake-TLS stream passes through)
   second is paired; while a pair is active extra connections are closed.
   When the pair ends the slot is **freed** — either side can re-register and
   re-pair (this is what makes presence work).
+- Echo of the observed address (2.9.0): a relay client may send an
+  ECHO_REQ record right after the marker:
+  `[17 03 03 0012][5B + noise 17]`. A 2.9.0+ relay replies
+  `[17 03 03 0012][5C + ip[4] + port u16 LE + noise 11]` carrying the
+  source address it observes (the client's NAT mapping — §15.1), then
+  pairing proceeds as usual; per-connection ordering guarantees the reply
+  arrives before the pair signal. The relay detects the request with a
+  50 ms peek window and does **not** consume foreign bytes: an old relay
+  never sees the request, an old client never sends it — fully backward
+  compatible.
 - Invite code with relay: `stille://i/<b64>@r/<host:port>`.
 - The A side (`invite <name> relay <addr>`) keeps its registration and
   reconnects on break until the invite is redeemed; the B side (`add <code>`)
@@ -513,6 +525,48 @@ then:          transparent byte split (fake-TLS stream passes through)
   compromised identity key is game-over anyway.
 - The relay does **not** hide addresses from the relay itself; a DPI sees a
   TLS-like stream to the relay and back.
+
+### 15.2 Direct-first: IPv6 and UPnP (2.10.0)
+
+The relay is only a rendezvous; the data path should be direct whenever the
+network allows it. Two mechanisms remove the relay entirely for capable
+networks:
+
+- **IPv6-direct.** The daemon listens on `[::]:listen_port` in addition to
+  the IPv4 listener (separate socket, V6ONLY — the v4 path is untouched).
+  IPv6 addresses are not NATed: a peer with a global (2000::/3) or ULA
+  (fd00::/8) address is dialable directly from anywhere. Address formats
+  everywhere (invite `addr`, contact storage, CONNECT) accept
+  `[v6]:port`; link-local fe80:: is deliberately excluded (scope-id
+  plumbing is a separate contract).
+  Address learning: when a relay-backed session binds, each core sends
+  V6_ADDR (0x47-table) with its current addresses; the receiver records
+  them as the contact's direct address. Incoming direct connections
+  teach the peer's address via getpeername (v6 always; v4 too). Mobile
+  address changes are covered by the peer redialing and the relay
+  fallback.
+- **UPnP IGD port mapping.** At startup (when `autodial` is on) a
+  background thread does SSDP discovery (M-SEARCH, 239.255.255.250:1900,
+  one request, 1.5 s timeout), fetches the IGD description, and calls
+  AddPortMapping for the listen port + GetExternalIPAddress. Success →
+  the public IPv4 endpoint is announced as the FIRST host candidate of
+  PUNCH_CANDIDATES (§7) and returned by GET_REACHABLE_ENDPOINTS: peers
+  dial it directly — the NAT is already mapped on the router side, no
+  simultaneous open needed. Failure is silent (no UPnP / IGD service /
+  strict router): relay and NAT-punch remain.
+  Note: UPnP speaks HTTP/XML because it is an external device standard
+  (like fake-TLS mimicry, this is interoperability, not our wire — the
+  stille wire stays binary LE).
+- **Fast presence.** With a known direct address (v6 or public IPv4)
+  the autodial backoff ceiling drops from 60 s to 3 s: one SYN every
+  3 s is cheap, so a peer appearing online is detected within seconds
+  by redialing (plus the usual LAN announcements when on the same
+  network).
+
+Honest limits: a firewall on the peer's router may still drop v6/mapped
+traffic (nothing can bypass policy); the worst case — both peers behind
+IPv4 NAT without UPnP and without a relay — still has no rendezvous at
+all (§15.1 covers it when a relay exists).
 
 ## 16. Fake-TLS v2 (wire mimicry)
 
@@ -555,7 +609,7 @@ with first-generation fake-TLS: both ends must run the same core release
 `stille-messenger-core serve` exposes the UDS socket `$HOME/.stille-messenger/api.sock` (0700) with a
 binary framed protocol — the only interface of the core; GUI clients talk to
 it. Frame layout, methods, machine-readable statuses, events and scenarios:
-**[CORE-API.md](CORE-API.md)** (API version 2.4.0).
+**[CORE-API.md](CORE-API.md)** (API version 2.10.0).
 
 ## 18. What an observer can learn
 
@@ -566,7 +620,7 @@ Honest limits of the design:
 | on-path DPI | an indistinguishable-from-Chrome TLS 1.3 stream with AECD-quantized record sizes (§16); no protocol markers |
 | passive network observer | the *fact* that two IPs talk, volume, timing |
 | relay (self-hosted) | both endpoint IPs, volume, timing; no content |
-| contact | everything you send them, delivery confirmations, your current name/avatar |
+| contact | everything you send them, delivery confirmations, your current name/avatar; after a successful punch (§15.1) — your public NAT endpoint |
 | anyone with the device | the seed → identity → decrypted history |
 | global adversary correlating traffic | endpoints of every connection (no cover traffic, no mixing) |
 
@@ -594,3 +648,14 @@ live instance by design).
   major version returned by `GET_VERSION`.
 - Sealed frames (0xA1 + epoch header) and `RATCHET_KEY` are incompatible with
   pre-epoch cores: both ends must run the same core version.
+- NAT punch (2.9.0) is additive at every layer: ECHO_REQ/ECHO_ACK records
+  are invisible to old relays/clients (the peek window consumes nothing,
+  old clients send nothing), and PUNCH_CANDIDATES is an unknown tag for old
+  cores — skipped, the pair stays relayed. Mixed 2.9.0/pre-2.9.0 peers work
+  over the relay exactly as before; no version negotiation is needed.
+- Direct-first (2.10.0) is likewise additive: V6_ADDR (0x48) is an unknown
+  tag for old cores (skipped), the v6 listener is a separate socket that
+  changes nothing for v4 peers, and UPnP mapping is entirely local. The
+  IPv6 address format `[v6]:port` inside invite/contact strings is parsed
+  by 2.10.0+ cores only — an older core fails the dial and falls back
+  (invite codes carrying v6 should be given to updated peers).

@@ -9,8 +9,17 @@ renders. The protocol is **binary**: no strings-as-protocol, no JSON, no
 human-readable text on the wire — only typed byte frames and machine-readable
 codes (methods, statuses, events).
 
-- API version: **2.8.0** (returned by `GET_VERSION`, semver).
-  2.8.0 adds short identity codes for deeplinks (§4.2:
+- API version: **2.10.0** (returned by `GET_VERSION`, semver).
+  2.10.0 adds direct-first: IPv6-direct sessions (`[v6]:port` addresses,
+  PROTOCOL.md §15.2), UPnP port mapping (public endpoint as a host
+  candidate), and fast presence (3 s autodial ceiling on direct
+  addresses). The `api_version` constant is raised 2.8.0 → 2.10.0 here
+  (2.9.0 was documented with NAT-punch but the constant bump was
+  missed; both changes land unreleased together).
+  2.9.0 added NAT traversal for relayed peers (config bit6 `nat_punch`,
+  §4.9; the ROUTE_STATE event, §5) — the relay session upgrades to a
+  direct punched connection (PROTOCOL.md §15.1), relay stays the fallback.
+  2.8.0 added short identity codes for deeplinks (§4.2:
   `GENERATE_SHORT_CODE`/`DECODE_SHORT_CODE`) — pure local computation,
   no wire or storage change.
   2.7.0 adds one-key friend-request invites, observable connection state,
@@ -57,9 +66,16 @@ steps — the core has already handled them.
   (the encrypted log is local). The recovery package (§4.10) is the one
   deliberate exception in kind: a sealed, client-stored blob in the user's
   own cloud holding identity/profile (never message content).
-- NAT traversal for two NAT-ed peers: the channel is LAN, direct TCP
-  (auto-selected port range 7777–7786), or a relay (`stille-messenger-core relay` on any
-  server).
+- NAT traversal is built in for relayed pairs (2.9.0, §4.9 bit6):
+  both peers behind NAT upgrade their relay session to a direct punched
+  connection (PROTOCOL.md §15.1). Direct-first (2.10.0) removes the relay
+  for capable networks: IPv6 peers connect directly (no NAT in v6), a
+  UPnP-mapped public IPv4 endpoint is dialed directly, and direct
+  addresses redial at a 3 s cadence (fast presence). The remaining
+  honest gap: two peers behind IPv4 NAT with **no** UPnP, **no** relay
+  and no LAN channel cannot meet at all — rendezvous needs one of
+  them; symmetric NATs are not punched (the pair silently stays
+  relayed).
 - Parsing pictures/files: bytes are passed as-is.
 
 ## 2. Frame
@@ -173,7 +189,7 @@ seed (HKDF), so the code never burns — every valid JOIN is accepted,
 forever, and the invite registry is not involved (no `TOO_MANY_INVITES`
 limit, validation is stateless). Any endpoint combination is allowed
 (direct, relay, hybrid, or none); a relay endpoint is recommended for
-site deeplinks because it works across networks. Repeating the call with
+shared profile codes because it works across networks. Repeating the call with
 the same arguments returns the same code. `invite_id` for mode 4 is the
 deterministic non-secret marker BLAKE2s-256(bundle)[0..16] (the
 `GET_IDENTITY` fingerprint prefix); `GET_INVITE_STATE` on it always
@@ -222,8 +238,10 @@ are intentionally not exposed.
 [count u32] × {contact_view}`. `GET_CONTACTS_DELTA` (47) takes
 `[epoch 16][from_revision u64]`; it returns revisioned contact changes or
 `RESYNC_REQUIRED` when the epoch/window is stale. `GET_REACHABLE_ENDPOINTS` (48)
-takes an empty payload and returns `[count u8] × [address str16]` local IPv4
-`host:port` candidates (not a reachability guarantee). `GET_HISTORY_PAGE` (51)
+takes an empty payload and returns `[count u8] × [address str16]` direct
+address candidates (not a reachability guarantee): local IPv4 `host:port`,
+global IPv6 `[v6]:port` (2.10.0), and the UPnP-mapped public `host:port`
+(2.10.0, when the router mapping succeeded). `GET_HISTORY_PAGE` (51)
 takes `[cid u32][has_cursor u8][before_ts u64][before_msg_id 16][limit u16]`
 and returns `[has_more u8][next_ts u64][next_msg_id 16][count u32] × history
 entry`, newest to oldest. The next cursor is exclusive; limit 0 defaults to 30,
@@ -248,12 +266,12 @@ code is the v1 format (`shopot1.<base64url(bundle|name)>`, with `@host:port`
 when the contact has a last known address). The 9-character code is
 information-theoretically irreversible (45 bits < the 512-bit bundle):
 resolution works only for bundles the core already knows — the local
-identity and stored contacts. For strangers the deeplink site (for example
-`stille.im/invite/{code}`) holds the mapping from the short code to the
-inviter's full code — the persistent profile code (`CREATE_INVITE_EX` mode 4)
-is designed exactly for this: it never burns, so one site link serves
-everyone — and hands the full code to the client, which feeds it to
-`ACCEPT_INVITE`/`ACCEPT_INVITE_EX`.
+identity and stored contacts. `stille.im` invite links therefore carry the
+full code itself, with the `stille://` scheme stripped
+(`stille.im/invite/i/…`, `stille.im/invite/i3/…`): the site is a redirector
+only and holds no mapping; the client re-attaches the scheme and feeds the
+code to `ACCEPT_INVITE`/`ACCEPT_INVITE_EX` directly. Short codes remain a
+local identifier for known contacts, not a link payload.
 Blocked contacts resolve normally (blocking is a rendering decision).
 A 40-bit hash collision between two contacts resolves deterministically to
 the lower cid. Errors: `BAD_ARGS` (malformed code), `NO_CONTACT` (unknown
@@ -493,9 +511,10 @@ The configuration is one binary blob, persisted in the encrypted log
 
 `flags` bits (unknown bits in `SET_CONFIG` are rejected with `BAD_ARGS`):
 bit0 `server_mode`, bit1 `use_fake_tls`, bit2 `use_tor_mask`, bit3
-`device_sync`, bit4 `lan_discovery`, bit5 `autodial`. Addresses are
-`host:port` (≤ 64 bytes; empty = unset). Defaults: all flags on except
-`server_mode` and `use_tor_mask`; `tor_addr` = `127.0.0.1:9050`.
+`device_sync`, bit4 `lan_discovery`, bit5 `autodial`, bit6 `nat_punch`.
+Addresses are `host:port` (≤ 64 bytes; empty = unset). Defaults: all
+flags on except `server_mode` and `use_tor_mask`; `tor_addr` =
+`127.0.0.1:9050`.
 
 - `server_mode` — all peer traffic flows through the user's **own**
   self-hosted relay (`server_addr`, `stille-messenger-core relay`). Requires `server_addr`
@@ -510,6 +529,17 @@ bit0 `server_mode`, bit1 `use_fake_tls`, bit2 `use_tor_mask`, bit3
 - `device_sync` — replicate the database to a linked device (below).
 - `lan_discovery` — UDP multicast announcements/search in the LAN.
 - `autodial` — background redialing of offline contacts by saved address.
+  2.10.0: also gates the UPnP mapping attempt at daemon startup; with a
+  known **direct** address (IPv6 or public IPv4) the redial backoff
+  ceiling is 3 s instead of 60 s — a peer coming online is detected
+  within seconds without a relay slot (PROTOCOL.md §15.2).
+- `nat_punch` (2.9.0) — upgrade relayed sessions to a direct punched
+  connection: the core exchanges direct-path candidates inside the
+  authenticated session and runs a simultaneous TCP open from the same
+  local port as the relay connection (PROTOCOL.md §15.1). Works only
+  between relayed peers (relay address from the invite / contact memory /
+  `server_mode`); failure (symmetric NAT, filter) is silent — the pair
+  stays on the relay. The route change is reported as `ROUTE_STATE` (§5).
 
 `SET_CONFIG` validates and applies atomically, persists, broadcasts
 `CONFIG_CHANGED` (payload = the new blob), and — with `device_sync` on —
@@ -610,11 +640,16 @@ Broadcast to all connected clients, in any order, `request_id = 0`.
 | `CONTACT_CARD` | 12 | `[cid u32][name str16][bundle 64][addr str16]` |
 | `REPLY_RECEIVED` | 13 | `[cid u32][msg_id 16][reply_to 16][ts_ms u64][name str16][body str16][entity tail]` |
 | `CONFIG_CHANGED` | 14 | config blob (§4.9: `[ver u8][flags u32][server_addr str16][tor_addr str16]`) |
+| `ROUTE_STATE` | 18 (2.9.0) | `[cid u32][route u8]`: 0 lan (direct dial by host candidate), 1 relay, 2 direct-punched (NAT-punch succeeded) — subscription required, like 15–17 |
 
 The connection-observation events are opt-in: call `SUBSCRIBE_CONTACT_UPDATES`
-before expecting events 15–17. `CONTACT_STATE_CHANGED` is a transport/UI
+before expecting events 15–18. `CONTACT_STATE_CHANGED` is a transport/UI
 state notification; `CONTACT_UPSERTED`/`CONTACTS_CHANGED` carry revisioned
 snapshot changes. They do not replace authenticated JOIN or `CONTACT_JOINED`.
+`ROUTE_STATE` (2.9.0) fires when a relay session is replaced by a direct
+punched/LAN connection (and once with route=1 when a relay session binds):
+a relay **downgrade** never happens, so route=1 after 2 means a new relay
+session after the direct path died.
 
 - `MESSAGE_RECEIVED.ts_ms` = local receive time, consistent with GET_HISTORY
   timestamps. The `msg_id` is what reactions address.
@@ -662,6 +697,10 @@ snapshot changes. They do not replace authenticated JOIN or `CONTACT_JOINED`.
 | direct TCP port range | 7777–7786 (first free wins; all busy → LAN discovery off) |
 | LAN discovery | UDP multicast 239.77.77.77:57770 + limited broadcast, 74-byte announcements; cadence 500 ms (100 ms burst while an outbox entry or JOIN is pending), immediate announce on a send to an offline peer; unicast reply on hearing a peer |
 | direct dial deadline | 3000 ms on every direct dial (relay-marker pairing and Tor SOCKS5 paths excluded) |
+| NAT punch (2.9.0) | ≤ 4 reflexive candidates per frame side, ≤ 8 candidates total; 3 rounds × 500 ms per attempt (50 ms retry slices), 5 s between attempts; 1 punch worker per contact; punch candidates only inside an authenticated session |
+| IPv6 addresses (2.10.0) | ≤ 2 per V6_ADDR frame, ≤ 16 enumerated; global 2000::/3 + ULA fd00::/8 only (no fe80::); address string `[v6]:port` |
+| UPnP mapping (2.10.0) | one attempt per daemon start (SSDP 1.5 s + IGD I/O 3 s timeouts); public endpoint announced as first host candidate |
+| fast presence (2.10.0) | autodial ceiling 3 s (v6 / public IPv4 addresses), 60 s otherwise |
 | daemons per `$HOME` | 1 (single UDS path) |
 
 ## 7. Delivery model
@@ -716,6 +755,28 @@ A: CREATE_INVITE{name:"mom"}             → one friend-request key
 B: ACCEPT_INVITE{code, my_name:"mom"}    → cid
    then: the session comes up by itself, PRESENCE online, text flows
 A: receives CONTACT_JOINED; no second key or manual confirmation is needed
+```
+
+### Remote (both behind NAT, relay)
+```
+A: runs stille-messenger-core relay host:port on any server
+A: CREATE_INVITE{relay=1}                  → code stille://i/…@r/host:port
+B: ACCEPT_INVITE{code}                     → cid; session over the relay
+both: ROUTE_STATE{cid, route=1 relay}      (subscribed clients)
+then: punch — ROUTE_STATE{cid, route=2 direct-punched}, session is direct
+      (symmetric NAT / port-restricted filter: stays relay=1 silently)
+```
+No third-party STUN; the relay is the rendezvous point (PROTOCOL.md §15.1).
+
+### Remote, direct-first (IPv6 or UPnP, 2.10.0)
+```
+both daemons: listen 0.0.0.0:P + [::]:P; autodial=1 (default) tries UPnP
+A: has global v6: CREATE_INVITE_EX{mode 1, direct "[2001:db8:…]:P"}
+   (or UPnP mapped: GET_REACHABLE_ENDPOINTS → "203.0.113.7:P")
+B: ACCEPT_INVITE → cid; B dials A directly — no relay at any point
+   online/offline: 3 s redial cadence (fast presence) both directions
+   existing relayed pair: V6_ADDR/UPnP candidate arrives inside the
+   session → contact address learned → next reconnects are direct
 ```
 
 ### Remote (behind NAT, address known)

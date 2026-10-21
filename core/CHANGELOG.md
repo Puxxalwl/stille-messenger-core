@@ -1,5 +1,143 @@
 # Changelog — stille-messenger
 
+## [Unreleased / неизданное] — direct-first: IPv6 и UPnP, без релея (2.10.0)
+
+- Feature (wire-compatible, API 2.10.0): the relay becomes
+  rendezvous-only for capable networks — direct paths without any relay
+  bytes. **IPv6-direct**: the daemon listens on `[::]:listen_port`
+  (V6ONLY, separate socket; the v4 path unchanged), address strings
+  accept `[v6]:port` everywhere (invite/contact/CONNECT), global
+  2000::/3 + ULA fd00::/8 addresses are enumerated and announced to
+  peers inside the authenticated session via the new V6_ADDR envelope
+  (0x48: `[count u8 ≤ 2][ip 16 × count][port u16]`; old cores skip the
+  unknown tag), and the receiving core stores them as the contact's
+  direct address. Incoming direct connections also teach the peer's
+  address via getpeername. **UPnP IGD**: a one-shot startup thread
+  (gated on `autodial`) does SSDP discovery + AddPortMapping +
+  GetExternalIPAddress (std-only raw sockets, bounded buffers,
+  1.5/3 s deadlines); the public IPv4 endpoint is announced as the
+  first host candidate of PUNCH_CANDIDATES and returned by
+  GET_REACHABLE_ENDPOINTS. **Fast presence**: with a known direct
+  address (v6 or public IPv4) the autodial backoff ceiling drops from
+  60 s to 3 s — a peer appearing online is detected within seconds,
+  no relay slot needed. Also: `api_version` constant finally raised to
+  match the documented 2.9.0 (the NAT-punch branch documented 2.9.0
+  but missed the constant bump; both changes are unreleased, so the
+  constant jumps 2.8.0 → 2.10.0). Honest limits: router firewalls may
+  still drop v6/mapped traffic; two IPv4-NAT peers without UPnP and
+  without a relay still have no rendezvous (unchanged).
+- Фича (совместима на проводе, API 2.10.0): релей становится
+  рандеву-точкой для способных сетей — прямые пути без единого
+  relay-байта. **IPv6-direct**: демон слушает `[::]:listen_port`
+  (V6ONLY, отдельный сокет; v4-путь не меняется), строки адресов
+  принимают `[v6]:port` везде (инвайт/контакт/CONNECT), глобальные
+  2000::/3 + ULA fd00::/8 перечисляются и объявляются пирам внутри
+  аутентифицированной сессии новым конвертом V6_ADDR (0x48:
+  `[count u8 ≤ 2][ip 16 × count][port u16]`; старые ядра пропускают
+  неизвестный тег), приёмник запоминает их как прямой адрес контакта.
+  Входящие прямые подключения тоже научают адресу пира через
+  getpeername. **UPnP IGD**: однопроходный поток на старте (под
+  флагом `autodial`) делает SSDP-поиск + AddPortMapping +
+  GetExternalIPAddress (только std, bounded-буферы, дедлайны 1.5/3 с);
+  публичный IPv4-endpoint объявляется первым host-кандидатом
+  PUNCH_CANDIDATES и возвращается GET_REACHABLE_ENDPOINTS.
+  **Fast presence**: с известным прямым адресом (v6 или публичный v4)
+  потолок бэкоффа автодозвона падает с 60 с до 3 с — появление пира
+  замечается за секунды без relay-слота. Также: константа
+  `api_version` наконец поднята под задокументированную 2.9.0
+  (ветка NAT-punch задокументировала 2.9.0, но бамп константы
+  пропустила; оба изменения неизданы — константа прыгает 2.8.0 →
+  2.10.0). Честные ограничения: firewall роутера может резать
+  v6/замапленный трафик; два пира за IPv4 NAT без UPnP и без релея
+  по-прежнему без рандеву (без изменений).
+
+
+## [Unreleased / неизданное] — NAT-обход: прямой путь поверх релея (2.9.0)
+
+- Feature (wire-compatible, API 2.9.0): relayed peers behind NAT now
+  upgrade their relay session to a **direct punched TCP connection**
+  (simultaneous open). The relay learns each side its reflexive address
+  via new ECHO_REQ/ECHO_ACK records (backward compatible: a 50 ms peek
+  window, old relays/clients never see them); candidates are exchanged
+  inside the authenticated session via the new PUNCH_CANDIDATES envelope
+  (0x47, `count u8 ≤ 8` × {type, ip, port}; old cores skip the unknown
+  tag and stay relayed); both cores then dial each other's reflexive
+  candidates from the same local address:port as their relay connection
+  (SO_REUSEADDR, cone NAT reuses the mapping). Host (LAN) candidates are
+  dialed by the bundle-smaller side. The punched connection carries a
+  fresh m1/m2/m3 and replaces the relay session (retired in bind); a
+  failure (symmetric NAT, filter) silently keeps the relay — no relay
+  downgrade is ever possible. No third-party STUN/TURN; the relay remains
+  the only rendezvous (serverless invariant). Engine: `net/punch.zig`
+  (budgets: ≤ 4 targets, 3 × 500 ms rounds with 50 ms retry slices, 5 s
+  between attempts, one worker per contact). App: config bit6 `nat_punch`
+  (default on), new ROUTE_STATE event (18: [cid][route 0 lan/1 relay/
+  2 direct-punched], subscription required). Known limits: two NAT-ed
+  peers with no relay/LAN channel cannot meet; after a successful punch
+  each peer learns the other's public NAT endpoint.
+- Фича (совместима на проводе, API 2.9.0): пара на релее за NAT теперь
+  поднимает relay-сессию до **прямого пробитого TCP-соединения**
+  (одновременный open). Релей сообщает каждой стороне её рефлексивный
+  адрес новыми записями ECHO_REQ/ECHO_ACK (обратная совместимость:
+  50-мс окно peek, старые релеи/клиенты их не видят); кандидаты
+  обмениваются внутри аутентифицированной сессии новым конвертом
+  PUNCH_CANDIDATES (0x47, `count u8 ≤ 8` × {type, ip, port}; старые ядра
+  пропускают неизвестный тег и остаются на релее); затем оба ядра диалят
+  рефлексивные кандидаты друг друга из того же локального адреса:порта,
+  что relay-подключение (SO_REUSEADDR, cone-NAT переиспользует маппинг).
+  Host-(LAN-)кандидаты дозванивает сторона с меньшим bundle. Пробитый
+  конн несёт свежие m1/m2/m3 и замещает relay-сессию (retired в бинде);
+  неудача (симметричный NAT, фильтр) молча оставляет релей — даунгрейда
+  на релей не бывает. Сторонних STUN/TURN нет; релей остаётся
+  единственной точкой рандеву (инвариант serverless). Движок:
+  `net/punch.zig` (бюджеты: ≤ 4 цели, 3 раунда × 500 мс со срезами
+  повтора 50 мс, 5 с между попытками, один воркер на контакт). Приложение:
+  бит конфигурации bit6 `nat_punch` (по умолчанию включён), новое событие
+  ROUTE_STATE (18: [cid][route 0 lan/1 relay/2 direct-punched], по
+  подписке). Известные ограничения: два узла за NAT без релея/LAN-канала
+  не встретятся; после успешного punch каждая сторона узнаёт публичный
+  endpoint NAT пира.
+
+## [Unreleased / неизданное] — чистка документации: версии и пути
+
+- Doc fixes only (no code/wire change): README EN/RU reworked — badges,
+  updated API version 2.7.0 → 2.8.0, wire protocol v4 → v5 (hybrid
+  ML-KEM-768 handshake now stated), the stale CLI relay example replaced
+  with the actual `CREATE_INVITE_EX` flow, detailed avatar/invite/recovery
+  prose moved to CORE-API/CLIENT_RULES links. PROTOCOL.md §17 now cites
+  API 2.8.0 (was 2.4.0). SECURITY.md hardening notes use the current
+  `~/.stille-messenger` paths (were `~/.shopot`). ARCHITECTURE.md gained a
+  compact module-dependency diagram (Mermaid) + hybrid-handshake layer row.
+  `make run` fixed: it invoked the nonexistent `chat` command, now `serve`.
+- Правки только документации (без изменений кода и провода): README EN/RU
+  переработан — бейджи, версия API 2.7.0 → 2.8.0, протокол провода v4 → v5
+  (указано гибридное ML-KEM-768-рукопожатие), несуществующий CLI-пример
+  релея заменён на реальный сценарий `CREATE_INVITE_EX`, детальные абзацы
+  про аватар/инвайты/восстановление вынесены ссылками в
+  CORE-API/CLIENT_RULES. PROTOCOL.md §17 теперь ссылается на API 2.8.0
+  (было 2.4.0). Заметки харденинга в SECURITY.md используют актуальные
+  пути `~/.stille-messenger` (было `~/.shopot`). ARCHITECTURE.md получил
+  компактную диаграмму зависимостей модулей (Mermaid) + строку слоя про
+  гибридное рукопожатие. Починен `make run`: вызывал несуществующую команду
+  `chat`, теперь `serve`.
+
+## [Unreleased / неизданное] — инвайт-ссылка несёт полный код
+
+- Doc clarification (no code/wire change): a `stille.im/invite/…` link
+  carries the **full invite code itself**, with the `stille://` scheme
+  stripped (`stille.im/invite/i/…`, `stille.im/invite/i3/…`). The site is a
+  redirector only and holds no mapping — the client re-attaches the scheme
+  and feeds the code to `ACCEPT_INVITE`/`ACCEPT_INVITE_EX`. Short codes
+  remain a local identifier for known contacts, not a link payload.
+  CORE-API EN/RU updated accordingly.
+- Уточнение документации (без изменений кода и протокола): ссылка
+  `stille.im/invite/…` несёт **полный инвайт-код сама**, без схемы
+  `stille://` (`stille.im/invite/i/…`, `stille.im/invite/i3/…`). Сайт —
+  только редиректор и не хранит маппинг: клиент снова приставляет схему и
+  передаёт код в `ACCEPT_INVITE`/`ACCEPT_INVITE_EX`. Короткие коды остаются
+  локальным идентификатором известных контактов, а не полезной нагрузкой
+  ссылки. CORE-API EN/RU обновлены соответственно.
+
 ## [Unreleased / неизданное] — короткие коды личности (API 2.8.0)
 
 - Added `GENERATE_SHORT_CODE` (52) and `DECODE_SHORT_CODE` (53) for
